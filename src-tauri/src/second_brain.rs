@@ -137,8 +137,7 @@ fn person_together<'a>(p: &PersonProfile, exportable: &[&'a Meeting]) -> Vec<&'a
         .filter(|m| {
             m.attendees.iter().any(|a| {
                 let a_lower = a.to_lowercase();
-                a_lower.contains(&name_lower)
-                    || aliases.iter().any(|alias| a_lower.contains(alias))
+                a_lower.contains(&name_lower) || aliases.iter().any(|alias| a_lower.contains(alias))
             })
         })
         .copied()

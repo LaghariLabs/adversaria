@@ -158,8 +158,9 @@ pub fn setup_status(app: &AppHandle) -> SetupStatus {
             minimum_memory_gb: 16,
             required_disk_gb: 7,
             quality_label: "Balanced quality".to_string(),
-            quality_note: "Strong meeting notes at a fraction of the size; good default for 16 GB Macs."
-                .to_string(),
+            quality_note:
+                "Strong meeting notes at a fraction of the size; good default for 16 GB Macs."
+                    .to_string(),
             installed: snapshot_installed(MID_REPO, MID_REVISION),
             recommended: mid_recommended,
         },

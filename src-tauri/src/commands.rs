@@ -1026,10 +1026,9 @@ pub async fn transcribe_meeting(
             // Phantom/accidental recording: no speech, no typed notes — discard it.
             return match cleanup_recordings(&audio_path, legacy_mic_path.as_deref()) {
                 Ok(()) => {
-                    crate::storage::delete_recording_asset(&audio_path)
-                        .map_err(|e| {
-                            format!("Could not clear the recording's recovery state: {e}")
-                        })?;
+                    crate::storage::delete_recording_asset(&audio_path).map_err(|e| {
+                        format!("Could not clear the recording's recovery state: {e}")
+                    })?;
                     crate::storage::delete_meeting(id)
                         .map_err(|e| format!("Could not remove the empty meeting: {e}"))?;
                     asset_guard.complete();
@@ -1064,13 +1063,9 @@ pub async fn transcribe_meeting(
         match cleanup_recordings(&audio_path, legacy_mic_path.as_deref()) {
             Ok(()) => {
                 crate::storage::clear_meeting_audio_path(id)
-                    .map_err(|e| {
-                        format!("Audio was deleted but its DB reference remained: {e}")
-                    })?;
+                    .map_err(|e| format!("Audio was deleted but its DB reference remained: {e}"))?;
                 crate::storage::delete_recording_asset(&audio_path)
-                    .map_err(|e| {
-                        format!("Could not clear completed recording asset: {e}")
-                    })?;
+                    .map_err(|e| format!("Could not clear completed recording asset: {e}"))?;
             }
             Err(error) => {
                 update_asset_state(&audio_path, "cleanup_pending", Some(&error))?;
@@ -2375,8 +2370,7 @@ pub async fn weekly_briefing(
     let digest = crate::recap::compute(&meetings, &all_items, offset);
 
     // Open loops: not done, assignee is not "Not mine", from this week's meetings.
-    let week_ids: std::collections::HashSet<i64> =
-        digest.sources.iter().map(|s| s.id).collect();
+    let week_ids: std::collections::HashSet<i64> = digest.sources.iter().map(|s| s.id).collect();
     let meeting_title_by_id: std::collections::HashMap<i64, &str> = meetings
         .iter()
         .filter(|m| week_ids.contains(&m.id))
@@ -3516,10 +3510,10 @@ pub async fn save_person(
         &name, &role, &company, &notes, &aliases, &email, &phone, &linkedin,
     )
     .map_err(|e| e.to_string())
-        .map(|profile| {
-            crate::second_brain::sync_async();
-            profile
-        })
+    .map(|profile| {
+        crate::second_brain::sync_async();
+        profile
+    })
 }
 
 /// Speech statistics for one meeting, computed from stored transcript turns
@@ -4515,7 +4509,10 @@ mod tests {
     fn notes_only_title_truncates_long_lines_with_ellipsis() {
         let line = "This is a very long first line that exceeds sixty characters by far";
         let title = notes_only_title(line);
-        assert!(title.chars().count() <= 60, "title longer than 60 chars: {title}");
+        assert!(
+            title.chars().count() <= 60,
+            "title longer than 60 chars: {title}"
+        );
         assert!(title.ends_with('…'), "should end with ellipsis: {title}");
         // char-boundary-safe: Arabic/emoji must not panic.
         let mb = "مرحبا كيف حالك اليوم في هذا الاجتماع المهم جدا جدا جدا جدا جدا";

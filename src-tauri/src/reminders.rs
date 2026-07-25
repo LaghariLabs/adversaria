@@ -99,11 +99,7 @@ fn check_and_notify(app: &tauri::AppHandle, prev: Option<&str>) -> Option<String
 
     let due_today = items
         .iter()
-        .filter(|it| {
-            !it.done
-                && it.assignee != "Not mine"
-                && it.due == today
-        })
+        .filter(|it| !it.done && it.assignee != "Not mine" && it.due == today)
         .count();
 
     let body = match digest_line(due_today, overdue) {
