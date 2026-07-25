@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "session_id": "synthetic-meeting-001",
+  "release_set": true,
+  "duration_seconds": 8.0,
+  "languages": ["en"],
+  "conditions": ["clean"],
+  "expected_speaker_count": 2,
+  "audio": [
+    {"path": "meeting.synthetic", "channel_role": "mixed"}
+  ],
+  "reference": {
+    "transcript": "reference.txt",
+    "turns": "turns.json",
+    "outcomes": "outcomes.json"
+  },
+  "hypothesis": "hypothesis.json",
+  "provenance": {
+    "kind": "synthetic",
+    "consent_confirmed": true,
+    "source_note": "Deterministic invented CI fixture; contains no user data.",
+    "license": "CC0"
+  }
+}

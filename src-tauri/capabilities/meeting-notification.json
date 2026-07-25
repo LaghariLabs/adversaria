@@ -1,0 +1,9 @@
+{
+  "identifier": "meeting-notification-window",
+  "description": "Meeting-detected card: emit the record signal and close itself only.",
+  "windows": ["notification"],
+  "permissions": [
+    "core:event:allow-emit",
+    "core:window:allow-close"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/LaghariLabs/adversaria-releases/releases/latest/download/latest-beta.json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Adversaria",
+  "version": "0.3.63",
+  "identifier": "com.meetingnotetaker.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "app"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "resources": {
+      "../python-service/dist/adversaria-service": "adversaria-service",
+      "../python-service/rapid-runtime/dist/rapid-mlx": "rapid-mlx"
+    },
+    "macOS": {
+      "minimumSystemVersion": "14.4"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdGNzg3RDVCRUQyQkI0RTEKUldUaHRDdnRXMzE0ZnpPSytGTFQ4NnIyK3ZuUCtOR3pVVXZ4Z04xbmdZN092M3MvWUZ1SUc4eWYK",
+      "endpoints": [
+        "https://github.com/LaghariLabs/adversaria-releases/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "Adversaria",
+        "width": 1024,
+        "height": 720,
+        "resizable": true,
+        "fullscreen": false,
+        "dragDropEnabled": false
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png"
+    },
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    }
+  }
+}

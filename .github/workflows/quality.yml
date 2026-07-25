@@ -1,0 +1,119 @@
+name: Quality gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-platform:
+    name: ${{ matrix.os }} quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend build and bundle budget
+        run: npm run build
+
+      - name: Frontend workflow tests
+        run: npm run test:coverage
+
+      - name: Install Python and uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          working-directory: python-service
+
+      - name: Install Python dependencies from lockfile
+        working-directory: python-service
+        run: uv sync --frozen --extra dev
+
+      - name: Ruff
+        working-directory: python-service
+        run: uv run --frozen ruff check .
+
+      - name: Python tests
+        working-directory: python-service
+        run: uv run --frozen pytest -q
+
+      - name: Privacy-safe evaluation smoke
+        working-directory: python-service
+        run: >-
+          uv run --frozen python -m eval.cli
+          --corpus eval/fixtures/synthetic
+          --output ${{ runner.temp }}/adversaria-eval-smoke
+          --fail-on-gate
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Rust Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+
+      - name: Native compile check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets --all-features
+
+  macos-desktop-smoke:
+    name: macOS embedded desktop smoke
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: macos-wdio
+
+      - run: npm ci
+      - run: npm run test:e2e:build
+      - run: npm run test:e2e
+
+      - name: Upload WebDriver logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-wdio-logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7

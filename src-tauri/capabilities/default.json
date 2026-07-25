@@ -1,0 +1,13 @@
+{
+  "identifier": "main-window",
+  "description": "Main application window: app metadata, event listeners, deliberate external links, and signed updates.",
+  "windows": ["main"],
+  "permissions": [
+    "core:app:allow-version",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "shell:allow-open",
+    "updater:default",
+    "process:allow-restart"
+  ]
+}

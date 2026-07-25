@@ -1,0 +1,114 @@
+name: macOS release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Updater channel to build
+        required: true
+        default: beta
+        type: choice
+        options: [beta, stable]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Rapid-MLX is Apple-Silicon-only. Release runners are deliberately owned,
+    # clean, and labelled rather than silently falling back to an Intel host.
+    runs-on: [self-hosted, macOS, ARM64, adversaria-release]
+    environment: macos-release
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          working-directory: python-service
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install locked dependencies
+        run: |
+          npm ci
+          cd python-service
+          uv sync --frozen --extra dev --extra mlx
+
+      - name: Verify source gates
+        run: |
+          npm run build
+          npm test
+          npm audit --omit=dev --audit-level=high
+          cd python-service
+          uv run --frozen ruff check .
+          uv run --frozen pytest -q
+          cd ../src-tauri
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/adversaria-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/adversaria-build.keychain-db"
+          echo "$CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          SIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
+          test -n "$SIGN_IDENTITY"
+          echo "ADVERSARIA_SIGN_IDENTITY=$SIGN_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Configure notarization credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: >-
+          xcrun notarytool store-credentials adversaria-ci
+          --apple-id "$APPLE_ID"
+          --team-id "$APPLE_TEAM_ID"
+          --password "$APPLE_APP_PASSWORD"
+
+      - name: Build, sign, notarize, staple, and verify
+        env:
+          ADVERSARIA_RELEASE_MODE: "1"
+          ADVERSARIA_RELEASE_CHANNEL: ${{ inputs.channel }}
+          ADVERSARIA_FORMSPREE_ENDPOINT: ${{ secrets.ADVERSARIA_FORMSPREE_ENDPOINT }}
+          ADVERSARIA_NOTARY_PROFILE: adversaria-ci
+          ADVERSARIA_INSTALL: "0"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/build-dmg.sh
+
+      - name: Upload immutable candidate for clean-machine acceptance
+        uses: actions/upload-artifact@v7
+        with:
+          name: adversaria-${{ inputs.channel }}-${{ github.sha }}
+          path: |
+            src-tauri/target/release/bundle/dmg/Adversaria_aarch64.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.sig
+            src-tauri/target/release/bundle/provenance-${{ inputs.channel }}.json
+          if-no-files-found: error
+          retention-days: 14

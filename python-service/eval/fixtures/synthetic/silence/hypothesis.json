@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "app_version": "fixture-v1",
+  "model_profile": "deterministic-fixture",
+  "model_revisions": {
+    "transcription": "exact-v1",
+    "summarization": "exact-v1"
+  },
+  "evaluation_config": {
+    "normalization": "adversaria-v1"
+  },
+  "transcript": "",
+  "turns": [],
+  "summary": "",
+  "summary_claims": [],
+  "action_items": []
+}

@@ -1,0 +1,9 @@
+{
+  "identifier": "recording-bubble-window",
+  "description": "Recording pill: narrowly scoped Rust commands, plus listening for the live-transcript event so the expressive island can show live captions.",
+  "windows": ["recording"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

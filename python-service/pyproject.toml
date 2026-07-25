@@ -1,0 +1,45 @@
+[project]
+name = "meeting-note-taker-ml"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "faster-whisper>=1.1.0",
+    "ollama>=0.4.0",
+    "pydantic>=2.0",
+    "python-multipart>=0.0.12",
+    "httpx>=0.28.0",
+    "huggingface-hub>=1.0",
+    # On-device speaker diarization of the system-audio channel (offline, ONNX,
+    # cross-platform). Models download once to ~/.cache/adversaria/diarization.
+    # sherpa-onnx-core ships the native libs (libonnxruntime); declared
+    # explicitly because `uv sync` otherwise drops this wheel-only companion,
+    # leaving the extension unable to dlopen its runtime.
+    "sherpa-onnx>=1.13",
+    "sherpa-onnx-core>=1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx2>=1.0",
+    "pytest>=8.0",
+    "ruff>=0.12",
+]
+cuda = [
+    "nvidia-cublas-cu12>=12.0",
+    "nvidia-cudnn-cu12>=9.0",
+]
+# Apple-Silicon GPU transcription backend. The marker keeps it a no-op on
+# Windows/Intel, so `uv sync --extra mlx` is safe everywhere but only installs
+# on arm64 macOS. Requires the ffmpeg CLI for audio decoding.
+mlx = [
+    "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

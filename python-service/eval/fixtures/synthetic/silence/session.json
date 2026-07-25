@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "session_id": "synthetic-silence-001",
+  "release_set": true,
+  "duration_seconds": 10.0,
+  "languages": ["en"],
+  "conditions": ["silence"],
+  "expected_speaker_count": 0,
+  "audio": [
+    {"path": "silence.synthetic", "channel_role": "mixed"}
+  ],
+  "reference": {
+    "transcript": "reference.txt",
+    "turns": "turns.json",
+    "outcomes": "outcomes.json"
+  },
+  "hypothesis": "hypothesis.json",
+  "provenance": {
+    "kind": "synthetic",
+    "consent_confirmed": true,
+    "source_note": "Deterministic silent CI fixture; contains no user data.",
+    "license": "CC0"
+  }
+}

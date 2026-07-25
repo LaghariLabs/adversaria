@@ -1,0 +1,67 @@
+import type { AppConfig, Meeting } from "../types";
+
+export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+  return {
+    python_service_url: "http://127.0.0.1:9876",
+    default_prompt_template: "general",
+    auto_detect_meetings: false,
+    ollama_model: "qwen3.6-35b",
+    summary_language: "auto",
+    user_name: "",
+    custom_vocabulary: "",
+    diarize: true,
+    auto_stop_enabled: true,
+    silence_prompt_minutes: 5,
+    silence_stop_minutes: 10,
+    pin_hash: null,
+    claude_api_key: null,
+    llm_provider: "local",
+    llm_base_url: "",
+    llm_api_key: "",
+    transcription_base_url: "",
+    transcription_api_key: "",
+    transcription_model: "whisper-large-v3",
+    whisper_model: "large-v3",
+    encrypt_db: true,
+    biometric_unlock: true,
+    user_email: "",
+    beta_onboarded: false,
+    signup_synced: false,
+    date_format: "system",
+    archive_after_days: 30,
+    sidebar_view: "compact",
+    recording_view: "balanced",
+    notch_pill_style: "minimal",
+    meeting_alert_style: "notch_drop",
+    second_brain_path: "",
+    second_brain_enabled: false,
+    calendar: {
+      google: null,
+      microsoft: null,
+      macos_eventkit_enabled: false,
+    },
+    ...overrides,
+  };
+}
+
+export function pendingMeeting(overrides: Partial<Meeting> = {}): Meeting {
+  return {
+    id: 1,
+    title: "Untranscribed recording",
+    recorded_at: "2026-07-14T18:00:00Z",
+    duration_seconds: 0,
+    transcript: "",
+    summary: "",
+    template_used: "general",
+    audio_file_path: "/tmp/meeting.wav",
+    attendees: [],
+    user_notes: "",
+    link: "",
+    tags: [{ label: "Needs transcription", color: "orange" }],
+    pinned: false,
+    locked: false,
+    archived: false,
+    transcript_turns: [],
+    ...overrides,
+  };
+}

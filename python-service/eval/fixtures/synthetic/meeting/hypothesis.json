@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "app_version": "fixture-v1",
+  "model_profile": "deterministic-fixture",
+  "model_revisions": {
+    "transcription": "exact-v1",
+    "summarization": "exact-v1"
+  },
+  "evaluation_config": {
+    "diarization_collar_seconds": 0.0,
+    "normalization": "adversaria-v1"
+  },
+  "transcript": "Amina approved the 5000 dollar budget by July 20. Omar will send the contract.",
+  "turns": [
+    {
+      "id": "h1",
+      "speaker": "Me",
+      "text": "Amina approved the 5000 dollar budget by July 20.",
+      "start": 0.0,
+      "end": 4.0
+    },
+    {
+      "id": "h2",
+      "speaker": "Them",
+      "text": "Omar will send the contract.",
+      "start": 4.0,
+      "end": 8.0
+    }
+  ],
+  "summary": "Amina approved the 5000 dollar budget by July 20. Omar will send the contract.",
+  "summary_claims": [
+    {
+      "text": "The 5000 dollar budget was approved.",
+      "kind": "decision",
+      "reference_ids": ["fact-budget", "decision-budget"],
+      "evidence_turn_ids": ["r1"],
+      "critical": false
+    }
+  ],
+  "action_items": [
+    {
+      "text": "Omar will send the contract.",
+      "reference_id": "action-contract",
+      "evidence_turn_ids": ["r2"]
+    }
+  ]
+}

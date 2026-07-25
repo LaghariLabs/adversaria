@@ -1,0 +1,24 @@
+{
+  "names": [
+    {"id": "name-amina", "text": "Amina"},
+    {"id": "name-omar", "text": "Omar"}
+  ],
+  "entities": [
+    {"id": "entity-contract", "text": "contract"}
+  ],
+  "dates": [
+    {"id": "date-july-20", "text": "July 20"}
+  ],
+  "numbers": [
+    {"id": "number-budget", "text": "5000"}
+  ],
+  "facts": [
+    {"id": "fact-budget", "text": "The budget is 5000 dollars."}
+  ],
+  "decisions": [
+    {"id": "decision-budget", "text": "Amina approved the budget."}
+  ],
+  "action_items": [
+    {"id": "action-contract", "text": "Omar will send the contract."}
+  ]
+}

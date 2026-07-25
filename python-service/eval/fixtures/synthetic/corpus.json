@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "corpus_id": "synthetic-ci-v1",
+  "sessions": [
+    "meeting/session.json",
+    "silence/session.json"
+  ]
+}

@@ -1,0 +1,36 @@
+Adversaria — private beta (macOS)
+==================================
+
+This beta build isn't notarized by Apple yet, so macOS adds one extra step the
+first time. Pick whichever is easier:
+
+
+EASIEST — the installer
+-----------------------
+1. Double-click  "Install Adversaria.command"  in this window.
+2. If macOS says it "can't be opened because it is from an unidentified
+   developer", right-click the file -> Open, then click Open again.
+
+It copies Adversaria into your Applications folder, clears the "downloaded from
+the internet" flag so the app can launch, and opens it.
+
+
+MANUAL — if the installer is blocked
+------------------------------------
+1. Drag  Adversaria.app  onto the Applications folder.
+2. Open the Terminal app (Cmd-Space, type "Terminal").
+3. Paste this exact line and press Return:
+
+       xattr -dr com.apple.quarantine /Applications/Adversaria.app
+
+4. Open Adversaria from your Applications folder.
+
+
+First run
+---------
+On your first recording, macOS asks for Microphone and Screen Recording
+permission — that's how Adversaria captures the meeting audio. Everything stays
+on your machine: the audio is transcribed locally and deleted, and the
+transcript never leaves your computer.
+
+Found a bug or have feedback? Just reply to the email that sent you this build.

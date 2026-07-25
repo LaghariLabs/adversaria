@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened-runtime resource access for the MAIN app binary. Without
+       audio-input, macOS never shows the microphone permission prompt on a
+       fresh machine (the app simply doesn't appear under Privacy & Security →
+       Microphone) — found by the 2026-07-18 clean-machine test. The dev
+       machine masked this because its TCC grant predates hardened builds. -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>

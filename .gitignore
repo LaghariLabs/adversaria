@@ -1,0 +1,86 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+*.egg-info/
+python-service/__pycache__/
+python-service/.venv/
+python-service/src/**/__pycache__/
+python-service/**/__pycache__/
+mcp-server/.venv/
+mcp-server/**/__pycache__/
+*.pyc
+
+# Env
+.env
+.env.local
+
+# Audio recordings (privacy)
+*.wav
+recordings/
+
+# Stuntman relay state
+.stuntman/
+
+# Claude Code session-local files
+.claude/
+# Auto-generated claude-mem memory cache — regenerated every session, so tracking
+# it just churns the tree and trips the handoff guard on non-code turns.
+AGENTS.md
+
+# Playwright MCP debug artifacts
+.playwright-mcp/
+
+# Dev/scratch artifacts
+tauri_dev.log
+tauri_dev.err.log
+logs/
+coverage/
+python-service/bench_results.json
+python-service/uvicorn_dev.log
+python-service/uvicorn_dev.err.log
+
+# Cloud-sync (OneDrive/iCloud) conflict copies, e.g. "prototype 2.css" — they
+# keep reappearing under ~/Documents and otherwise pollute git status.
+* [2-9].*
+
+# LLM-council session artifacts (one-off roast/analysis outputs, timestamped)
+council-report-*.html
+council-transcript-*.md
+
+# Private meeting artifacts (never commit raw transcripts/summaries)
+/transcript.md
+/summaryA_F.md
+/summaryB_P.md
+/summaryC_L.md
+
+# Private evaluation corpus and reports (Phase 2)
+.adversaria-eval/
+evaluation-reports/
+
+# Launch-video render artifacts (source index.html + assets are tracked;
+# renders/snapshots are reproducible via `npx hyperframes@0.7.42 render`)
+marketing/launch-video/renders/
+marketing/launch-video/snapshots/
+marketing/launch-video/render.log
+# v3/v4 are heavy render experiments (183M/95M) — too big for git; keep whole dirs
+# out (use `git add -f` for a specific source file if one is ever worth tracking).
+marketing/launch-video-v3/
+marketing/launch-video-v4/
+
+# Other agent's AI-generated fake screenshots (garbled text) — never used; keep out.
+video/

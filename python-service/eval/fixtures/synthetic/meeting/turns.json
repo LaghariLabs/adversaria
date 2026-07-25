@@ -1,0 +1,16 @@
+[
+  {
+    "id": "r1",
+    "speaker": "speaker-a",
+    "text": "Amina approved the 5000 dollar budget by July 20.",
+    "start": 0.0,
+    "end": 4.0
+  },
+  {
+    "id": "r2",
+    "speaker": "speaker-b",
+    "text": "Omar will send the contract.",
+    "start": 4.0,
+    "end": 8.0
+  }
+]

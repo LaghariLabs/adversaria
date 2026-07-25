@@ -1,0 +1,90 @@
+[package]
+name = "meeting-note-taker"
+version = "0.3.63"
+edition = "2021"
+
+[lib]
+name = "meeting_note_taker_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# Test-only WebdriverIO bridge and embedded driver. Production builds do not
+# enable this feature, so neither plugin nor its permissions ship to users.
+wdio = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
+
+[[bin]]
+name = "meeting-note-taker"
+path = "src/main.rs"
+
+[dependencies]
+# macos-private-api enables transparent windows (the floating meeting-detected
+# card) on macOS; harmless on Windows.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-shell = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
+# Auto-update (Tauri v2 updater) + process plugin for relaunch after install.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SQLCipher (encryption at rest). The vendored-openssl variant bundles both
+# SQLCipher and OpenSSL so the signed .app has no system-crypto dependency.
+# FTS5 stays enabled (the bundled build sets -DSQLITE_ENABLE_FTS5).
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+directories = "5"
+# Native "Save As" dialog for exporting meeting notes to a .md file.
+rfd = "0.15"
+# Calendar integration (Phase 0): OAuth + PKCE + OS keychain token storage.
+tauri-plugin-oauth = "2"
+keyring = "4"
+sha2 = "0.10"
+rand = "0.8"
+chacha20poly1305 = "0.10"
+# Native biometric unlock for locked meetings: Touch ID on macOS, Windows Hello
+# on Windows, with the OS password as fallback.
+robius-authentication = "0.1"
+base64 = "0.22"
+url = "2"
+regex = "1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system"] }
+tauri-plugin-wdio = { version = "1", optional = true }
+tauri-plugin-wdio-webdriver = { version = "1", optional = true }
+
+# --- Windows-only: WASAPI dual capture + registry-based meeting detection ---
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Media_Audio",
+    "Media_Devices",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+] }
+# Registry read for meeting auto-detection (mic-in-use via CapabilityAccessManager).
+# winreg depends only on windows-sys, so it coexists with the windows 0.58 crate.
+winreg = "0.52"
+
+# --- macOS-only: ScreenCaptureKit (system audio) + cpal (mic) + CoreAudio ---
+[target.'cfg(target_os = "macos")'.dependencies]
+# Feature MUST match our deployment target (macOS 14.4). `macos_26_0` pulls in
+# macOS-26-only classes (e.g. SCScreenshotConfiguration) as STRONG links, which
+# crashes dyld at launch on macOS 15/14 ("Symbol not found"). We only use base
+# SCStream audio capture, so cap the API surface at 14.4. See LESSONS_LEARNED.
+screencapturekit = { version = "7.0.1", features = ["macos_14_4"] }
+cpal = "0.18"
+# Process-object list for meeting detection (which app is using the mic).
+coreaudio-sys = "0.2"
+core-foundation = "0.10"
+# Calendar — macOS EventKit (zero sign-in, reads from the Mac's Calendar app).
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-event-kit = { version = "0.3", features = ["EKEventStore", "EKEvent", "EKParticipant", "EKTypes", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSScreen", "NSWindow", "NSResponder", "NSGraphics"] }
+block2 = "0.6"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The frozen sidecar loads many nested .so/.dylib from different (or no)
+       signing identities. Without this, an ad-hoc-signed launcher enforces
+       library validation and macOS refuses them ("library load disallowed by
+       system policy"). -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+  <!-- The frozen sidecar bundles llvmlite (LLVM JIT, via numba). Under hardened
+       runtime, JIT-generated executable memory is killed with SIGKILL
+       ("Code Signature Invalid", faulting in libllvmlite.dylib) unless these two
+       are granted. Without them the whole ML service dies on launch. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

@@ -1,0 +1,31 @@
+{
+  "identifier": "com.lagharilabs.adversaria.e2e",
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "resources": []
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [
+        {
+          "identifier": "e2e-main",
+          "description": "Test-only capability for the WebdriverIO smoke suite",
+          "windows": ["main"],
+          "permissions": [
+            "core:default",
+            "core:app:allow-version",
+            "core:window:allow-close",
+            "core:window:allow-start-dragging",
+            "shell:allow-open",
+            "notification:default",
+            "updater:default",
+            "process:allow-restart",
+            "wdio:default",
+            "wdio-webdriver:default"
+          ]
+        }
+      ]
+    }
+  }
+}
