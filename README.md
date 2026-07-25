@@ -20,23 +20,71 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 
 ## Features
 
-- **Record → transcribe → summarize**, fully on-device; the audio is deleted right after.
-- **A recording companion view** — while recording, the app collapses into a slim panel made for docking beside a call: record bar (timer · live audio level · Stop & summarize), an auto-scrolling live transcript, and your notes split 50/50 (or pick **Transcript-first** in Settings → Recording view to give the transcript the whole window, notes in a one-tap footer). Toggle recording from anywhere with **⌘⇧M** (macOS) / **Ctrl+Shift+M** (Windows); **⌘⇧N** jots a quick note.
-- **A floating recording pill** — switch away from the app mid-recording and a compact pill tucks in just below the notch (dot · timer · live waveform). Choose **Notch pill → Expressive** in Settings → Notch & alerts for a richer island — timer, the running live caption, both channels, and a one-tap Stop — or **Hidden** to turn it off.
-- **Speaker-labeled** transcript (`Me:` / `Them:`, with on-device **Speaker 1/2/… diarization** of the remote side); multilingual + **Arabic/RTL** summaries.
-- **Smart note templates** — the app detects what a recording is (watched video, brainstorm, 1:1, **job interview — either side of the table**) and picks the matching notes template automatically; your manual template choice always wins.
-- **Meeting Insights** — on-device speaking stats per meeting (talk-time share, pace vs the 130–175 wpm target, filler-word rate, interruptions, longest monologue) computed with zero AI calls; transcripts carry **[MM:SS] timestamps** per turn.
-- **To-dos** — action items from every meeting on a **triage board** (Overdue / This week / Later lanes with **drag-and-drop** — drops edit the due date) or a **focus queue** (one next-up card at a time), with meeting-scope chips, editable due dates, and **twice-daily due/overdue notification digests**.
-- **Weekly Briefing** — your week written by the local LLM ("your week in sixty seconds"), plus stats, decisions made, and open loops carried forward.
-- **Ask across meetings** — cross-meeting Q&A (SQLite FTS5 retrieval) answered by the local LLM.
-- **Knowledge Graph** — an interactive, physics-animated map of your meetings, people, tags, and action owners (built from local data, zero LLM). Click any node for a **side dossier**: meeting-notes previews, and **editable person profiles** (role, company, notes, aliases) that sync to your Obsidian vault alongside meeting notes.
-- **Import & export** — import a voice memo/audio file into notes; export a meeting as a dark **slide** (HTML → one-page PDF), **Markdown**, or a portable **`.adversaria.json` bundle**; back up / restore everything from Settings → Data.
-- **A sidebar that stays short** — compact one-line rows (category dot · title · time) grouped into date bins (Pinned / Today / Yesterday / This week / month), with details in a hover peek (or switch back to the classic full cards in Settings); **archive any meeting** from its ⋯ menu (older ones auto-archive after a configurable window) into a collapsed, always-searchable **Archive**; the open meeting is highlighted; type **`@` in search to filter by person** (attendee chips that combine with text, day, and tag filters).
-- Colorful per-meeting **tags** + a **date heatmap** filter, **pin / delete / privacy-lock** (per-meeting PIN), **editable summaries**, **chat with a meeting**, **custom vocabulary**, and **auto-detect meetings**.
+Capture is the easy part. Adversaria is built around what happens *after* —
+turning a pile of recordings into something you can actually search, act on, and
+carry with you.
+
+**Recording**
+- **No bot joins the call.** It captures the audio your machine already plays and
+  the mic it already hears, as **two separate streams**, so it always knows who
+  spoke. The audio file is deleted once transcription succeeds.
+- **Speaker-labeled transcripts** — `Me:` / `Them:`, plus on-device **diarization**
+  of the remote side into Speaker 1/2/…, with `[MM:SS]` timestamps per turn.
+  Multilingual, including **Arabic/RTL** summaries.
+- **A recording companion + notch pill** — while recording, the app collapses to a
+  slim panel for docking beside a call; switch away and a pill tucks into the
+  notch with a live timer, per-channel waveforms, and the running caption.
+  Toggle from anywhere with **⌘⇧M**; **⌘⇧N** jots a quick note.
+
+**Organization — the point of the whole thing**
+- **Notes that match the meeting.** It detects a 1:1, a job interview, a
+  brainstorm, a standup, or a video you just watched, and writes each one
+  differently. Your manual choice always wins.
+- **To-dos, compiled automatically.** Action items are extracted from every
+  meeting into one **triage board** (Overdue / This week / Later, drag-and-drop to
+  change the due date) or a focus queue — with owners, editable due dates,
+  meeting-scope filters, and twice-daily notification digests. You never retype a
+  follow-up.
+- **Weekly Briefing** — your week written by the local model: decisions made, open
+  loops carried forward, plus stats.
+- **Knowledge graph** — an interactive map of every meeting, person, tag, and
+  action owner, built from local data with zero LLM calls. Click a person for a
+  dossier: every meeting you've had together, and an editable profile.
+- **Contacts that fill themselves in** — a person's **role and company are
+  extracted from what was actually said out loud**; email, phone, and LinkedIn are
+  yours to add. Anything you type always beats what the model inferred.
+- **Ask across meetings** — hybrid retrieval (SQLite FTS5 + on-device embeddings +
+  graph anchoring, RRF-fused) answered by your local model, with the meetings it
+  drew from.
+- **Meeting insights, zero AI calls** — talk-time share, speaking pace against the
+  130–175 wpm target, filler-word rate, interruptions, longest monologue.
+- **A sidebar that stays short** — compact rows in date bins, archive, per-meeting
+  **tags**, a date heatmap, pin / delete / **privacy-lock** (per-meeting PIN), and
+  `@` in search to filter by attendee.
+
+**It's yours to take**
+- **Export** a meeting as a dark **slide** (HTML → one-page PDF), **Markdown**, or
+  a portable **`.adversaria.json` bundle**; mirror everything into an Obsidian
+  vault with `[[wikilinks]]`; back up and restore from Settings → Data.
+- **Import** a voice memo or audio file and it's transcribed locally like anything
+  else.
+- **[MCP server](https://github.com/LaghariLabs/adversaria-mcp)** — a separate,
+  open-source, **read-only** server that exposes your meetings and to-dos over the
+  Model Context Protocol, so **Claude Desktop, Claude Code, or any MCP client** can
+  answer questions from them. It runs locally and makes no network calls of its
+  own. Tools: `list_recent_meetings`, `search_meetings`, `get_meeting`,
+  `get_action_items`.
+- **Chat with a single meeting**, re-summarize on demand, edit summaries, and add
+  custom vocabulary for names the transcriber keeps missing.
 
 ## Install (macOS, Apple Silicon)
 
-The packaged app bundles the Python ML service — **no terminal needed at runtime**.
+**Just want to use it?** Download the signed, notarized DMG from the
+[releases page](https://github.com/LaghariLabs/adversaria-releases/releases/latest),
+drag it to Applications, and launch. Requires macOS 14.4+ on Apple Silicon.
+
+To build it yourself instead — the packaged app bundles the Python ML service, so
+**no terminal is needed at runtime**:
 
 1. Build the installer (one command; needs the dev toolchain in [Prerequisites](#prerequisites)):
    ```bash
@@ -51,8 +99,9 @@ The packaged app bundles the Python ML service — **no terminal needed at runti
    separately launched server is needed.
 
 The model download is several gigabytes and the first local warm-up can take a
-few minutes. A locally built ad-hoc DMG is for development only. Public builds
-must pass the signed/notarized release gates in [CODEX_PLAN.md](docs/CODEX_PLAN.md).
+few minutes. A locally built ad-hoc DMG is for development only — official builds are signed
+and notarized, and are published on the
+[releases page](https://github.com/LaghariLabs/adversaria-releases/releases/latest).
 
 ## How it works
 
@@ -103,7 +152,7 @@ below are for Windows.
 
 > **macOS (Apple Silicon):** setup differs — MLX transcription + Rapid-MLX for the
 > LLM, `uv sync --extra mlx`, and `HF_HUB_DISABLE_XET=1` (or the model download
-> hangs). Follow the macOS runbook in [`docs/HANDOFF.md`](docs/HANDOFF.md).
+> hangs).
 
 **Terminal 1 — Python ML service:**
 
