@@ -79,6 +79,19 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      # tauri-build refuses to run when a bundle resource named in
+      # tauri.conf.json is missing, and both sidecars are PyInstaller output
+      # produced by scripts/build-dmg.sh into gitignored dist/ directories. That
+      # makes every cargo invocation below fail on a clean checkout. Clippy,
+      # tests, and cargo check need the paths to exist, not the real binaries —
+      # so stub them instead of spending ~10 minutes per job freezing two ML
+      # runtimes that nothing here executes.
+      - name: Stub bundled sidecar resources
+        shell: bash
+        run: |
+          mkdir -p python-service/dist/adversaria-service
+          mkdir -p python-service/rapid-runtime/dist/rapid-mlx
+
       - name: Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
