@@ -14,7 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Both repos (the public mirror and the private workspace) carry an identical
+  # copy of this file, so the sync can never drift. The guard keeps every job to
+  # the PUBLIC repo, where GitHub-hosted runners are free — a run in the private
+  # workspace would bill real minutes at macOS ×10 / Windows ×2.
   cross-platform:
+    if: github.repository == 'LaghariLabs/adversaria'
     name: ${{ matrix.os }} quality
     strategy:
       fail-fast: false
@@ -87,6 +92,7 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 
   macos-desktop-smoke:
+    if: github.repository == 'LaghariLabs/adversaria'
     name: macOS embedded desktop smoke
     runs-on: macos-latest
 
