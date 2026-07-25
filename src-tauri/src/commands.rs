@@ -3491,6 +3491,10 @@ pub async fn get_person(name: String) -> Result<Option<crate::types::PersonProfi
     crate::storage::get_person(&name).map_err(|e| e.to_string())
 }
 
+// The parameters mirror the IPC payload one-to-one, which is what makes the
+// frontend wrapper readable; collapsing them into a struct would only move the
+// same eight fields behind an extra `person:` envelope.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn save_person(
     name: String,
@@ -3510,10 +3514,7 @@ pub async fn save_person(
         &name, &role, &company, &notes, &aliases, &email, &phone, &linkedin,
     )
     .map_err(|e| e.to_string())
-    .map(|profile| {
-        crate::second_brain::sync_async();
-        profile
-    })
+    .inspect(|_| crate::second_brain::sync_async())
 }
 
 /// Speech statistics for one meeting, computed from stored transcript turns
@@ -4306,6 +4307,9 @@ fn is_cross_source_duplicate(
     })
 }
 
+// One caption pump per audio source; the shared `recent` ring is what lets the
+// two sources dedup against each other, so it has to be threaded through.
+#[allow(clippy::too_many_arguments)]
 async fn feed_live_source(
     app: &AppHandle,
     client: &HttpClient,

@@ -1881,6 +1881,8 @@ pub fn get_person(name: &str) -> anyhow::Result<Option<crate::types::PersonProfi
 
 /// Insert a new person or update the non-name fields of an existing one (case-
 /// insensitive match on `name`). Returns the row after the upsert.
+// Mirrors the editable profile fields; see `save_person`.
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_person(
     name: &str,
     role: &str,

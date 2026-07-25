@@ -190,6 +190,12 @@ impl AudioCapture {
     }
 }
 
+impl Default for AudioCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Spawn a thread that captures one WASAPI stream and writes it to
 /// `output_path` when recording stops.
 fn spawn_capture_thread(
@@ -206,7 +212,6 @@ fn spawn_capture_thread(
         if let Err(e) = capture_wasapi(source, recording, state.clone()) {
             eprintln!("Audio capture error ({label}): {e}");
             *state.ok.lock().unwrap() = false;
-            return;
         }
     })
 }
