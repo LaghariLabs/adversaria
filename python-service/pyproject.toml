@@ -25,6 +25,10 @@ dev = [
     "httpx2>=1.0",
     "pytest>=8.0",
     "ruff>=0.12",
+    # tests/test_cloud_transcribe.py writes WAV fixtures with scipy.io. It is
+    # present transitively in a full local install, so a missing declaration
+    # only shows up on a clean CI runner.
+    "scipy>=1.11",
 ]
 cuda = [
     "nvidia-cublas-cu12>=12.0",

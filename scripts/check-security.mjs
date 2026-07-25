@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+// fileURLToPath, not URL.pathname: on Windows the latter yields "/D:/a/..."
+// and the leading slash makes resolve() prepend the cwd drive → "D:\D:\a\...".
+const root = fileURLToPath(new URL("..", import.meta.url));
 const tauri = JSON.parse(readFileSync(resolve(root, "src-tauri/tauri.conf.json")));
 const csp = tauri?.app?.security?.csp;
 if (typeof csp !== "string" || !csp.includes("default-src 'self'")) {
