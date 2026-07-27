@@ -59,11 +59,24 @@ print(json.dumps({
 PY
 
 echo "==> Publishing $TAG to $RELEASE_REPO ($ASSET_NAME, ${CHANNEL} channel → ${MANIFEST_NAME})"
+# The DMG is what humans download; the .app.tar.gz is only for the auto-updater.
+# Upload both, using the STABLE filename so the website's
+# .../releases/latest/download/Adversaria-macos-arm64.dmg link keeps working
+# across releases. Uploading it by hand is how a release ships with no download.
+DMG="$(dirname "$ARTIFACT")/../dmg/Adversaria-macos-arm64.dmg"
+DMG_ARGS=()
+if [ -f "$DMG" ]; then
+  DMG_ARGS+=("$DMG")
+else
+  echo "==> WARNING: $DMG not found — publishing without a downloadable DMG."
+  echo "    Re-run scripts/build-dmg.sh, then: gh release upload $TAG <dmg> --repo $RELEASE_REPO"
+fi
+
 gh release create "$TAG" \
   --repo "$RELEASE_REPO" \
   --title "Adversaria $TAG" \
   --notes "$NOTES" \
-  "$ARTIFACT" "$LATEST_JSON"
+  "$ARTIFACT" "$LATEST_JSON" ${DMG_ARGS+"${DMG_ARGS[@]}"}
 
 echo "✅ Published $TAG."
 echo "   Manifest: https://github.com/$RELEASE_REPO/releases/latest/download/${MANIFEST_NAME}"

@@ -2981,6 +2981,23 @@ nav {
 .welcome-download > div { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; font-size: 11px; }
 .welcome-download progress { width: 100%; accent-color: var(--accent-blue, #24a0ed); }
 .welcome-download.error { background: color-mix(in srgb, #ff453a 10%, transparent); }
+/* Live permission rows: status dot · copy · action, granted up-front in setup
+   so macOS can't interrupt the user's first recording. */
+.perm-live li { align-items: center; }
+.perm-live .perm-copy { display: flex; flex-direction: column; gap: 3px; flex: 1; }
+.perm-live .perm-copy span { color: var(--text-secondary); font-size: 12px; }
+.perm-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.perm-granted { background: var(--accent-green, #34c759); box-shadow: 0 0 8px rgba(52, 199, 89, 0.5); }
+.perm-denied { background: var(--accent-red, #ff5f57); }
+.perm-undetermined { background: var(--text-muted, #6b6b75); }
+.perm-ok { font-size: 12px; color: var(--accent-green, #34c759); white-space: nowrap; }
+.perm-relaunch {
+  margin-top: 16px; padding: 14px 16px; border-radius: 10px;
+  border: 1px solid var(--accent-blue, #007aff);
+  background: rgba(0, 122, 255, 0.08);
+  display: flex; flex-direction: column; gap: 12px; align-items: flex-start;
+}
+.perm-relaunch p { margin: 0; font-size: 13px; line-height: 1.5; }
 .welcome-permissions { display: flex; flex-direction: column; gap: 8px; padding: 0; list-style: none; }
 .welcome-permissions li { display: flex; justify-content: space-between; gap: 24px; padding: 11px 0; border-bottom: 1px solid var(--border-color); }
 .welcome-permissions span { color: var(--text-secondary); font-size: 12px; text-align: right; }

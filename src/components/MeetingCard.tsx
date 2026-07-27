@@ -3,7 +3,7 @@ import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /**
- * Floating "Meeting detected" card. Rendered in its own small,
+ * Granola-style floating "Meeting detected" card. Rendered in its own small,
  * frameless, always-on-top webview window (label "notification"). Clicking
  * Record signals the main window to start recording via the existing
  * `tray-toggle-recording` event; Dismiss just closes the card.

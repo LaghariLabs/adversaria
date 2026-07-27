@@ -251,6 +251,17 @@ node scripts/release-provenance.mjs "$OUT" \
   "src-tauri/target/release/bundle/provenance-${CHANNEL}.json" \
   "$UPDATER_ARCHIVE" "${UPDATER_ARCHIVE}.sig"
 
+# A stable-named copy for the website's download link. The versioned filename
+# changes every release, so a link to
+# .../releases/latest/download/Adversaria-<version>-... silently 404s the moment
+# the next version ships. This name never changes, so the site link keeps working.
+# Copied AFTER stapling so it carries the notarization ticket.
+STABLE_DMG="$(dirname "$OUT")/Adversaria-macos-arm64.dmg"
+if [ "$OUT" != "$STABLE_DMG" ]; then
+  cp -f "$OUT" "$STABLE_DMG"
+  echo "==> Stable download name: $STABLE_DMG"
+fi
+
 # Auto-install into /Applications so you're always running the build you just
 # made (set ADVERSARIA_INSTALL=0 to skip). Quits + replaces + relaunches.
 if [ "${ADVERSARIA_INSTALL:-0}" != "0" ]; then
@@ -267,3 +278,4 @@ echo ""
 echo "✅ Done."
 echo "   App: $APP"
 echo "   DMG: $OUT"
+echo "   DMG (stable name): $STABLE_DMG"

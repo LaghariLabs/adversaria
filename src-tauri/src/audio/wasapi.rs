@@ -313,6 +313,27 @@ fn capture_wasapi(
         let mut frames_available: u32 = 0;
         let mut flags: u32 = 0;
 
+        let block_align = wave_format.nBlockAlign as usize;
+        let sample_rate = wave_format.nSamplesPerSec as u64;
+
+        // A loopback endpoint delivers NOTHING while nothing is playing — not
+        // silent packets, no packets at all. The microphone stream meanwhile
+        // keeps delivering continuously, so every quiet stretch shortens the
+        // system stream relative to the mic one. Left uncorrected the two
+        // spooled streams drift apart, and because `build_labeled_turns`
+        // interleaves them by timestamp, every later "Them" turn is placed
+        // earlier than it was actually spoken. ScreenCaptureKit pads silence
+        // for us on macOS, which is why this has no counterpart there.
+        //
+        // So for loopback only, top the stream up with the silence the device
+        // declined to give us, keeping it aligned to wall clock.
+        let pad_silence = source == CaptureSource::SystemLoopback;
+        let started = std::time::Instant::now();
+        let mut frames_written: u64 = 0;
+        // ~50 ms of zeroed frames, reused so a long quiet stretch doesn't
+        // reallocate on every top-up.
+        let silence = vec![0u8; block_align * (sample_rate as usize / 20).max(1)];
+
         loop {
             if !*recording.lock().unwrap() {
                 break;
@@ -328,14 +349,50 @@ fn capture_wasapi(
             );
 
             if hr.is_ok() && frames_available > 0 && !data_ptr.is_null() {
-                let byte_count = (frames_available * wave_format.nBlockAlign as u32) as usize;
-                let data = std::slice::from_raw_parts(data_ptr, byte_count);
-                state.push(data)?;
+                // Close any gap that opened while the endpoint was idle BEFORE
+                // appending this packet, so the packet lands at its true offset.
+                if pad_silence {
+                    pad_to_wall_clock(
+                        &state,
+                        &silence,
+                        block_align,
+                        sample_rate,
+                        started,
+                        &mut frames_written,
+                    )?;
+                }
 
+                let byte_count = frames_available as usize * block_align;
+                // AUDCLNT_BUFFERFLAGS_SILENT means the packet's contents are
+                // undefined and must be treated as silence — reading them
+                // verbatim feeds whatever the driver left in the buffer into
+                // the transcript.
+                let is_silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                let result = if is_silent {
+                    push_silence(&state, &silence, byte_count)
+                } else {
+                    state.push(std::slice::from_raw_parts(data_ptr, byte_count))
+                };
+
+                // Release before propagating any error: returning with the
+                // packet still held leaks it and wedges the capture client.
                 let _ = capture_client.ReleaseBuffer(frames_available);
+                result?;
+                frames_written += frames_available as u64;
             } else {
-                // No packet available (buffer empty or error) — sleep
-                // briefly instead of busy-spinning a core.
+                // No packet available (buffer empty or error). Keep the loopback
+                // stream growing in real time rather than only catching up when
+                // audio resumes, then sleep instead of busy-spinning a core.
+                if pad_silence {
+                    pad_to_wall_clock(
+                        &state,
+                        &silence,
+                        block_align,
+                        sample_rate,
+                        started,
+                        &mut frames_written,
+                    )?;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -347,6 +404,78 @@ fn capture_wasapi(
     Ok(())
 }
 
+/// Append `bytes` of silence to `state`, chunked out of the reusable `silence`
+/// buffer so a long quiet stretch never allocates.
+fn push_silence(state: &StreamState, silence: &[u8], bytes: usize) -> Result<(), String> {
+    // Guard the degenerate buffer: `remaining -= 0` would spin this thread
+    // forever. Unreachable while the format is sane (the buffer is sized from
+    // block_align, which is non-zero whenever `bytes` is), but a hung capture
+    // thread is a bad way to find out otherwise.
+    if silence.is_empty() {
+        return Ok(());
+    }
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let chunk = remaining.min(silence.len());
+        state.push(&silence[..chunk])?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+/// Only a wall-clock shortfall larger than this counts as a real silence gap.
+///
+/// The capture thread can fall tens of milliseconds behind for reasons that are
+/// NOT the endpoint going quiet — the 10 ms idle sleep below, scheduler jitter,
+/// or `StreamState::push` blocking while the spool encrypts and flushes to disk.
+/// Padding at that scale would splice silence into audio that never stopped,
+/// which is a worse bug than the drift it was meant to fix. A quarter second is
+/// comfortably above that noise floor and far below the multi-second scale at
+/// which speaker turns get reordered, so the residual misalignment this leaves
+/// (never more than one threshold) is inaudible in the transcript.
+const SILENCE_GAP_THRESHOLD_MS: u64 = 250;
+
+/// Frames of silence needed to bring a stream back to wall clock — 0 when it is
+/// level, ahead, or short by less than [`SILENCE_GAP_THRESHOLD_MS`].
+///
+/// Split out from [`pad_to_wall_clock`] so the decision is testable without a
+/// live WASAPI endpoint and an attached spool writer.
+fn silence_deficit_frames(
+    elapsed: std::time::Duration,
+    frames_written: u64,
+    sample_rate: u64,
+) -> u64 {
+    let elapsed_frames = (elapsed.as_secs_f64() * sample_rate as f64) as u64;
+    let deficit = elapsed_frames.saturating_sub(frames_written);
+    if deficit < sample_rate * SILENCE_GAP_THRESHOLD_MS / 1000 {
+        return 0;
+    }
+    deficit
+}
+
+/// Insert the silence a loopback endpoint declines to deliver while it is idle,
+/// so the system stream stays aligned to wall clock and therefore to the
+/// microphone stream captured alongside it.
+fn pad_to_wall_clock(
+    state: &StreamState,
+    silence: &[u8],
+    block_align: usize,
+    sample_rate: u64,
+    started: std::time::Instant,
+    frames_written: &mut u64,
+) -> Result<(), String> {
+    if block_align == 0 || sample_rate == 0 {
+        return Ok(());
+    }
+    let deficit = silence_deficit_frames(started.elapsed(), *frames_written, sample_rate);
+    if deficit == 0 {
+        return Ok(());
+    }
+    push_silence(state, silence, deficit as usize * block_align)?;
+    *frames_written += deficit;
+    Ok(())
+}
+
 /// RAII guard that calls `CoUninitialize` on drop.
 struct ComGuard;
 
@@ -355,5 +484,68 @@ impl Drop for ComGuard {
         unsafe {
             windows::Win32::System::Com::CoUninitialize();
         }
+    }
+}
+
+#[cfg(test)]
+mod silence_gap_tests {
+    use std::time::Duration;
+
+    use super::{silence_deficit_frames, SILENCE_GAP_THRESHOLD_MS};
+
+    const RATE: u64 = 48_000;
+
+    #[test]
+    fn stream_level_with_wall_clock_needs_no_padding() {
+        assert_eq!(
+            silence_deficit_frames(Duration::from_secs(10), RATE * 10, RATE),
+            0
+        );
+    }
+
+    #[test]
+    fn stream_ahead_of_wall_clock_never_pads() {
+        // A device clock running slightly fast must not underflow into a huge
+        // bogus deficit.
+        assert_eq!(
+            silence_deficit_frames(Duration::from_secs(10), RATE * 11, RATE),
+            0
+        );
+    }
+
+    #[test]
+    fn jitter_below_the_threshold_is_ignored() {
+        // 100 ms behind — the idle sleep plus a slow spool flush, not a gap.
+        let written = RATE * 10 - RATE / 10;
+        assert_eq!(
+            silence_deficit_frames(Duration::from_secs(10), written, RATE),
+            0
+        );
+    }
+
+    #[test]
+    fn a_real_silence_gap_is_padded_to_wall_clock() {
+        // Three seconds of an idle endpoint: pad the whole shortfall, so the
+        // next real packet lands at its true offset instead of 3 s early.
+        let written = RATE * 7;
+        assert_eq!(
+            silence_deficit_frames(Duration::from_secs(10), written, RATE),
+            RATE * 3
+        );
+    }
+
+    #[test]
+    fn threshold_boundary_is_the_documented_quarter_second() {
+        let threshold = RATE * SILENCE_GAP_THRESHOLD_MS / 1000;
+        let elapsed = Duration::from_secs(10);
+        let base = RATE * 10;
+        assert_eq!(
+            silence_deficit_frames(elapsed, base - threshold + 1, RATE),
+            0
+        );
+        assert_eq!(
+            silence_deficit_frames(elapsed, base - threshold, RATE),
+            threshold
+        );
     }
 }

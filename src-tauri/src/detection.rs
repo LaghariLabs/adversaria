@@ -80,7 +80,7 @@ pub fn spawn_detector(app: AppHandle) {
                         // open); the floating card below is the primary surface.
                         let _ =
                             app.emit("meeting-detected", MeetingDetected { app: label.clone() });
-                        // Floating meeting-detected card — a small always-on-top
+                        // Granola-style floating card — a small always-on-top
                         // window we draw ourselves, so it shows in dev too
                         // (Windows suppresses OS toasts for unpackaged builds).
                         show_meeting_card(&app, &label);

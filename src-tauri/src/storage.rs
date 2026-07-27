@@ -117,6 +117,33 @@ fn open_keyed() -> rusqlite::Result<Connection> {
 /// No-op on a fresh install (no file) or an already-encrypted DB. Backs the
 /// plaintext up and verifies row counts before swapping — on any mismatch it
 /// bails WITHOUT touching the original, so no data is lost.
+/// Row count for `table`, or 0 when the table does not exist.
+///
+/// The encryption migrations below run **before** `init_db` creates the schema,
+/// so they see whatever schema the database already had. A database written by a
+/// build that predates a table simply has no such table — and since
+/// `sqlcipher_export` copies the schema it finds, absent-on-both-sides is a
+/// legitimate match, not a failed copy.
+///
+/// Treating a missing table as an error made the app refuse to start with
+/// `no such table: action_items` for anyone upgrading from a build older than
+/// that table (e.g. the 0.2.x Windows line, whose `meetings.db` has only
+/// `meetings`), and the message then blamed the macOS keychain.
+fn table_count(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(0);
+    }
+    // `table` is a hardcoded literal at every call site, never user input.
+    conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| {
+        r.get(0)
+    })
+}
+
 fn migrate_plaintext_to_encrypted(path: &std::path::Path, key: &str) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(()); // fresh install — open_keyed() creates an encrypted DB
@@ -149,9 +176,9 @@ fn migrate_plaintext_to_encrypted(path: &std::path::Path, key: &str) -> anyhow::
     // Count rows per table in the plaintext source so we can verify the copy.
     let counts = |conn: &Connection| -> rusqlite::Result<(i64, i64, i64)> {
         Ok((
-            conn.query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))?,
-            conn.query_row("SELECT count(*) FROM action_items", [], |r| r.get(0))?,
-            conn.query_row("SELECT count(*) FROM chat_messages", [], |r| r.get(0))?,
+            table_count(conn, "meetings")?,
+            table_count(conn, "action_items")?,
+            table_count(conn, "chat_messages")?,
         ))
     };
 
@@ -231,9 +258,9 @@ fn migrate_encrypted_to_plaintext(path: &std::path::Path, key: &str) -> anyhow::
 
     let counts = |conn: &Connection| -> rusqlite::Result<(i64, i64, i64)> {
         Ok((
-            conn.query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))?,
-            conn.query_row("SELECT count(*) FROM action_items", [], |r| r.get(0))?,
-            conn.query_row("SELECT count(*) FROM chat_messages", [], |r| r.get(0))?,
+            table_count(conn, "meetings")?,
+            table_count(conn, "action_items")?,
+            table_count(conn, "chat_messages")?,
         ))
     };
 
@@ -2007,6 +2034,60 @@ pub fn get_people() -> anyhow::Result<Vec<crate::types::PersonProfile>> {
 #[cfg(test)]
 mod encryption_tests {
     use super::*;
+
+    /// A database written before `action_items` existed still migrates.
+    ///
+    /// Regression: the pre-copy verification counted rows in `action_items` and
+    /// `chat_messages` unconditionally, but the encryption migration runs BEFORE
+    /// `init_db` creates the schema. Upgrading from the 0.2.x Windows line —
+    /// whose `meetings.db` has only `meetings` — therefore failed with
+    /// `no such table: action_items`, and the app refused to start while
+    /// blaming the macOS keychain. 147 real meetings hit this.
+    #[test]
+    fn migrate_plaintext_from_a_schema_predating_action_items() {
+        let dir = std::env::temp_dir().join(format!("adv-oldschema-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meetings.db");
+
+        // Exactly the old shape: `meetings` and nothing else.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meetings (id INTEGER PRIMARY KEY, title TEXT);
+                 INSERT INTO meetings (title) VALUES ('Alpha'), ('Beta');",
+            )
+            .unwrap();
+        }
+
+        let key = random_key_hex();
+        migrate_plaintext_to_encrypted(&path, &key)
+            .expect("a pre-action_items database must still migrate");
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+            .unwrap();
+        let meetings: i64 = conn
+            .query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(meetings, 2, "no meeting may be lost by the migration");
+        // The absent tables stay absent; init_db creates them afterwards.
+        assert_eq!(table_count(&conn, "action_items").unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `table_count` reports 0 for an absent table and the real count otherwise.
+    #[test]
+    fn table_count_tolerates_a_missing_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meetings (id INTEGER PRIMARY KEY); INSERT INTO meetings DEFAULT VALUES;",
+        )
+        .unwrap();
+        assert_eq!(table_count(&conn, "meetings").unwrap(), 1);
+        assert_eq!(table_count(&conn, "action_items").unwrap(), 0);
+    }
 
     /// A plaintext DB is migrated to SQLCipher in place: row counts are
     /// preserved, the result needs the key, and a plaintext backup is kept.

@@ -5,6 +5,26 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.65] - 2026-07-25
+
+### Fixed
+- **Recording no longer dead-ends after an update.** macOS revokes Screen
+  Recording permission whenever an app is replaced, so updating could leave
+  Record failing with an unreadable error and no way forward. Adversaria now
+  checks before it starts recording and offers the two steps that fix it —
+  opening the right System Settings pane, and relaunching, which macOS
+  requires before a new grant takes effect.
+
+## [0.3.64] - 2026-07-25
+
+### Fixed
+- **Recording permissions are asked during setup instead of mid-meeting.**
+  Previously the app waited until you pressed Record for the first time, then
+  macOS interrupted with a permission prompt — and granting Screen Recording
+  required quitting and reopening the app. Setup now asks for both up front,
+  shows which are granted, opens the exact System Settings pane if one was
+  refused, and offers a Relaunch button when macOS needs a restart to apply it.
+
 ## [0.3.63] - 2026-07-25
 
 ### Added

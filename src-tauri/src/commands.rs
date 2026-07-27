@@ -93,7 +93,11 @@ pub fn spawn_sidecar(app: &AppHandle) {
     };
     let exe = resource_dir
         .join("adversaria-service")
-        .join("adversaria-service");
+        .join(if cfg!(windows) {
+            "adversaria-service.exe"
+        } else {
+            "adversaria-service"
+        });
     if !exe.exists() {
         return; // dev / not bundled — use the manually-run service
     }
@@ -107,21 +111,38 @@ pub fn spawn_sidecar(app: &AppHandle) {
         return;
     };
 
-    // Ensure ffmpeg (mlx-whisper shells out to it) resolves, and keep HF model
-    // downloads working on this box (broken hf_xet).
-    let path = std::env::var("PATH").unwrap_or_default();
-    let path = format!("/opt/homebrew/bin:/usr/local/bin:{path}");
-
-    match std::process::Command::new(&exe)
+    let mut command = std::process::Command::new(&exe);
+    command
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
-        .env("PATH", path)
-        .env("HF_HUB_DISABLE_XET", "1")
-        .current_dir(exe.parent().unwrap())
-        .spawn()
+        .current_dir(exe.parent().unwrap());
+
+    // Ensure ffmpeg (mlx-whisper shells out to it) resolves, and keep HF model
+    // downloads working on this box (broken hf_xet). Both are macOS-specific:
+    // the Windows sidecar has no ffmpeg dependency (faster-whisper decodes via
+    // the bundled `av`), and prepending POSIX paths to a Windows PATH is noise.
+    #[cfg(target_os = "macos")]
     {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command
+            .env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"))
+            .env("HF_HUB_DISABLE_XET", "1");
+    }
+
+    // The sidecar is a background service with no UI. Without CREATE_NO_WINDOW a
+    // console window flashes on every app launch — and, because the parent is a
+    // GUI process with no console of its own, Windows would otherwise allocate a
+    // fresh one for the child.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    match command.spawn() {
         Ok(child) => {
             *app.state::<AppState>().sidecar.lock().unwrap() = Some(child);
             app.state::<AppState>()
@@ -137,6 +158,19 @@ pub fn spawn_sidecar(app: &AppHandle) {
 pub fn shutdown_sidecar(state: &AppState) {
     crate::setup::stop(&state.managed_llm);
     if let Some(mut child) = state.sidecar.lock().unwrap().take() {
+        // `kill()` is TerminateProcess on Windows, which terminates ONLY the
+        // named process — any helper it spawned survives, keeps the loopback
+        // port bound, and the next launch fails to start its own sidecar. Kill
+        // the whole tree first; kill()+wait() below still reaps our own handle.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &child.id().to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -146,6 +180,11 @@ pub fn shutdown_sidecar(state: &AppState) {
 // Recording
 // ---------------------------------------------------------------------------
 
+/// Marks an error the UI should render with "Open Settings" / "Relaunch"
+/// buttons rather than as plain text. Kept in sync with `PERMISSION_ERROR_PREFIX`
+/// in `src/lib/tauri.ts`.
+pub const PERMISSION_ERROR_PREFIX: &str = "PERMISSION_REQUIRED:";
+
 /// Begin WASAPI loopback audio capture.  Audio is written to a
 /// timestamped WAV file under the app-data `recordings/` directory so a
 /// recording kept for later transcription (ML service down at stop time)
@@ -154,6 +193,20 @@ pub fn shutdown_sidecar(state: &AppState) {
 pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     if state.capture.is_recording() {
         return Err("Already recording".to_string());
+    }
+    // Pre-flight the capture permission. macOS revokes Screen Recording when the
+    // app bundle is replaced, so an *updated* user hits this even though they
+    // granted it before — and they never see first-run setup again. Without this
+    // check the failure surfaces from deep inside ScreenCaptureKit as a raw
+    // `NoShareableContent(...)` debug string, after a capture session has already
+    // been half-started. The sentinel prefix lets the UI offer the two buttons
+    // that actually fix it instead of printing an error nobody can act on.
+    let perms = crate::permissions::check();
+    if perms.screen_recording != crate::permissions::PermissionState::Granted {
+        return Err(format!(
+            "{PERMISSION_ERROR_PREFIX}Adversaria needs Screen Recording permission to capture \
+             meeting audio. macOS asks again whenever the app updates."
+        ));
     }
     let dir = crate::config::recordings_dir()
         .map_err(|e| format!("Could not prepare recordings directory: {e}"))?;
@@ -3756,8 +3809,8 @@ pub fn complete_onboarding_step(
 }
 
 #[tauri::command]
-pub fn get_setup_status(app: AppHandle) -> crate::types::SetupStatus {
-    crate::setup::setup_status(&app)
+pub async fn get_setup_status(app: AppHandle) -> crate::types::SetupStatus {
+    crate::setup::setup_status(&app).await
 }
 
 #[tauri::command]
@@ -3820,7 +3873,13 @@ pub async fn set_local_model_profile(
     state: State<'_, AppState>,
     profile_id: String,
 ) -> Result<crate::types::ManagedLlmStatus, String> {
-    crate::setup::pinned_snapshot(&profile_id)?;
+    // Ollama models have no pinned HF snapshot to verify — `setup::start` checks
+    // the tag is actually served instead, which is the equivalent "don't disrupt
+    // a working engine for a broken target" guard. Running the snapshot check on
+    // an `ollama:` id would reject every local switch off Apple Silicon.
+    if !profile_id.starts_with("ollama:") {
+        crate::setup::pinned_snapshot(&profile_id)?;
+    }
     crate::registration::set_selected_model_profile(&profile_id)?;
     crate::setup::stop(&state.managed_llm);
     crate::setup::start(&app, &state.managed_llm, &profile_id).await
@@ -3828,8 +3887,19 @@ pub async fn set_local_model_profile(
 
 #[tauri::command]
 pub async fn test_local_setup(state: State<'_, AppState>) -> Result<String, String> {
-    let (base_url, api_key) = crate::setup::managed_credentials()
-        .ok_or_else(|| "Start the managed local model before running the sample.".to_string())?;
+    // Rapid-MLX serves on a per-launch loopback URL + key, so the sample has to
+    // be pointed at it. Ollama is addressed by the Python service itself from
+    // config, so there is nothing to pass — and a `None` base URL is exactly how
+    // the summarizer selects its Ollama backend.
+    //
+    // Absent credentials therefore mean "local engine is Ollama", not "nothing
+    // started": the caller (`runSample`) always starts the managed runtime first
+    // and surfaces that error, so requiring them here only ever broke the
+    // non-Apple-Silicon path.
+    let (base_url, api_key) = match crate::setup::managed_credentials() {
+        Some((url, key)) => (Some(url), Some(key)),
+        None => (None, None),
+    };
     let response = state
         .client
         .summarize(SummarizeParams {
@@ -3840,8 +3910,8 @@ pub async fn test_local_setup(state: State<'_, AppState>) -> Result<String, Stri
             model: Some(configured_model().unwrap_or_else(|| "default".to_string())),
             output_language: Some("en".to_string()),
             user_notes: None,
-            llm_base_url: Some(base_url),
-            llm_api_key: Some(api_key),
+            llm_base_url: base_url,
+            llm_api_key: api_key,
             known_attendees: Some(vec!["Amina".to_string(), "Omar".to_string()]),
             category_hint: Some("meeting".to_string()),
             auto_template: false,
@@ -4200,6 +4270,67 @@ pub async fn calendar_event_at(at: String) -> Result<Option<CalendarEvent>, Stri
 }
 
 // ---------------------------------------------------------------------------
+// Capture permissions — asked during setup, not at the first recording
+// ---------------------------------------------------------------------------
+
+/// Current TCC state for microphone + screen recording.
+#[tauri::command]
+pub async fn check_capture_permissions() -> Result<crate::permissions::CapturePermissions, String> {
+    Ok(crate::permissions::check())
+}
+
+/// Show the macOS microphone prompt. Blocks until the user answers, so it runs
+/// on a blocking thread rather than stalling the async runtime.
+#[tauri::command]
+pub async fn request_microphone_permission() -> Result<crate::permissions::PermissionState, String>
+{
+    tauri::async_runtime::spawn_blocking(crate::permissions::request_microphone)
+        .await
+        .map_err(|e| format!("Permission request failed: {e}"))
+}
+
+/// Ask for Screen Recording. macOS only ever shows this prompt once per
+/// install; a `denied` result means the user must use System Settings.
+#[tauri::command]
+pub async fn request_screen_permission() -> Result<crate::permissions::PermissionState, String> {
+    tauri::async_runtime::spawn_blocking(crate::permissions::request_screen_recording)
+        .await
+        .map_err(|e| format!("Permission request failed: {e}"))
+}
+
+/// Open the exact System Settings pane for a permission. Also records that the
+/// user went to grant Screen Recording, so the UI can offer the relaunch macOS
+/// requires before the grant takes effect.
+#[tauri::command]
+pub async fn open_privacy_settings(app: AppHandle, which: String) -> Result<(), String> {
+    if which != "microphone" {
+        crate::permissions::mark_screen_granted_externally();
+    }
+    let _ = app;
+    // `open` handles the x-apple.systempreferences: scheme; the shell plugin's
+    // scope would need a matching allowlist entry for a URL this exotic.
+    // Windows has no equivalent deep link (permissions::check() reports
+    // everything granted there), so the whole body is macOS-only — including
+    // resolving the URL, which is otherwise an unused-variable error under the
+    // `-D warnings` clippy gate.
+    #[cfg(target_os = "macos")]
+    {
+        let url = crate::permissions::settings_url(&which);
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("Couldn't open System Settings: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Restart the app so a freshly granted Screen Recording permission applies.
+#[tauri::command]
+pub async fn relaunch_for_permissions(app: AppHandle) -> Result<(), String> {
+    app.restart();
+}
+
+// ---------------------------------------------------------------------------
 // Calendar — macOS EventKit (Phase 4, zero sign-in)
 // ---------------------------------------------------------------------------
 
@@ -4419,6 +4550,20 @@ fn spawn_live_caption(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    /// The frontend branches on this prefix to decide whether to show the
+    /// "Open Settings" / "Relaunch" buttons. If the two copies drift, the
+    /// banner silently degrades to unactionable text — so pin them together.
+    #[test]
+    fn permission_error_prefix_matches_the_frontend() {
+        let ts = include_str!("../../src/lib/tauri.ts");
+        assert!(
+            ts.contains(&format!(
+                "PERMISSION_ERROR_PREFIX = \"{PERMISSION_ERROR_PREFIX}\""
+            )),
+            "src/lib/tauri.ts must define PERMISSION_ERROR_PREFIX as {PERMISSION_ERROR_PREFIX:?}"
+        );
+    }
+
     use super::*;
 
     #[test]
