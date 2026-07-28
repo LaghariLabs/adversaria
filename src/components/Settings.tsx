@@ -34,7 +34,12 @@ const TABS: { id: SettingsTab; label: string; icon: JSX.Element }[] = [
  * is a card in `./settings/` that receives the config and edits it through
  * `update` (saved on Save) or `persist` (written immediately).
  */
-export function Settings() {
+interface SettingsProps {
+  /** Tab to open on (used by the guided tour to land on AI Model). */
+  initialTab?: string;
+}
+
+export function Settings({ initialTab }: SettingsProps) {
   // App version (so the user can always tell which build is running).
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
@@ -46,7 +51,9 @@ export function Settings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("general");
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>(
+    (initialTab as SettingsTab) || "general",
+  );
 
   const loadConfig = useCallback(async () => {
     try {

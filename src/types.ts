@@ -221,6 +221,8 @@ export interface AppConfig {
   /** OS notification N minutes before a calendar meeting starts. */
   meeting_reminder_enabled: boolean;
   meeting_reminder_minutes: number;
+  /** One-time guided tour shown after setup; true once finished or skipped. */
+  tour_completed: boolean;
   calendar: CalendarConfig;
 }
 

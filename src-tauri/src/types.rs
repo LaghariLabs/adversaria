@@ -504,6 +504,10 @@ pub struct AppConfig {
     /// `meeting_reminder_enabled` is set.
     #[serde(default = "default_meeting_reminder_minutes")]
     pub meeting_reminder_minutes: u32,
+    /// One-time guided tour after setup (coach marks ending on Settings › AI
+    /// Model). False = not yet shown; set true on finish OR skip.
+    #[serde(default)]
+    pub tour_completed: bool,
 }
 
 fn default_whisper_model() -> String {

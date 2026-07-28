@@ -9,6 +9,7 @@ import {
   listTemplates,
   mergeMeetingSpeakers,
   updateMeetingLink,
+  engineConfigured,
   resummarizeMeeting,
   retryRecordingCleanup,
   structureNote,
@@ -127,6 +128,8 @@ export function NoteViewer({
   const [language, setLanguage] = useState<SummaryLanguage>("en");
   const [resummarizing, setResummarizing] = useState(false);
   const [resummarizeError, setResummarizeError] = useState<string | null>(null);
+  // Only probed for the empty-summary state; null = unknown (probe pending).
+  const [hasEngine, setHasEngine] = useState<boolean | null>(null);
 
   // A "pending" meeting is one saved when transcription couldn't run (ML
   // service down at stop time): the audio is kept on disk and there's no
@@ -339,6 +342,15 @@ export function NoteViewer({
     setSummaryDraft(meeting.summary);
     setEditingSummary(false);
   }, [meeting.summary]);
+
+  // Empty-summary meetings show the choose-an-engine CTA; check whether an
+  // engine can actually serve so the copy tells the truth.
+  useEffect(() => {
+    if (meeting.summary.trim() !== "") return;
+    engineConfigured()
+      .then(setHasEngine)
+      .catch(() => setHasEngine(null));
+  }, [meeting.id, meeting.summary]);
 
   const handleSaveSummary = async () => {
     setSavingSummary(true);
@@ -1106,6 +1118,24 @@ export function NoteViewer({
                   were picked up as separate people, or fix any other detail.
                 </p>
               </>
+            ) : meeting.summary.trim() === "" ? (
+              /* No-engine-yet is a legal state (SPEC v2): the transcript is
+                 safe, and notes generate retroactively once an engine exists. */
+              <div className="summary-empty-state">
+                <strong>Transcript saved — notes haven't been written yet.</strong>
+                <p>
+                  {hasEngine === false
+                    ? "Choose how notes get written in Settings → AI Model (download a local model or connect your own provider), then come back and generate."
+                    : "Your engine is configured — generate the notes whenever you're ready."}
+                </p>
+                <button
+                  className="btn-primary"
+                  onClick={handleResummarize}
+                  disabled={resummarizing}
+                >
+                  {resummarizing ? "Writing notes…" : "Generate notes"}
+                </button>
+              </div>
             ) : (
               <SummaryView
                 summary={meeting.summary}

@@ -60,11 +60,16 @@ interface AiModelTabProps {
 }
 
 /**
- * AI Model — the model that writes your notes. On-device model first; the
- * external-service configuration lives behind the Advanced disclosure.
+ * AI Model — the model that writes your notes (SPEC v2: Meetily-shaped).
+ *
+ * Provider dropdown first; when Local is selected, a dropdown lists the models
+ * already on this machine, with the hardware-recommended one labeled when it
+ * isn't downloaded yet. Downloads start ONLY from the explicit button — and on
+ * platforms whose managed engine isn't installed, that click first surfaces
+ * the transparent install-plan consent card. API providers are first-class:
+ * their key/model fields render inline, not behind a disclosure.
  */
 export function AiModelTab({ active, config, update, replaceConfig }: AiModelTabProps) {
-  // On-device meeting-model (Rapid-MLX profile) picker — Local engine only.
   const [setup, setSetup] = useState<SetupStatus | null>(null);
   const [modelSwitching, setModelSwitching] = useState(false);
   const [modelMsg, setModelMsg] = useState("");
@@ -73,6 +78,11 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
     "checking" | "ok" | "degraded" | "unreachable"
   >("checking");
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Which profile the dropdown is showing (not necessarily in use yet).
+  const [chosenId, setChosenId] = useState<string | null>(null);
+  // Windows: a Download click on a pinned tier first opens the engine consent
+  // card; the model download follows only after the engine install succeeds.
+  const [engineConsentFor, setEngineConsentFor] = useState<string | null>(null);
 
   const [llmTest, setLlmTest] = useState<{
     status: "idle" | "testing" | "ok" | "error";
@@ -98,16 +108,33 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
     }
   }, []);
 
-  // Read hardware + pinned meeting-model profiles once, for the Local engine
-  // picker. Cheap and best-effort; the free-text model field remains the
-  // fallback when this build has no bundled managed runtime.
   useEffect(() => {
     getSetupStatus().then(setSetup).catch(() => {});
     checkHealth();
   }, [checkHealth]);
 
-  // While a profile downloads, poll until it verifies, then refresh the
-  // profiles so the row flips to "Verified" (mirrors the Welcome flow).
+  const switchLocalModel = useCallback(
+    async (profileId: string) => {
+      setModelSwitching(true);
+      setModelMsg("Switching model — the on-device engine is restarting…");
+      try {
+        await setLocalModelProfile(profileId);
+        const [cfg, next] = await Promise.all([getConfig(), getSetupStatus()]);
+        replaceConfig(cfg);
+        setSetup(next);
+        setModelMsg("Model switched. It can take a minute to finish loading.");
+      } catch (e) {
+        setModelMsg(String(e));
+      } finally {
+        setModelSwitching(false);
+      }
+    },
+    [replaceConfig],
+  );
+
+  // While a profile downloads, poll until it verifies — then make it the
+  // active model: the user explicitly asked for THIS model, so finishing the
+  // download and not using it would be a dead end.
   useEffect(() => {
     if (!profileDownload || !["preparing", "downloading", "verifying"].includes(profileDownload.state)) {
       return;
@@ -116,31 +143,29 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
       getModelDownloadStatus(profileDownload.profile_id)
         .then(async (status) => {
           setProfileDownload(status);
-          if (status.state === "ready") setSetup(await getSetupStatus());
+          if (status.state === "ready") {
+            setSetup(await getSetupStatus());
+            await switchLocalModel(status.profile_id);
+          }
         })
         .catch(() => {});
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [profileDownload?.profile_id, profileDownload?.state]);
-
-  const switchLocalModel = async (profileId: string) => {
-    setModelSwitching(true);
-    setModelMsg("Switching model — the on-device engine is restarting…");
-    try {
-      await setLocalModelProfile(profileId);
-      const [cfg, next] = await Promise.all([getConfig(), getSetupStatus()]);
-      replaceConfig(cfg);
-      setSetup(next);
-      setModelMsg("Model switched. It can take a minute to finish loading.");
-    } catch (e) {
-      setModelMsg(String(e));
-    } finally {
-      setModelSwitching(false);
-    }
-  };
+  }, [profileDownload?.profile_id, profileDownload?.state, switchLocalModel]);
 
   const downloadLocalModel = async (profileId: string) => {
     setModelMsg("");
+    // Consent gate (SPEC v2/§D): a pinned tier on a platform without the
+    // managed engine shows the install plan BEFORE anything downloads.
+    if (
+      setup &&
+      setup.platform !== "macos" &&
+      !setup.managed_engine_installed &&
+      !profileId.startsWith("ollama:")
+    ) {
+      setEngineConsentFor(profileId);
+      return;
+    }
     try {
       setProfileDownload(await startModelDownload(profileId));
     } catch (e) {
@@ -149,9 +174,20 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
   };
 
   const isCloud = config.llm_provider !== "local";
+  const deviceLabel = setup?.platform === "macos" ? "Mac" : "PC";
+
+  const profiles = setup?.profiles ?? [];
+  const inUse = profiles.find((p) => p.model_alias === config.ollama_model);
+  const recommended = profiles.find((p) => p.recommended);
+  const chosen =
+    profiles.find((p) => p.id === chosenId) ?? inUse ?? recommended ?? profiles[0];
+  const chosenDownloading =
+    chosen &&
+    profileDownload?.profile_id === chosen.id &&
+    ["preparing", "downloading", "verifying"].includes(profileDownload.state);
 
   return (
-    <div className={`settings-section-card${active ? " active-card" : ""}`}>
+    <div className={`settings-section-card${active ? " active-card" : ""}`} data-tour="ai-model">
       <h3 className="settings-card-title">AI Model</h3>
       <p className="settings-card-desc">
         The model that turns transcripts into notes. <strong>Local</strong> runs on
@@ -160,7 +196,7 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
         transcript away for summarizing.
       </p>
 
-      {/* Engine */}
+      {/* Provider — first-class, first control. */}
       <div className="settings-form-group">
         <label className="settings-label" htmlFor="settings-provider">Engine</label>
         <select
@@ -187,9 +223,6 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
             if (provider !== "custom") {
               patch.ollama_model = DEFAULT_MODEL[provider];
             }
-            // Picking an online service means the setup for it (key, address)
-            // is what you need next — open Advanced so it isn't a dead end.
-            if (provider !== "local") setAdvancedOpen(true);
             update(patch);
           }}
           className="settings-select"
@@ -203,86 +236,104 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
         </select>
       </div>
 
-      {/* Off Apple Silicon the managed engine is llama.cpp and needs a
-          one-time consented install ('Not now' in the wizard lands here). The
-          card names exactly what installs before anything happens. */}
-      {config.llm_provider === "local" &&
-        setup &&
-        setup.platform !== "macos" &&
-        !setup.managed_engine_installed && (
-          <EngineInstallCard
-            onInstalled={() => {
-              getSetupStatus().then(setSetup).catch(() => {});
-            }}
-          />
-        )}
-
-      {/* The Local engine gets a curated on-device model picker (recommend,
-          never force). It only appears when this build actually bundles the
-          managed runtime (macOS/Apple Silicon); otherwise the free-text model
-          field under Advanced is the way in. */}
-      {config.llm_provider === "local" && setup?.rapid_runtime_bundled && (
+      {/* Local: dropdown of what's on this machine; the recommended model is
+          labeled when missing and downloads only from the button below. */}
+      {config.llm_provider === "local" && profiles.length > 0 && chosen && (
         <div className="settings-form-group">
-          <label className="settings-label">On-device meeting model</label>
-          <p className="settings-card-desc">
-            {setup.profiles.find((p) => p.recommended)?.display_name ?? "The lighter model"} is
-            recommended for your Mac ({(setup.total_memory_bytes / 1e9).toFixed(0)} GB). Switching
-            restarts the on-device engine and takes effect without a restart — nothing else is changed.
+          <label className="settings-label" htmlFor="settings-local-model">Meeting model</label>
+          <select
+            id="settings-local-model"
+            className="settings-select"
+            value={chosen.id}
+            onChange={(e) => {
+              setChosenId(e.target.value);
+              setEngineConsentFor(null);
+              setModelMsg("");
+            }}
+          >
+            {profiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.display_name}
+                {profile.installed
+                  ? " — on this computer"
+                  : profile.recommended
+                    ? ` — Recommended for your ${deviceLabel} (not downloaded)`
+                    : " — not downloaded"}
+              </option>
+            ))}
+          </select>
+          <p className="settings-help">
+            {chosen.quality_note} Needs {chosen.minimum_memory_gb} GB RAM
+            {chosen.installed ? "." : ` · ${chosen.required_disk_gb} GB download.`}
           </p>
-          <div className="settings-model-list">
-            {setup.profiles.map((profile) => {
-              const inUse = profile.model_alias === config.ollama_model;
-              const downloading =
-                profileDownload?.profile_id === profile.id &&
-                ["preparing", "downloading", "verifying"].includes(profileDownload.state);
-              return (
-                <div className={`settings-model-row${inUse ? " active" : ""}`} key={profile.id}>
-                  <div className="settings-model-info">
-                    <strong>
-                      {profile.display_name}
-                      {profile.recommended ? " · Recommended" : ""}
-                    </strong>
-                    <small>
-                      Downloads {profile.required_disk_gb} GB · needs {profile.minimum_memory_gb} GB RAM ·{" "}
-                      {profile.installed ? "on this computer" : "not downloaded yet"}
-                    </small>
-                  </div>
-                  <div className="settings-model-action">
-                    {inUse ? (
-                      <span className="settings-model-inuse">In use</span>
-                    ) : downloading ? (
-                      <span className="settings-model-dl">
-                        {profileDownload && profileDownload.total_bytes > 0
-                          ? `${(profileDownload.downloaded_bytes / 1e9).toFixed(1)} / ${(profileDownload.total_bytes / 1e9).toFixed(1)} GB`
-                          : "Preparing…"}
-                      </span>
-                    ) : profile.installed ? (
-                      <button
-                        type="button"
-                        className="btn-ghost"
-                        disabled={modelSwitching}
-                        onClick={() => switchLocalModel(profile.id)}
-                      >
-                        {modelSwitching ? "Switching…" : "Use"}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="btn-ghost"
-                        disabled={modelSwitching}
-                        onClick={() => downloadLocalModel(profile.id)}
-                      >
-                        {profileDownload?.profile_id === profile.id && profileDownload.state === "error"
-                          ? "Retry"
-                          : "Download"}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+
+          <div className="settings-model-action-row">
+            {inUse?.id === chosen.id ? (
+              <span className="settings-model-inuse">In use</span>
+            ) : chosenDownloading ? (
+              <span className="settings-model-dl">
+                {profileDownload && profileDownload.total_bytes > 0
+                  ? `${(profileDownload.downloaded_bytes / 1e9).toFixed(1)} / ${(profileDownload.total_bytes / 1e9).toFixed(1)} GB`
+                  : "Preparing…"}
+              </span>
+            ) : chosen.installed ? (
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={modelSwitching}
+                onClick={() => switchLocalModel(chosen.id)}
+              >
+                {modelSwitching ? "Switching…" : "Use this model"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={modelSwitching}
+                onClick={() => downloadLocalModel(chosen.id)}
+              >
+                {profileDownload?.profile_id === chosen.id && profileDownload.state === "error"
+                  ? "Retry download"
+                  : `Download (${chosen.required_disk_gb} GB)`}
+              </button>
+            )}
           </div>
+          {chosenDownloading && profileDownload && profileDownload.total_bytes > 0 && (
+            <progress
+              value={profileDownload.downloaded_bytes}
+              max={profileDownload.total_bytes}
+            />
+          )}
           {modelMsg && <p className="settings-msg">{modelMsg}</p>}
+        </div>
+      )}
+
+      {/* Consent card appears ONLY after a Download click needs the engine. */}
+      {config.llm_provider === "local" && engineConsentFor && (
+        <EngineInstallCard
+          onInstalled={() => {
+            const profileId = engineConsentFor;
+            setEngineConsentFor(null);
+            getSetupStatus().then(setSetup).catch(() => {});
+            // The consent card named this model too — continue into its download.
+            if (profileId) {
+              startModelDownload(profileId)
+                .then(setProfileDownload)
+                .catch((e) => setModelMsg(String(e)));
+            }
+          }}
+          onDismiss={() => setEngineConsentFor(null)}
+        />
+      )}
+
+      {/* Local with nothing detected at all (no pinned tiers, no Ollama). */}
+      {config.llm_provider === "local" && profiles.length === 0 && setup && (
+        <div className="settings-form-group">
+          <div className="settings-note info">
+            No local notes engine was found on this computer yet. Pick an online
+            engine above, or type the model your own local server exposes under
+            Advanced.
+          </div>
         </div>
       )}
 
@@ -297,48 +348,36 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
         </div>
       )}
 
-      {/* Advanced — everything about connecting an online service, plus the
-          local service plumbing. Opens automatically when a service is picked. */}
-      <details
-        className="settings-advanced"
-        open={advancedOpen}
-        onToggle={(e) => setAdvancedOpen(e.currentTarget.open)}
-      >
-        <summary>Advanced — online services &amp; connection details</summary>
-
-        {/* Groq onboarding helper */}
-        {config.llm_provider === "groq" && (
-          <div className="settings-form-group" style={{ marginTop: 12 }}>
-            <div className="settings-note info">
-              Get a free API key at{" "}
-              <button className="btn-link" onClick={() => open("https://console.groq.com/keys")}>
-                console.groq.com/keys
-              </button>{" "}
-              — no credit card needed. Paste it in the API Key field below.
+      {/* API provider setup — first-class, inline (SPEC v2), not "Advanced". */}
+      {isCloud && (
+        <>
+          {config.llm_provider === "groq" && (
+            <div className="settings-form-group">
+              <div className="settings-note info">
+                Get a free API key at{" "}
+                <button className="btn-link" onClick={() => open("https://console.groq.com/keys")}>
+                  console.groq.com/keys
+                </button>{" "}
+                — no credit card needed. Paste it in the API Key field below.
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Base URL — custom only (other providers are preset) */}
-        {config.llm_provider === "custom" && (
-          <div className="settings-form-group" style={{ marginTop: 12 }}>
-            <label className="settings-label" htmlFor="settings-base-url">Base URL</label>
-            <input
-              id="settings-base-url"
-              type="text"
-              value={config.llm_base_url}
-              onChange={(e) => update({ llm_base_url: e.target.value })}
-              className="settings-input-text"
-              placeholder="https://api.example.com/v1"
-            />
-          </div>
-        )}
+          {config.llm_provider === "custom" && (
+            <div className="settings-form-group">
+              <label className="settings-label" htmlFor="settings-base-url">Base URL</label>
+              <input
+                id="settings-base-url"
+                type="text"
+                value={config.llm_base_url}
+                onChange={(e) => update({ llm_base_url: e.target.value })}
+                className="settings-input-text"
+                placeholder="https://api.example.com/v1"
+              />
+            </div>
+          )}
 
-        {/* Model name — free text for every engine the on-device picker above
-            doesn't cover (all online services, and local builds without the
-            bundled runtime). */}
-        {!(config.llm_provider === "local" && setup?.rapid_runtime_bundled) && (
-          <div className="settings-form-group" style={{ marginTop: 12 }}>
+          <div className="settings-form-group">
             <label className="settings-label" htmlFor="settings-model">Model</label>
             <input
               id="settings-model"
@@ -349,10 +388,7 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
               placeholder={MODEL_PLACEHOLDER[config.llm_provider] ?? "model-name"}
             />
           </div>
-        )}
 
-        {/* API key (online services only) */}
-        {isCloud && (
           <div className="settings-form-group">
             <label className="settings-label" htmlFor="settings-api-key">API Key</label>
             <div className="settings-row">
@@ -375,6 +411,31 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
             </div>
             {llmTest.status === "ok" && <p className="settings-msg ok">{llmTest.msg}</p>}
             {llmTest.status === "error" && <p className="settings-msg err">{llmTest.msg}</p>}
+          </div>
+        </>
+      )}
+
+      {/* Advanced — local service plumbing only. */}
+      <details
+        className="settings-advanced"
+        open={advancedOpen}
+        onToggle={(e) => setAdvancedOpen(e.currentTarget.open)}
+      >
+        <summary>Advanced — connection details</summary>
+
+        {/* Model free-text for a local setup with no detected profiles (e.g.
+            the user's own OpenAI-compatible server on this machine). */}
+        {config.llm_provider === "local" && profiles.length === 0 && (
+          <div className="settings-form-group" style={{ marginTop: 12 }}>
+            <label className="settings-label" htmlFor="settings-local-free-model">Model</label>
+            <input
+              id="settings-local-free-model"
+              type="text"
+              value={config.ollama_model}
+              onChange={(e) => update({ ollama_model: e.target.value })}
+              className="settings-input-text"
+              placeholder={MODEL_PLACEHOLDER.local}
+            />
           </div>
         )}
 

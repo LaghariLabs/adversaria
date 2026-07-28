@@ -5,6 +5,33 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.66] - 2026-07-28
+
+### Changed
+- **Setup is now three screens instead of seven** — your name, recording
+  permissions (macOS only; Windows setup is two screens), and Ready. Model
+  downloads and the first-notes verification run in the background: you can
+  start using Adversaria immediately, and a small status bar tracks progress
+  until your private engine is verified.
+- **Settings reorganized into five tabs** (General, AI Model, Recording,
+  Templates & Calendar, Privacy & Data). Your name is the first thing in
+  General. Engine jargon is gone from every label.
+
+### Added
+- **Meeting reminders.** Setup asks once: "Notify me before my meetings
+  start." One notification per meeting from your connected calendar,
+  2–15 minutes ahead, controlled from Settings → General.
+- **Windows: a transparent local engine.** Instead of asking you to install
+  Ollama, Adversaria offers to install its own engine — and names the exact
+  build, size, checksum, and download source of everything before you approve.
+  Machines that already run Ollama keep using it; nothing installs without
+  consent.
+
+### Fixed
+- **The model download progress bar no longer freezes at ~5%.** It previously
+  only counted completed files, so the main multi-GB download showed no
+  movement until it finished. It now tracks bytes as they arrive.
+
 ## [0.3.65] - 2026-07-25
 
 ### Fixed
