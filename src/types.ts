@@ -218,6 +218,9 @@ export interface AppConfig {
   second_brain_path: string;
   /** Auto-export the meeting graph after every meeting change. */
   second_brain_enabled: boolean;
+  /** OS notification N minutes before a calendar meeting starts. */
+  meeting_reminder_enabled: boolean;
+  meeting_reminder_minutes: number;
   calendar: CalendarConfig;
 }
 
@@ -268,6 +271,33 @@ export interface SetupStatus {
   rapid_runtime_bundled: boolean;
   profiles: ModelProfile[];
   recommended_profile: string;
+  /** Detected GPU (informational); absent on Apple Silicon / no nvidia-smi. */
+  gpu_name?: string | null;
+  /** Managed llama.cpp engine installed (non-Apple-Silicon platforms). */
+  managed_engine_installed?: boolean;
+}
+
+/** Everything the transparent Windows engine install would do — shown on the
+ * consent card BEFORE anything downloads (SETUP_REDESIGN_SPEC §D). */
+export interface EngineInstallPlan {
+  schema_version: number;
+  engine_name: string;
+  engine_version: string;
+  asset_name: string;
+  asset_size_bytes: number;
+  asset_sha256: string;
+  source_url: string;
+  install_dir: string;
+  engine_installed: boolean;
+  gpu: string | null;
+  model_profile_id: string;
+  model_display_name: string;
+  model_repo: string;
+  model_revision: string;
+  model_file: string;
+  model_size_bytes: number;
+  model_sha256: string;
+  model_installed: boolean;
 }
 
 export interface ManagedLlmStatus {

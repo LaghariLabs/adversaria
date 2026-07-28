@@ -86,7 +86,7 @@ pub fn downloadable_profile(profile_id: &str) -> bool {
     profile_alias(profile_id).is_some() || matches!(profile_id, "whisper-main" | "whisper-live")
 }
 
-fn cache_root() -> Option<PathBuf> {
+pub(crate) fn cache_root() -> Option<PathBuf> {
     std::env::var_os("HF_HOME")
         .map(PathBuf::from)
         .map(|path| path.join("hub"))
@@ -262,7 +262,38 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
     // Silicon on the MLX list either way, and correctly routes Intel Macs — where
     // Rapid-MLX can never run — to Ollama alongside Windows and Linux.
     if !rapid_mlx_supported() {
-        let profiles = ollama_profiles(memory_gb).await;
+        let mut ollama = ollama_profiles(memory_gb).await;
+        let engine_installed = crate::llama_engine::engine_installed();
+        let pinned = crate::llama_engine::recommended_gguf(memory_gb, disk_gb);
+        // The managed tiers are the product default once their engine exists —
+        // and when there is no Ollama to lean on, they are the only zero-terminal
+        // path, so they carry the recommendation (behind the consent screen).
+        // An already-working Ollama install keeps its recommendation until the
+        // user opts into the managed engine.
+        let prefer_managed = engine_installed || !ollama.iter().any(|profile| profile.recommended);
+        if prefer_managed {
+            for profile in &mut ollama {
+                profile.recommended = false;
+            }
+        }
+        let mut profiles: Vec<ModelProfile> = crate::llama_engine::GGUF_PINS
+            .iter()
+            .map(|pin| ModelProfile {
+                id: pin.profile_id.to_string(),
+                display_name: pin.display_name.to_string(),
+                model_alias: pin.alias.to_string(),
+                model_repo: pin.repo.to_string(),
+                model_revision: pin.revision.to_string(),
+                runtime: "llama-cpp-pinned".to_string(),
+                minimum_memory_gb: pin.minimum_memory_gb,
+                required_disk_gb: pin.required_disk_gb,
+                quality_label: pin.quality_label.to_string(),
+                quality_note: pin.quality_note.to_string(),
+                installed: crate::llama_engine::gguf_installed(pin),
+                recommended: prefer_managed && pin.profile_id == pinned.profile_id,
+            })
+            .collect();
+        profiles.append(&mut ollama);
         let recommended_profile = profiles
             .iter()
             .find(|profile| profile.recommended)
@@ -277,6 +308,8 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
             rapid_runtime_bundled: runtime,
             recommended_profile,
             profiles,
+            gpu_name: crate::llama_engine::detect_gpu(),
+            managed_engine_installed: engine_installed,
         };
     }
 
@@ -345,6 +378,10 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
         }
         .to_string(),
         profiles,
+        // Apple Silicon's engine is the bundled Rapid-MLX; the managed
+        // llama.cpp fields only mean something off this platform.
+        gpu_name: None,
+        managed_engine_installed: false,
     }
 }
 
@@ -464,6 +501,16 @@ pub async fn start(
     // Apple Silicon only" on a machine that was never going to run Rapid-MLX.
     // A stale id resolves to the configured Ollama tag instead.
     if !rapid_mlx_supported() {
+        // Managed llama.cpp first: a pinned GGUF tier whose engine + weights
+        // are both installed serves exactly like Rapid-MLX does on macOS
+        // (loopback port, per-launch key). Anything else — `ollama:` ids,
+        // tiers not yet downloaded, engine not consented/installed — falls
+        // through to the Ollama path unchanged.
+        if let Some(pin) = crate::llama_engine::gguf_pin(profile_id) {
+            if crate::llama_engine::engine_installed() && crate::llama_engine::gguf_installed(pin) {
+                return start_llama_server(process, pin).await;
+            }
+        }
         let tag = profile_id
             .strip_prefix("ollama:")
             .map(str::to_string)
@@ -553,6 +600,103 @@ pub async fn start(
     }
     stop(process);
     crate::diagnostics::record("local_model.timeout", profile_id);
+    Err("The local meeting model did not become ready within three minutes.".to_string())
+}
+
+/// Managed llama.cpp serve — the Windows twin of the Rapid-MLX spawn above
+/// (same loopback-port + per-launch-key + health-poll shape; kept separate
+/// rather than extracted so the macOS path stays byte-identical, per
+/// SETUP_REDESIGN_SPEC §D). Serves the pinned GGUF under the same alias
+/// `complete_step` wrote into `config.ollama_model`, so the summarizer's
+/// model name resolves without any Windows-specific config.
+async fn start_llama_server(
+    process: &std::sync::Mutex<Option<ManagedLlmProcess>>,
+    pin: &crate::llama_engine::GgufPin,
+) -> Result<ManagedLlmStatus, String> {
+    if process.lock().unwrap().is_some() {
+        return Ok(status(process));
+    }
+    let executable = crate::llama_engine::server_path();
+    let model = crate::llama_engine::gguf_path(pin)
+        .ok_or_else(|| "Could not locate the local model cache.".to_string())?;
+    crate::diagnostics::record("local_model.starting", pin.profile_id);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("Could not reserve a local model port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Could not inspect the local model port: {e}"))?
+        .port();
+    drop(listener);
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+    let api_key = random_api_key();
+    let mut command = std::process::Command::new(&executable);
+    command
+        .arg("-m")
+        .arg(model)
+        // Must match `profile_alias(pin.profile_id)` — pinned by a unit test
+        // in llama_engine.rs, because the summarizer requests this name.
+        .arg("--alias")
+        .arg(pin.alias)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--api-key")
+        .arg(&api_key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| format!("Could not start the local engine: {e}"))?;
+    set_managed_credentials(Some((base_url.clone(), api_key.clone())));
+    *process.lock().unwrap() = Some(ManagedLlmProcess {
+        child,
+        profile_id: pin.profile_id.to_string(),
+        ready: false,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("Could not create local model health client: {e}"))?;
+    for _ in 0..90 {
+        if process
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|managed| managed.child.try_wait().ok().flatten())
+            .is_some()
+        {
+            stop(process);
+            return Err(
+                "The local engine exited while loading. Retry from Settings › AI Model."
+                    .to_string(),
+            );
+        }
+        if client
+            .get(format!("{base_url}/models"))
+            .bearer_auth(&api_key)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            if let Some(managed) = process.lock().unwrap().as_mut() {
+                managed.ready = true;
+            }
+            crate::diagnostics::record("local_model.ready", pin.profile_id);
+            return Ok(status(process));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    stop(process);
+    crate::diagnostics::record("local_model.timeout", pin.profile_id);
     Err("The local meeting model did not become ready within three minutes.".to_string())
 }
 
