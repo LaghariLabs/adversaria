@@ -120,6 +120,8 @@ impl Default for AppConfig {
             meeting_alert_style: "notch_drop".to_string(),
             second_brain_path: String::new(),
             second_brain_enabled: false,
+            meeting_reminder_enabled: false,
+            meeting_reminder_minutes: 5,
         }
     }
 }

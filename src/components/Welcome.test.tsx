@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { OnboardingState, RegistrationState, SetupStatus } from "../types";
 import { appConfig } from "../test/fixtures";
-import { Welcome, resolveProfile } from "./Welcome";
+import { Welcome, resolveProfile, resolveScreen } from "./Welcome";
 
 const registration = (status: RegistrationState["status"] = "unregistered"): RegistrationState => ({
   schema_version: 1,
@@ -30,13 +30,13 @@ const onboarding = (completed_steps: string[] = [], setup_complete = false): Onb
   updated_at: "2026-07-14T10:00:00Z",
 });
 
-const setup = (installed = false): SetupStatus => ({
+const setup = (installed = false, platform = "macos"): SetupStatus => ({
   schema_version: 1,
-  platform: "macos",
-  architecture: "aarch64",
+  platform,
+  architecture: platform === "macos" ? "aarch64" : "x86_64",
   total_memory_bytes: 16_000_000_000,
   available_disk_bytes: 50_000_000_000,
-  rapid_runtime_bundled: true,
+  rapid_runtime_bundled: platform === "macos",
   recommended_profile: "qwen-4b-light",
   profiles: [{
     id: "qwen-4b-light",
@@ -54,8 +54,19 @@ const setup = (installed = false): SetupStatus => ({
   }],
 });
 
+const downloadStatus = (id: string) => ({
+  profile_id: id,
+  state: "ready",
+  downloaded_bytes: 1,
+  total_bytes: 1,
+  detail: "",
+  error_code: null,
+  verified: true,
+  can_retry: true,
+});
+
 describe("Welcome", () => {
-  it("requires explicit consent and continues when registration is queued offline", async () => {
+  it("requires explicit consent, then lands on permissions after registering", async () => {
     let submitted = false;
     mockIPC((command) => {
       if (command === "get_config") return appConfig();
@@ -67,6 +78,9 @@ describe("Welcome", () => {
       if (command === "submit_registration") {
         submitted = true;
         return registration("pending");
+      }
+      if (command === "start_model_download" || command === "get_model_download_status") {
+        return downloadStatus("whisper-main");
       }
       return null;
     });
@@ -83,38 +97,77 @@ describe("Welcome", () => {
     expect(submit).toBeEnabled();
     await user.click(submit);
 
-    expect(await screen.findByText("Choose where meeting notes are created")).toBeInTheDocument();
+    expect(await screen.findByText("Recording permissions")).toBeInTheDocument();
     expect(screen.getByText("Registration queued")).toBeInTheDocument();
     expect(screen.getByText(/Local setup can continue offline/)).toBeInTheDocument();
   });
 
-  it("resumes at the first incomplete step and persists a verified local profile", async () => {
-    let current = onboarding(["registration", "disclosure", "hardware"]);
+  it("resumes a legacy 7-step wizard on Ready and persists profile + completion", async () => {
+    // A user who finished everything except the old sample/capture steps must
+    // NOT restart setup — they land on Ready and finish in one click.
+    let current: OnboardingState = {
+      ...onboarding(["registration", "disclosure", "hardware", "model", "permissions"]),
+      selected_model_profile: "qwen-4b-light",
+    };
+    let savedReminder: boolean | null = null;
     mockIPC((command, payload) => {
       if (command === "get_config") return appConfig();
       if (command === "get_registration_state") return registration("submitted");
       if (command === "get_setup_status") return setup(true);
       if (command === "get_onboarding_state") return current;
+      if (command === "update_config") {
+        const args = payload as { config?: { meeting_reminder_enabled?: boolean } };
+        savedReminder = args.config?.meeting_reminder_enabled ?? null;
+        return null;
+      }
       if (command === "complete_onboarding_step") {
-        const args = payload as { step?: string; selectedModelProfile?: string };
-        expect(args.step).toBe("model");
+        const args = payload as { step?: string; selectedModelProfile?: string | null; setupComplete?: boolean };
+        expect(args.step).toBe("ready");
         expect(args.selectedModelProfile).toBe("qwen-4b-light");
-        current = { ...current, completed_steps: [...current.completed_steps, "model"], selected_model_profile: "qwen-4b-light" };
+        expect(args.setupComplete).toBe(true);
+        current = {
+          ...current,
+          completed_steps: [...current.completed_steps, "ready"],
+          setup_complete: true,
+        };
         return current;
       }
       if (command === "start_model_download" || command === "get_model_download_status") {
         const args = payload as { profileId?: string };
-        const id = args.profileId ?? "qwen-4b-light";
-        return { profile_id: id, state: "ready", downloaded_bytes: 1, total_bytes: 1, detail: "", error_code: null, verified: true, can_retry: true };
+        return downloadStatus(args.profileId ?? "qwen-4b-light");
       }
       return null;
     });
 
     const user = userEvent.setup();
     render(<Welcome />);
-    expect(await screen.findByText("Install a local meeting model")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Use this verified model" }));
-    await waitFor(() => expect(screen.getByText("Recording permissions")).toBeInTheDocument());
+    expect(await screen.findByText("You're ready")).toBeInTheDocument();
+    // The pre-meeting notification question lives HERE, not buried in
+    // Settings; it defaults on and persists when setup finishes.
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Start using Adversaria" }));
+    await waitFor(() => expect(screen.queryByText("You're ready")).not.toBeInTheDocument());
+    expect(savedReminder).toBe(true);
+  });
+
+  it("skips the permissions screen on Windows", async () => {
+    mockIPC((command, payload) => {
+      if (command === "get_config") return appConfig();
+      if (command === "get_registration_state") return registration("submitted");
+      if (command === "get_setup_status") return setup(false, "windows");
+      if (command === "get_onboarding_state") return onboarding(["registration"]);
+      if (command === "start_model_download" || command === "get_model_download_status") {
+        const args = payload as { profileId?: string };
+        return downloadStatus(args.profileId ?? "whisper-main");
+      }
+      return null;
+    });
+
+    render(<Welcome />);
+    expect(await screen.findByText("You're ready")).toBeInTheDocument();
+    expect(screen.queryByText("Recording permissions")).not.toBeInTheDocument();
+    // Two visible steps on Windows, and this is the last of them.
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
   });
 
   it("does not show setup for a migrated existing user", async () => {
@@ -122,7 +175,7 @@ describe("Welcome", () => {
       if (command === "get_config") return appConfig({ beta_onboarded: true });
       if (command === "get_registration_state") return registration("submitted");
       if (command === "get_setup_status") return setup(true);
-      if (command === "get_onboarding_state") return onboarding([...STEP_NAMES], true);
+      if (command === "get_onboarding_state") return onboarding([...LEGACY_STEP_NAMES, "ready"], true);
       return null;
     });
     render(<Welcome />);
@@ -142,7 +195,30 @@ describe("Welcome", () => {
   });
 });
 
-const STEP_NAMES = ["registration", "disclosure", "hardware", "model", "permissions", "sample", "capture"];
+const LEGACY_STEP_NAMES = ["registration", "disclosure", "hardware", "model", "permissions", "sample", "capture"];
+
+describe("resolveScreen", () => {
+  it("starts an empty row on registration", () => {
+    expect(resolveScreen([], "macos")).toBe("registration");
+  });
+
+  it("maps a legacy mid-wizard row onto the first missing new screen", () => {
+    // Completed registration + disclosure + hardware on the 7-step wizard.
+    expect(resolveScreen(["registration", "disclosure", "hardware"], "macos")).toBe("permissions");
+    // Past permissions (old step 5) — everything else folded into Ready.
+    expect(
+      resolveScreen(["registration", "disclosure", "hardware", "model", "permissions"], "macos"),
+    ).toBe("ready");
+    // Old "step 6/7" stall state: all but sample/capture.
+    expect(
+      resolveScreen(["registration", "disclosure", "hardware", "model", "permissions", "sample"], "macos"),
+    ).toBe("ready");
+  });
+
+  it("never shows permissions on Windows", () => {
+    expect(resolveScreen(["registration"], "windows")).toBe("ready");
+  });
+});
 
 describe("resolveProfile", () => {
   const withProfiles = (ids: string[], recommended: string): SetupStatus => ({

@@ -16,6 +16,7 @@ import { RecordingCompanion } from "./components/RecordingCompanion";
 import { ErrorBanner } from "./components/ErrorBanner";
 import { UpdatePrompt } from "./components/UpdatePrompt";
 import { Welcome } from "./components/Welcome";
+import { SetupStatusStrip } from "./components/SetupStatusStrip";
 import {
   getConfig,
   deleteMeeting,
@@ -625,6 +626,7 @@ function App() {
   return (
     <div className={`h-screen flex flex-col${companionActive ? " companion-mode" : ""}`}>
       <Welcome />
+      <SetupStatusStrip />
       <UpdatePrompt />
       {/* Intro / loading splash */}
       {showSplash && (

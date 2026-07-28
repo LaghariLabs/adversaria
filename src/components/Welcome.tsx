@@ -17,12 +17,8 @@ import {
   getRegistrationState,
   getSetupStatus,
   retryRegistration,
-  startManagedLlm,
   startModelDownload,
   submitRegistration,
-  testCloudSetup,
-  testLlmConnection,
-  testLocalSetup,
   updateConfig,
   checkCapturePermissions,
   requestMicrophonePermission,
@@ -31,20 +27,12 @@ import {
   relaunchForPermissions,
 } from "../lib/tauri";
 import type { CapturePermissions } from "../lib/tauri";
+import { EngineInstallCard } from "./EngineInstallCard";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main"] as const;
-const STEP_ORDER = [
-  "registration",
-  "disclosure",
-  "hardware",
-  "model",
-  "permissions",
-  "sample",
-  "capture",
-] as const;
+export const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main"] as const;
+const STEP_ORDER = ["registration", "permissions", "ready"] as const;
 type SetupStep = (typeof STEP_ORDER)[number];
-type ProviderChoice = "local" | "cloud";
 
 function formatGb(bytes: number): string {
   return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
@@ -80,8 +68,24 @@ export function resolveProfile(persisted: string, setup: SetupStatus): string {
     : setup.recommended_profile;
 }
 
-/** Restart-safe first-run setup. Every completed step is persisted by Rust; a
- * network failure queues registration locally and never blocks local setup. */
+/** Which of the 3 screens a (possibly legacy 7-step) onboarding row lands on.
+ *
+ * Read-side mapping, never a data migration: old rows keep their old step
+ * names, and whatever they completed carries over. Someone who finished
+ * registration + disclosure + hardware on the 7-step wizard resumes at
+ * Permissions; someone past permissions resumes at Ready. Windows has no
+ * TCC-style capture prompts, so the permissions screen never renders there. */
+export function resolveScreen(completedSteps: string[], platform: string): SetupStep {
+  if (!completedSteps.includes("registration")) return "registration";
+  if (platform === "macos" && !completedSteps.includes("permissions")) return "permissions";
+  return "ready";
+}
+
+/** Restart-safe first-run setup, three screens total. Every completed step is
+ * persisted by Rust; a network failure queues registration locally and never
+ * blocks local setup. Model downloads start immediately, continue after the
+ * wizard closes, and the sample verification runs in the background from
+ * SetupStatusStrip — the wizard never makes the user wait for either. */
 export function Welcome() {
   const [registration, setRegistration] = useState<RegistrationState>(emptyRegistration);
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
@@ -96,35 +100,34 @@ export function Welcome() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [consent, setConsent] = useState(false);
-  const [provider, setProvider] = useState<ProviderChoice>("local");
-  const [disclosureAccepted, setDisclosureAccepted] = useState(false);
+  // Asked once, here, because nobody discovers a notification toggle inside
+  // Settings. Defaults on; persisted only when setup finishes.
+  const [notifyBeforeMeetings, setNotifyBeforeMeetings] = useState(true);
   const [selectedProfile, setSelectedProfile] = useState("");
+  // A pinned tier on a platform whose managed engine isn't installed yet is
+  // consent-locked: NOTHING about it downloads until the user approves the
+  // transparent install plan (SETUP_REDESIGN_SPEC §D). Whisper models are
+  // exempt — transcription is core and disclosed on the first screen.
+  const engineConsentPending = Boolean(
+    setup &&
+      setup.platform !== "macos" &&
+      !setup.managed_engine_installed &&
+      selectedProfile &&
+      !selectedProfile.startsWith("ollama:"),
+  );
   // Profile ids the download pipeline may actually fetch. An Ollama model is
   // already on disk, and the Rust side's `downloadable_profile` rejects its id
   // outright — so including it here would raise "Unknown model profile" on the
   // start call and again on every one-second status poll.
   const engineDownloadIds = useMemo(
     () =>
-      selectedProfile && !selectedProfile.startsWith("ollama:")
+      selectedProfile && !selectedProfile.startsWith("ollama:") && !engineConsentPending
         ? [...ENGINE_WHISPER_IDS, selectedProfile]
         : [...ENGINE_WHISPER_IDS],
-    [selectedProfile],
+    [selectedProfile, engineConsentPending],
   );
   const [engineDownloads, setEngineDownloads] = useState<Record<string, ModelDownloadStatus>>({});
   const [engineError, setEngineError] = useState("");
-  const [cloudBaseUrl, setCloudBaseUrl] = useState("https://api.openai.com/v1");
-  const [cloudApiKey, setCloudApiKey] = useState("");
-  const [cloudModel, setCloudModel] = useState("");
-  const [cloudDisclosure, setCloudDisclosure] = useState(false);
-  const [sampleTitle, setSampleTitle] = useState("");
-  const [warmupSeconds, setWarmupSeconds] = useState<number | null>(null);
-
-  const refreshSetup = async () => {
-    const value = await getSetupStatus();
-    setSetup(value);
-    setSelectedProfile((current) => resolveProfile(current, value));
-    return value;
-  };
 
   useEffect(() => {
     Promise.all([
@@ -149,13 +152,9 @@ export function Welcome() {
         setConfig(nextConfig);
         setName(nextRegistration.name || nextConfig.user_name || "");
         setEmail(nextRegistration.email || nextConfig.user_email || "");
-        setProvider(nextConfig.llm_provider === "local" ? "local" : "cloud");
         setSelectedProfile(
           resolveProfile(nextOnboarding.selected_model_profile, nextSetup),
         );
-        setCloudBaseUrl(nextConfig.llm_base_url || "https://api.openai.com/v1");
-        setCloudApiKey(nextConfig.llm_api_key || "");
-        setCloudModel(nextConfig.ollama_model || "");
       })
       .catch(() => {
         setLoadingError("Setup state could not be loaded. Restart Adversaria and try again.");
@@ -164,9 +163,9 @@ export function Welcome() {
 
   // Whisper models are needed for every provider (transcription is always
   // on-device), so start caching them the moment first-run setup begins —
-  // the download overlaps the registration/disclosure steps. Server-side
-  // starts are idempotent; failures are silent here (the service may still
-  // be booting) and the model step retries and surfaces real errors.
+  // the download overlaps the registration screen. Server-side starts are
+  // idempotent; failures are silent here (the service may still be booting)
+  // and the Ready screen retries and surfaces real errors.
   useEffect(() => {
     if (!onboarding || onboarding.setup_complete) return;
     ENGINE_WHISPER_IDS.forEach((id) => {
@@ -175,60 +174,36 @@ export function Welcome() {
   }, [onboarding?.setup_complete]);
 
   const step = useMemo<SetupStep | null>(() => {
-    if (!onboarding || onboarding.setup_complete) return null;
-    return STEP_ORDER.find((value) => !onboarding.completed_steps.includes(value)) ?? "capture";
-  }, [onboarding]);
+    if (!onboarding || onboarding.setup_complete || !setup) return null;
+    return resolveScreen(onboarding.completed_steps, setup.platform);
+  }, [onboarding, setup]);
 
   // Seamless engine setup: the selected profile (and the Whisper models, in
   // case the early start raced the service boot) auto-start — and auto-resume
-  // after a relaunch — whenever the local model or sample step is active.
+  // after a relaunch — whenever the Ready screen is showing.
   useEffect(() => {
-    if (provider !== "local" || !selectedProfile || !["model", "sample"].includes(step ?? "")) {
-      return;
-    }
+    if (!selectedProfile || step !== "ready") return;
     engineDownloadIds.forEach((id) => {
       startModelDownload(id).catch((error) => setEngineError(String(error)));
     });
-  }, [provider, selectedProfile, step]);
+  }, [selectedProfile, step]);
 
   // Combined polling for all engine downloads (LLM + Whisper models) — one
   // status bar that covers everything the user needs before their first meeting.
   useEffect(() => {
-    if (provider !== "local" || !selectedProfile || !["model", "sample"].includes(step ?? "")) {
-      return;
-    }
+    if (step !== "ready") return;
     const timer = window.setInterval(() => {
       engineDownloadIds.forEach((id) => {
         getModelDownloadStatus(id)
-          .then(async (status) => {
+          .then((status) => {
             setEngineDownloads((current) => ({ ...current, [id]: status }));
-            if (id === selectedProfile && status.state === "ready") await refreshSetup();
           })
           .catch(() => {});
       });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [provider, selectedProfile, step]);
+  }, [engineDownloadIds, step]);
 
-  // Elapsed-seconds ticker for the model warm-up panel on the sample step.
-  useEffect(() => {
-    if (warmupSeconds === null) return;
-    const timer = window.setInterval(() => {
-      setWarmupSeconds((current) => (current === null ? null : current + 1));
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [warmupSeconds !== null]);
-
-  if (loadingError) {
-    return (
-      <div className="welcome-overlay">
-        <div className="welcome-card" role="alert">
-          <h2 className="welcome-title">Setup needs attention</h2>
-          <p className="welcome-error">{loadingError}</p>
-        </div>
-      </div>
-    );
-  }
   // Live permission state for the permissions step. Re-checked on focus because
   // a user who grants in System Settings and tabs back gets no callback.
   useEffect(() => {
@@ -248,6 +223,17 @@ export function Welcome() {
       window.clearInterval(timer);
     };
   }, [step]);
+
+  if (loadingError) {
+    return (
+      <div className="welcome-overlay">
+        <div className="welcome-card" role="alert">
+          <h2 className="welcome-title">Setup needs attention</h2>
+          <p className="welcome-error">{loadingError}</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!onboarding || !setup || !config || onboarding.setup_complete) return null;
 
@@ -280,7 +266,7 @@ export function Welcome() {
   };
 
   const finishStep = async (
-    completedStep: SetupStep,
+    completedStep: string,
     profileId: string | null = null,
     setupComplete = false,
   ) => {
@@ -325,85 +311,44 @@ export function Welcome() {
     }
   };
 
-  const saveDisclosure = async () => {
-    if (!disclosureAccepted || busy) return;
+  // Finishing never blocks on downloads: they continue inside the app, where
+  // SetupStatusStrip shows the same aggregate bar and then runs the sample
+  // verification. A machine with no local engine yet (Windows without Ollama)
+  // finishes with no profile — Settings › AI Model picks it up later.
+  const finishReady = async () => {
+    if (busy) return;
     setBusy(true);
     setMessage("");
     try {
-      const nextConfig = {
-        ...config,
-        llm_provider: provider === "local" ? "local" : "custom",
-      };
-      await updateConfig(nextConfig);
-      setConfig(nextConfig);
-      await finishStep("disclosure");
-    } catch (error) {
-      setMessage(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const chooseLocalModel = async () => {
-    if (!selectedProfile || busy) return;
-    setBusy(true);
-    try {
-      await finishStep("model", selectedProfile);
-    } catch (error) {
-      setMessage(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const chooseCloudModel = async () => {
-    if (!cloudDisclosure || !cloudBaseUrl || !cloudApiKey || !cloudModel || busy) return;
-    setBusy(true);
-    setMessage("");
-    try {
-      await testLlmConnection(cloudBaseUrl.trim(), cloudApiKey.trim());
-      const nextConfig = {
-        ...config,
-        llm_provider: "custom",
-        llm_base_url: cloudBaseUrl.trim().replace(/\/$/, ""),
-        llm_api_key: cloudApiKey.trim(),
-        ollama_model: cloudModel.trim(),
-      };
-      await updateConfig(nextConfig);
-      setConfig(nextConfig);
-      await finishStep("model");
-    } catch (error) {
-      setMessage(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runSample = async () => {
-    setBusy(true);
-    setMessage(provider === "local" ? "" : "Running a cloud sample…");
-    if (provider === "local") setWarmupSeconds(0);
-    try {
-      let title: string;
-      if (provider === "local") {
-        await startManagedLlm(selectedProfile);
-        setWarmupSeconds(null);
-        title = await testLocalSetup();
-      } else {
-        title = await testCloudSetup(cloudBaseUrl, cloudApiKey, cloudModel);
+      if (config.meeting_reminder_enabled !== notifyBeforeMeetings) {
+        const nextConfig = { ...config, meeting_reminder_enabled: notifyBeforeMeetings };
+        await updateConfig(nextConfig);
+        setConfig(nextConfig);
       }
-      setSampleTitle(title);
-      setMessage("Sample meeting notes completed successfully.");
-      await finishStep("sample");
+      await finishStep("ready", selectedProfile || null, true);
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setWarmupSeconds(null);
       setBusy(false);
     }
   };
 
-  const progressIndex = Math.max(0, STEP_ORDER.indexOf(step ?? "capture"));
+  // `setup.platform` is std::env::consts::OS. The wizard used to hardcode "Mac"
+  // in its user-facing copy, which read as a porting bug on Windows ("On this
+  // Mac", "Your Mac has 64 GB of memory").
+  const deviceLabel = setup.platform === "macos" ? "Mac" : "PC";
+  // Must mirror `setup::rapid_mlx_supported()` exactly — it decides which
+  // engine's profiles the backend returns, and this decides the copy describing
+  // them. Keying on `platform` alone would put on-device wording over an Ollama
+  // list on an Intel Mac.
+  const isAppleLocalRuntime =
+    setup.platform === "macos" && setup.architecture === "aarch64";
+
+  // Windows has no capture-permission prompts, so its wizard is two screens.
+  const visibleSteps = STEP_ORDER.filter(
+    (value) => value !== "permissions" || setup.platform === "macos",
+  );
+  const progressIndex = Math.max(0, visibleSteps.indexOf(step ?? "ready"));
   const pendingRegistration = registration.status === "pending";
 
   // Lead with ONE clear recommendation; the other profiles hide behind a quiet
@@ -432,26 +377,9 @@ export function Welcome() {
     0,
   );
   const engineFailed = engineStatuses.find((status) => status.state === "error");
-  const selectedInstalled =
-    (setup.profiles.find((profile) => profile.id === selectedProfile)?.installed ?? false) ||
-    engineDownloads[selectedProfile]?.state === "ready";
-  // `setup.platform` is std::env::consts::OS. The wizard used to hardcode "Mac"
-  // in its user-facing copy, which read as a porting bug on Windows ("On this
-  // Mac", "Your Mac has 64 GB of memory").
-  const deviceLabel = setup.platform === "macos" ? "Mac" : "PC";
-  // Must mirror `setup::rapid_mlx_supported()` exactly — it decides which
-  // engine's profiles the backend returns, and this decides the copy describing
-  // them. Keying on `platform` alone would put MLX wording over an Ollama list
-  // on an Intel Mac.
-  const isAppleLocalRuntime =
-    setup.platform === "macos" && setup.architecture === "aarch64";
-  const localRuntimeLabel = setup.rapid_runtime_bundled
-    ? "Bundled"
-    : isAppleLocalRuntime
-      ? "Missing from this build"
-      : setup.profiles.length > 0
-        ? `Ollama (${setup.profiles.length} model${setup.profiles.length === 1 ? "" : "s"} available)`
-        : "Ollama — not detected";
+  const engineAllReady =
+    engineStatuses.length === engineDownloadIds.length &&
+    engineStatuses.every((status) => status.state === "ready");
 
   const retryEngineDownloads = () => {
     setEngineError("");
@@ -465,12 +393,12 @@ export function Welcome() {
   return (
     <div className="welcome-overlay">
       <main className="welcome-card welcome-card-wide" aria-labelledby="setup-title">
-        <div className="welcome-progress" aria-label={`Setup step ${progressIndex + 1} of ${STEP_ORDER.length}`}>
+        <div className="welcome-progress" aria-label={`Setup step ${progressIndex + 1} of ${visibleSteps.length}`}>
           <span>Setup</span>
-          <span>{progressIndex + 1} / {STEP_ORDER.length}</span>
+          <span>{progressIndex + 1} / {visibleSteps.length}</span>
         </div>
         <div className="welcome-progress-track" aria-hidden="true">
-          <span style={{ width: `${((progressIndex + 1) / STEP_ORDER.length) * 100}%` }} />
+          <span style={{ width: `${((progressIndex + 1) / visibleSteps.length) * 100}%` }} />
         </div>
 
         {pendingRegistration && step !== "registration" && (
@@ -489,7 +417,8 @@ export function Welcome() {
           <form onSubmit={submitIdentity}>
             <h2 className="welcome-title" id="setup-title">Welcome to Adversaria</h2>
             <p className="welcome-sub">
-              Register for the beta, then configure private local meeting notes without a terminal.
+              Everything runs on this {deviceLabel} — nothing is uploaded. Meeting
+              audio, transcripts, and notes never leave your machine.
             </p>
             <label className="settings-label" htmlFor="welcome-name">Name</label>
             <input
@@ -499,6 +428,10 @@ export function Welcome() {
               value={name}
               onChange={(event) => setName(event.target.value)}
             />
+            <p className="welcome-field-hint">
+              Used as your speaker label in transcripts and notes — change it any
+              time in Settings.
+            </p>
             <label className="settings-label welcome-field-label" htmlFor="welcome-email">Email</label>
             <input
               id="welcome-email"
@@ -521,131 +454,6 @@ export function Welcome() {
               </button>
             </div>
           </form>
-        )}
-
-        {step === "disclosure" && (
-          <section>
-            <h2 className="welcome-title" id="setup-title">Choose where meeting notes are created</h2>
-            <p className="welcome-sub">Local is the default. Adversaria never falls back to a cloud provider automatically.</p>
-            <div className="welcome-choice-grid">
-              <button className={`welcome-choice${provider === "local" ? " selected" : ""}`} onClick={() => setProvider("local")}>
-                <strong>On this {deviceLabel}</strong>
-                <span>Transcripts and prompts stay on-device. Models download from Hugging Face during setup.</span>
-              </button>
-              <button className={`welcome-choice${provider === "cloud" ? " selected" : ""}`} onClick={() => setProvider("cloud")}>
-                <strong>My cloud provider</strong>
-                <span>Meeting text is sent only to the HTTPS provider and model you explicitly configure.</span>
-              </button>
-            </div>
-            <label className="welcome-check">
-              <input type="checkbox" checked={disclosureAccepted} onChange={(event) => setDisclosureAccepted(event.target.checked)} />
-              <span>I understand this data flow and can change it later in Settings.</span>
-            </label>
-            <div className="welcome-actions">
-              <button className="btn-primary" onClick={saveDisclosure} disabled={!disclosureAccepted || busy}>Continue</button>
-            </div>
-          </section>
-        )}
-
-        {step === "hardware" && (
-          <section>
-            <h2 className="welcome-title" id="setup-title">Hardware check</h2>
-            <p className="welcome-sub">The recommendation uses total memory and currently available disk space. Nothing is uploaded.</p>
-            <dl className="welcome-hardware">
-              <div><dt>Platform</dt><dd>{setup.platform} / {setup.architecture}</dd></div>
-              <div><dt>Memory</dt><dd>{formatGb(setup.total_memory_bytes)}</dd></div>
-              <div><dt>Free disk</dt><dd>{formatGb(setup.available_disk_bytes)}</dd></div>
-              <div><dt>Local runtime</dt><dd>{localRuntimeLabel}</dd></div>
-            </dl>
-            {/* A missing Rapid-MLX runtime is only a fault on Apple Silicon,
-                where it ships in the bundle. Everywhere else the local engine is
-                Ollama by design, so the old "reinstall a complete build" error
-                was telling Windows users their install was broken when it wasn't. */}
-            {!setup.rapid_runtime_bundled && provider === "local" && (
-              isAppleLocalRuntime ? (
-                <p className="welcome-error" role="alert">This build is missing the pinned local runtime. You can inspect the model choices, but the sample cannot pass until Adversaria is reinstalled with a complete build.</p>
-              ) : setup.profiles.length === 0 ? (
-                <p className="welcome-error" role="alert">No local engine found. Adversaria uses <strong>Ollama</strong> for on-device notes on this platform — install it from ollama.com and pull a model (for example <code>ollama pull qwen3:8b</code>), then reopen this step. You can also choose a cloud provider instead.</p>
-              ) : null
-            )}
-            <div className="welcome-actions">
-              <button className="btn-primary" onClick={() => finishStep("hardware").catch((error) => setMessage(String(error)))}>Continue</button>
-            </div>
-          </section>
-        )}
-
-        {step === "model" && provider === "local" && (
-          <section>
-            <h2 className="welcome-title" id="setup-title">{isAppleLocalRuntime ? "Install a local meeting model" : "Choose a local meeting model"}</h2>
-            <p className="welcome-sub">
-              Your {deviceLabel} has <strong>{formatGb(setup.total_memory_bytes)}</strong> of memory, so <strong>{recommendedProfile?.display_name ?? "the lighter model"}</strong> is recommended — it fits and runs fast.{" "}
-              {isAppleLocalRuntime
-                ? "Downloads resume from the content-addressed cache and every weight file is checksum-verified."
-                : "These are the models already pulled in Ollama, so nothing downloads here."}
-            </p>
-            <div className="welcome-profile-list">
-              {recommendedProfile && renderLocalProfile(recommendedProfile)}
-            </div>
-            {otherProfiles.length > 0 && (
-              <details className="welcome-more-models">
-                <summary>Change model</summary>
-                <div className="welcome-profile-list">
-                  {otherProfiles.map(renderLocalProfile)}
-                </div>
-              </details>
-            )}
-            <div className={`welcome-download ${engineFailed ? "error" : "downloading"}`} role="status">
-              <div>
-                <strong>
-                  {engineFailed
-                    ? engineFailed.detail
-                    : selectedInstalled
-                      ? "Your private engine is ready."
-                      : "Setting up your private engine in the background…"}
-                </strong>
-                <span>
-                  {engineTotal > 0 ? `${formatGb(engineDone)} / ${formatGb(engineTotal)}` : "Preparing…"}
-                </span>
-              </div>
-              {engineTotal > 0 ? (
-                <progress value={engineDone} max={engineTotal} />
-              ) : (
-                <progress />
-              )}
-            </div>
-            {engineFailed && (
-              <div className="welcome-actions">
-                <button className="btn-secondary" onClick={retryEngineDownloads} disabled={busy}>
-                  Retry downloads
-                </button>
-              </div>
-            )}
-            <div className="welcome-actions">
-              <button className="btn-primary" onClick={chooseLocalModel} disabled={busy}>
-                {selectedInstalled ? "Use this verified model" : "Continue — downloads keep running"}
-              </button>
-            </div>
-          </section>
-        )}
-
-        {step === "model" && provider === "cloud" && (
-          <section>
-            <h2 className="welcome-title" id="setup-title">Connect your cloud provider</h2>
-            <p className="welcome-sub">Adversaria will test the connection first. Meeting text is sent only after setup succeeds and cloud remains selected.</p>
-            <label className="settings-label" htmlFor="welcome-cloud-url">OpenAI-compatible HTTPS base URL</label>
-            <input id="welcome-cloud-url" className="settings-input-text" value={cloudBaseUrl} onChange={(event) => setCloudBaseUrl(event.target.value)} />
-            <label className="settings-label welcome-field-label" htmlFor="welcome-cloud-model">Model</label>
-            <input id="welcome-cloud-model" className="settings-input-text" value={cloudModel} onChange={(event) => setCloudModel(event.target.value)} />
-            <label className="settings-label welcome-field-label" htmlFor="welcome-cloud-key">API key</label>
-            <input id="welcome-cloud-key" className="settings-input-text" type="password" autoComplete="off" value={cloudApiKey} onChange={(event) => setCloudApiKey(event.target.value)} />
-            <label className="welcome-check">
-              <input type="checkbox" checked={cloudDisclosure} onChange={(event) => setCloudDisclosure(event.target.checked)} />
-              <span>I understand that transcript text and prompts will be sent to this provider when I use meeting features.</span>
-            </label>
-            <div className="welcome-actions">
-              <button className="btn-primary" onClick={chooseCloudModel} disabled={busy || !cloudDisclosure || !cloudBaseUrl || !cloudApiKey || !cloudModel}>{busy ? "Testing…" : "Test and continue"}</button>
-            </div>
-          </section>
         )}
 
         {step === "permissions" && (
@@ -710,52 +518,108 @@ export function Welcome() {
           </section>
         )}
 
-        {step === "sample" && (
+        {step === "ready" && (
           <section>
-            <h2 className="welcome-title" id="setup-title">Verify meeting notes</h2>
-            <p className="welcome-sub">A synthetic two-sentence meeting will be summarized. No personal or recorded content is used.</p>
-            <div className="welcome-sample"><strong>Sample input</strong><p>Amina approved the launch checklist. Omar will send the final draft by Friday.</p></div>
-            {provider === "local" && !selectedInstalled && (
-              <div className="welcome-download downloading" role="status">
-                <div>
-                  <strong>Your meeting model is still downloading — this step unlocks when it finishes.</strong>
-                  <span>
-                    {engineTotal > 0 ? `${formatGb(engineDone)} / ${formatGb(engineTotal)}` : "Preparing…"}
-                  </span>
-                </div>
-                {engineTotal > 0 ? (
-                  <progress value={engineDone} max={engineTotal} />
-                ) : (
-                  <progress />
-                )}
-              </div>
+            <h2 className="welcome-title" id="setup-title">You're ready</h2>
+            {recommendedProfile ? (
+              <p className="welcome-sub">
+                Recommended for your <strong>{formatGb(setup.total_memory_bytes)}</strong> {deviceLabel}:{" "}
+                <strong>{recommendedProfile.display_name}</strong>.{" "}
+                {isAppleLocalRuntime
+                  ? "It downloads and verifies in the background — you can start using Adversaria right away."
+                  : selectedProfile.startsWith("ollama:")
+                    ? "This model is already on this computer, so nothing new downloads."
+                    : "It downloads after you approve the engine plan below — everything is named before anything installs."}
+              </p>
+            ) : (
+              <p className="welcome-sub">
+                Adversaria records and transcribes on this {deviceLabel} out of the
+                box. Your meeting-notes model can be set up any time in
+                Settings → AI Model.
+              </p>
             )}
-            {warmupSeconds !== null && (
-              <div className="welcome-download downloading" role="status">
-                <div>
-                  <strong>Unfolding the meeting model into memory…</strong>
-                  <span>
-                    {Math.floor(warmupSeconds / 60)}:{String(warmupSeconds % 60).padStart(2, "0")} elapsed · usually 1–3 minutes on first start
-                  </span>
-                </div>
-                <progress />
-              </div>
-            )}
-            {sampleTitle && <p className="welcome-success">Created: {sampleTitle}</p>}
-            <div className="welcome-actions"><button className="btn-primary" onClick={runSample} disabled={busy || (provider === "local" && !selectedInstalled)}>{busy ? "Running sample…" : "Run sample summary"}</button></div>
-          </section>
-        )}
 
-        {step === "capture" && (
-          <section>
-            <h2 className="welcome-title" id="setup-title">Setup is ready</h2>
-            <p className="welcome-sub">Your sample succeeded. A short recording test is optional; start one from the Record tab after entering the app.</p>
-            <div className="welcome-summary-list">
-              <span>Registration: {registration.status === "submitted" ? "submitted" : "queued for retry"}</span>
-              <span>Meeting engine: {provider === "local" ? `local on this ${deviceLabel}` : "explicit cloud provider"}</span>
-              <span>Recovery: interrupted setup resumes from this step</span>
+            {!setup.rapid_runtime_bundled && isAppleLocalRuntime && (
+              <p className="welcome-error" role="alert">
+                This build is missing its local engine, so meeting notes will need
+                a reinstall of Adversaria. Recording and everything you set up here
+                are unaffected.
+              </p>
+            )}
+            {!isAppleLocalRuntime && setup.profiles.length === 0 && (
+              <p className="welcome-footnote" role="note">
+                No local notes engine was found on this computer yet — finish setup
+                now and connect one later in Settings → AI Model.
+              </p>
+            )}
+            {engineConsentPending && (
+              <EngineInstallCard
+                onInstalled={() => {
+                  getSetupStatus()
+                    .then(setSetup)
+                    .catch((error) => setMessage(String(error)));
+                }}
+              />
+            )}
+
+            {otherProfiles.length > 0 && (
+              <details className="welcome-more-models">
+                <summary>Change model</summary>
+                <div className="welcome-profile-list">
+                  {recommendedProfile && renderLocalProfile(recommendedProfile)}
+                  {otherProfiles.map(renderLocalProfile)}
+                </div>
+              </details>
+            )}
+
+            <div className={`welcome-download ${engineFailed ? "error" : "downloading"}`} role="status">
+              <div>
+                <strong>
+                  {engineFailed
+                    ? engineFailed.detail
+                    : engineAllReady
+                      ? "Your private engine is ready."
+                      : "Setting up your private engine in the background…"}
+                </strong>
+                <span>
+                  {engineTotal > 0 ? `${formatGb(engineDone)} / ${formatGb(engineTotal)}` : "Preparing…"}
+                </span>
+              </div>
+              {engineTotal > 0 ? (
+                <progress value={engineDone} max={engineTotal} />
+              ) : (
+                <progress />
+              )}
             </div>
-            <div className="welcome-actions"><button className="btn-primary" onClick={() => finishStep("capture", null, true).catch((error) => setMessage(String(error)))}>Finish setup</button></div>
+            {engineFailed && (
+              <div className="welcome-actions">
+                <button className="btn-secondary" onClick={retryEngineDownloads} disabled={busy}>
+                  Retry downloads
+                </button>
+              </div>
+            )}
+
+            <label className="welcome-check">
+              <input
+                type="checkbox"
+                checked={notifyBeforeMeetings}
+                onChange={(event) => setNotifyBeforeMeetings(event.target.checked)}
+              />
+              <span>
+                Notify me {config.meeting_reminder_minutes || 5} minutes before my
+                meetings start. Needs a connected calendar — add one any time in
+                Settings.
+              </span>
+            </label>
+            <div className="welcome-actions">
+              <button className="btn-primary" onClick={finishReady} disabled={busy}>
+                {busy ? "Finishing…" : "Start using Adversaria"}
+              </button>
+            </div>
+            <p className="welcome-footnote">
+              Anything still downloading keeps going inside Adversaria — a small
+              status bar tracks it until your first meeting notes are verified.
+            </p>
           </section>
         )}
 

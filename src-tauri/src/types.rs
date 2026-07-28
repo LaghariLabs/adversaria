@@ -330,6 +330,14 @@ pub struct SetupStatus {
     pub rapid_runtime_bundled: bool,
     pub profiles: Vec<ModelProfile>,
     pub recommended_profile: String,
+    /// Detected GPU, informational only (consent screen + diagnostics).
+    /// None on Apple Silicon and wherever nvidia-smi is absent.
+    #[serde(default)]
+    pub gpu_name: Option<String>,
+    /// Whether the managed llama.cpp engine is installed (non-Apple-Silicon
+    /// platforms). Gates the transparent-install consent card in the wizard.
+    #[serde(default)]
+    pub managed_engine_installed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,6 +495,15 @@ pub struct AppConfig {
     /// deliberate, opt-in egress.
     #[serde(default)]
     pub second_brain_enabled: bool,
+    /// OS notification shortly before a calendar meeting starts. Asked once on
+    /// the wizard's Ready screen and editable in Settings › General. Off by
+    /// default so existing users never get a surprise notification.
+    #[serde(default)]
+    pub meeting_reminder_enabled: bool,
+    /// Minutes before a meeting's start to notify. Only meaningful while
+    /// `meeting_reminder_enabled` is set.
+    #[serde(default = "default_meeting_reminder_minutes")]
+    pub meeting_reminder_minutes: u32,
 }
 
 fn default_whisper_model() -> String {
@@ -515,6 +532,10 @@ fn default_notch_pill_style() -> String {
 
 fn default_meeting_alert_style() -> String {
     "notch_drop".to_string()
+}
+
+fn default_meeting_reminder_minutes() -> u32 {
+    5
 }
 
 /// One curated on-device Whisper model + whether it's already downloaded.
