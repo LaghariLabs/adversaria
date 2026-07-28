@@ -24,7 +24,13 @@ import {
   testLlmConnection,
   testLocalSetup,
   updateConfig,
+  checkCapturePermissions,
+  requestMicrophonePermission,
+  requestScreenPermission,
+  openPrivacySettings,
+  relaunchForPermissions,
 } from "../lib/tauri";
+import type { CapturePermissions } from "../lib/tauri";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main"] as const;
@@ -61,6 +67,19 @@ function emptyRegistration(): RegistrationState {
   };
 }
 
+/** A persisted model choice is only usable if THIS machine still offers it.
+ *
+ * Onboarding stores `selected_model_profile`, so a choice made on a build that
+ * offered different profiles — an MLX id like `qwen-27b-quality` picked before
+ * Windows listed Ollama models — is replayed on every resume. Left unchecked it
+ * is handed to the managed-runtime start and fails there forever, which is
+ * exactly how a resumed setup got stuck on step 6/7. */
+export function resolveProfile(persisted: string, setup: SetupStatus): string {
+  return setup.profiles.some((profile) => profile.id === persisted)
+    ? persisted
+    : setup.recommended_profile;
+}
+
 /** Restart-safe first-run setup. Every completed step is persisted by Rust; a
  * network failure queues registration locally and never blocks local setup. */
 export function Welcome() {
@@ -68,6 +87,8 @@ export function Welcome() {
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
   const [setup, setSetup] = useState<SetupStatus | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [perms, setPerms] = useState<CapturePermissions | null>(null);
+  const [permBusy, setPermBusy] = useState<"" | "microphone" | "screen">("");
   const [loadingError, setLoadingError] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -78,6 +99,17 @@ export function Welcome() {
   const [provider, setProvider] = useState<ProviderChoice>("local");
   const [disclosureAccepted, setDisclosureAccepted] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState("");
+  // Profile ids the download pipeline may actually fetch. An Ollama model is
+  // already on disk, and the Rust side's `downloadable_profile` rejects its id
+  // outright — so including it here would raise "Unknown model profile" on the
+  // start call and again on every one-second status poll.
+  const engineDownloadIds = useMemo(
+    () =>
+      selectedProfile && !selectedProfile.startsWith("ollama:")
+        ? [...ENGINE_WHISPER_IDS, selectedProfile]
+        : [...ENGINE_WHISPER_IDS],
+    [selectedProfile],
+  );
   const [engineDownloads, setEngineDownloads] = useState<Record<string, ModelDownloadStatus>>({});
   const [engineError, setEngineError] = useState("");
   const [cloudBaseUrl, setCloudBaseUrl] = useState("https://api.openai.com/v1");
@@ -90,7 +122,7 @@ export function Welcome() {
   const refreshSetup = async () => {
     const value = await getSetupStatus();
     setSetup(value);
-    setSelectedProfile((current) => current || value.recommended_profile);
+    setSelectedProfile((current) => resolveProfile(current, value));
     return value;
   };
 
@@ -119,7 +151,7 @@ export function Welcome() {
         setEmail(nextRegistration.email || nextConfig.user_email || "");
         setProvider(nextConfig.llm_provider === "local" ? "local" : "cloud");
         setSelectedProfile(
-          nextOnboarding.selected_model_profile || nextSetup.recommended_profile,
+          resolveProfile(nextOnboarding.selected_model_profile, nextSetup),
         );
         setCloudBaseUrl(nextConfig.llm_base_url || "https://api.openai.com/v1");
         setCloudApiKey(nextConfig.llm_api_key || "");
@@ -154,7 +186,7 @@ export function Welcome() {
     if (provider !== "local" || !selectedProfile || !["model", "sample"].includes(step ?? "")) {
       return;
     }
-    [...ENGINE_WHISPER_IDS, selectedProfile].forEach((id) => {
+    engineDownloadIds.forEach((id) => {
       startModelDownload(id).catch((error) => setEngineError(String(error)));
     });
   }, [provider, selectedProfile, step]);
@@ -165,9 +197,8 @@ export function Welcome() {
     if (provider !== "local" || !selectedProfile || !["model", "sample"].includes(step ?? "")) {
       return;
     }
-    const ids = [...ENGINE_WHISPER_IDS, selectedProfile];
     const timer = window.setInterval(() => {
-      ids.forEach((id) => {
+      engineDownloadIds.forEach((id) => {
         getModelDownloadStatus(id)
           .then(async (status) => {
             setEngineDownloads((current) => ({ ...current, [id]: status }));
@@ -198,7 +229,55 @@ export function Welcome() {
       </div>
     );
   }
+  // Live permission state for the permissions step. Re-checked on focus because
+  // a user who grants in System Settings and tabs back gets no callback.
+  useEffect(() => {
+    if (step !== "permissions") return;
+    let alive = true;
+    const refresh = () => {
+      checkCapturePermissions()
+        .then((p) => { if (alive) setPerms(p); })
+        .catch(() => {});
+    };
+    refresh();
+    window.addEventListener("focus", refresh);
+    const timer = window.setInterval(refresh, 2000);
+    return () => {
+      alive = false;
+      window.removeEventListener("focus", refresh);
+      window.clearInterval(timer);
+    };
+  }, [step]);
+
   if (!onboarding || !setup || !config || onboarding.setup_complete) return null;
+
+  const grantMicrophone = async () => {
+    setPermBusy("microphone");
+    try {
+      const state = await requestMicrophonePermission();
+      // Already-denied can't re-prompt; System Settings is the only way back.
+      if (state === "denied") await openPrivacySettings("microphone");
+      setPerms(await checkCapturePermissions());
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setPermBusy("");
+    }
+  };
+
+  const grantScreen = async () => {
+    setPermBusy("screen");
+    try {
+      const state = await requestScreenPermission();
+      // macOS shows this prompt once per install; after that only Settings works.
+      if (state !== "granted") await openPrivacySettings("screen");
+      setPerms(await checkCapturePermissions());
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setPermBusy("");
+    }
+  };
 
   const finishStep = async (
     completedStep: SetupStep,
@@ -344,7 +423,7 @@ export function Welcome() {
     </label>
   );
 
-  const engineStatuses = [...ENGINE_WHISPER_IDS, selectedProfile]
+  const engineStatuses = engineDownloadIds
     .map((id) => engineDownloads[id])
     .filter((status): status is ModelDownloadStatus => Boolean(status));
   const engineTotal = engineStatuses.reduce((sum, status) => sum + status.total_bytes, 0);
@@ -356,10 +435,27 @@ export function Welcome() {
   const selectedInstalled =
     (setup.profiles.find((profile) => profile.id === selectedProfile)?.installed ?? false) ||
     engineDownloads[selectedProfile]?.state === "ready";
+  // `setup.platform` is std::env::consts::OS. The wizard used to hardcode "Mac"
+  // in its user-facing copy, which read as a porting bug on Windows ("On this
+  // Mac", "Your Mac has 64 GB of memory").
+  const deviceLabel = setup.platform === "macos" ? "Mac" : "PC";
+  // Must mirror `setup::rapid_mlx_supported()` exactly — it decides which
+  // engine's profiles the backend returns, and this decides the copy describing
+  // them. Keying on `platform` alone would put MLX wording over an Ollama list
+  // on an Intel Mac.
+  const isAppleLocalRuntime =
+    setup.platform === "macos" && setup.architecture === "aarch64";
+  const localRuntimeLabel = setup.rapid_runtime_bundled
+    ? "Bundled"
+    : isAppleLocalRuntime
+      ? "Missing from this build"
+      : setup.profiles.length > 0
+        ? `Ollama (${setup.profiles.length} model${setup.profiles.length === 1 ? "" : "s"} available)`
+        : "Ollama — not detected";
 
   const retryEngineDownloads = () => {
     setEngineError("");
-    [...ENGINE_WHISPER_IDS, selectedProfile].forEach((id) => {
+    engineDownloadIds.forEach((id) => {
       if (engineDownloads[id]?.state === "error") {
         startModelDownload(id).catch((error) => setEngineError(String(error)));
       }
@@ -433,7 +529,7 @@ export function Welcome() {
             <p className="welcome-sub">Local is the default. Adversaria never falls back to a cloud provider automatically.</p>
             <div className="welcome-choice-grid">
               <button className={`welcome-choice${provider === "local" ? " selected" : ""}`} onClick={() => setProvider("local")}>
-                <strong>On this Mac</strong>
+                <strong>On this {deviceLabel}</strong>
                 <span>Transcripts and prompts stay on-device. Models download from Hugging Face during setup.</span>
               </button>
               <button className={`welcome-choice${provider === "cloud" ? " selected" : ""}`} onClick={() => setProvider("cloud")}>
@@ -459,10 +555,18 @@ export function Welcome() {
               <div><dt>Platform</dt><dd>{setup.platform} / {setup.architecture}</dd></div>
               <div><dt>Memory</dt><dd>{formatGb(setup.total_memory_bytes)}</dd></div>
               <div><dt>Free disk</dt><dd>{formatGb(setup.available_disk_bytes)}</dd></div>
-              <div><dt>Local runtime</dt><dd>{setup.rapid_runtime_bundled ? "Bundled" : "Missing from this build"}</dd></div>
+              <div><dt>Local runtime</dt><dd>{localRuntimeLabel}</dd></div>
             </dl>
+            {/* A missing Rapid-MLX runtime is only a fault on Apple Silicon,
+                where it ships in the bundle. Everywhere else the local engine is
+                Ollama by design, so the old "reinstall a complete build" error
+                was telling Windows users their install was broken when it wasn't. */}
             {!setup.rapid_runtime_bundled && provider === "local" && (
-              <p className="welcome-error" role="alert">This build is missing the pinned local runtime. You can inspect the model choices, but the sample cannot pass until Adversaria is reinstalled with a complete build.</p>
+              isAppleLocalRuntime ? (
+                <p className="welcome-error" role="alert">This build is missing the pinned local runtime. You can inspect the model choices, but the sample cannot pass until Adversaria is reinstalled with a complete build.</p>
+              ) : setup.profiles.length === 0 ? (
+                <p className="welcome-error" role="alert">No local engine found. Adversaria uses <strong>Ollama</strong> for on-device notes on this platform — install it from ollama.com and pull a model (for example <code>ollama pull qwen3:8b</code>), then reopen this step. You can also choose a cloud provider instead.</p>
+              ) : null
             )}
             <div className="welcome-actions">
               <button className="btn-primary" onClick={() => finishStep("hardware").catch((error) => setMessage(String(error)))}>Continue</button>
@@ -472,8 +576,13 @@ export function Welcome() {
 
         {step === "model" && provider === "local" && (
           <section>
-            <h2 className="welcome-title" id="setup-title">Install a local meeting model</h2>
-            <p className="welcome-sub">Your Mac has <strong>{formatGb(setup.total_memory_bytes)}</strong> of memory, so <strong>{recommendedProfile?.display_name ?? "the lighter model"}</strong> is recommended — it fits and runs fast. Downloads resume from the content-addressed cache and every weight file is checksum-verified.</p>
+            <h2 className="welcome-title" id="setup-title">{isAppleLocalRuntime ? "Install a local meeting model" : "Choose a local meeting model"}</h2>
+            <p className="welcome-sub">
+              Your {deviceLabel} has <strong>{formatGb(setup.total_memory_bytes)}</strong> of memory, so <strong>{recommendedProfile?.display_name ?? "the lighter model"}</strong> is recommended — it fits and runs fast.{" "}
+              {isAppleLocalRuntime
+                ? "Downloads resume from the content-addressed cache and every weight file is checksum-verified."
+                : "These are the models already pulled in Ollama, so nothing downloads here."}
+            </p>
             <div className="welcome-profile-list">
               {recommendedProfile && renderLocalProfile(recommendedProfile)}
             </div>
@@ -542,14 +651,62 @@ export function Welcome() {
         {step === "permissions" && (
           <section>
             <h2 className="welcome-title" id="setup-title">Recording permissions</h2>
-            <p className="welcome-sub">macOS asks only when a feature first needs access. Denying a permission does not remove existing notes.</p>
-            <ul className="welcome-permissions">
-              <li><strong>Microphone</strong><span>Required only to include your voice.</span></li>
-              <li><strong>System audio</strong><span>Required to capture calls and playback.</span></li>
-              <li><strong>Accessibility</strong><span>Optional; used for meeting detection and app controls.</span></li>
+            <p className="welcome-sub">
+              Grant these now so your first recording just works. macOS would
+              otherwise interrupt you mid-meeting.
+            </p>
+            <ul className="welcome-permissions perm-live">
+              <li>
+                <span className={`perm-dot perm-${perms?.screen_recording ?? "undetermined"}`} />
+                <div className="perm-copy">
+                  <strong>System audio</strong>
+                  <span>Records the other people on the call. Without it a meeting captures only you.</span>
+                </div>
+                {perms?.screen_recording === "granted" ? (
+                  <span className="perm-ok">Granted</span>
+                ) : (
+                  <button className="btn-secondary" disabled={permBusy !== ""} onClick={grantScreen}>
+                    {permBusy === "screen" ? "Waiting…" : "Grant"}
+                  </button>
+                )}
+              </li>
+              <li>
+                <span className={`perm-dot perm-${perms?.microphone ?? "undetermined"}`} />
+                <div className="perm-copy">
+                  <strong>Microphone</strong>
+                  <span>Records your own voice, so notes can tell you and them apart.</span>
+                </div>
+                {perms?.microphone === "granted" ? (
+                  <span className="perm-ok">Granted</span>
+                ) : (
+                  <button className="btn-secondary" disabled={permBusy !== ""} onClick={grantMicrophone}>
+                    {permBusy === "microphone" ? "Waiting…" : "Grant"}
+                  </button>
+                )}
+              </li>
             </ul>
-            <p className="welcome-footnote">You can retry denied permissions from macOS System Settings and then return to Adversaria.</p>
-            <div className="welcome-actions"><button className="btn-primary" onClick={() => finishStep("permissions").catch((error) => setMessage(String(error)))}>Continue</button></div>
+
+            {perms?.needs_relaunch && (
+              <div className="perm-relaunch">
+                <p>
+                  <strong>Almost there.</strong> macOS only applies Screen Recording after
+                  Adversaria restarts. Everything you've set up so far is saved.
+                </p>
+                <button className="btn-primary" onClick={() => relaunchForPermissions().catch((error) => setMessage(String(error)))}>
+                  Relaunch Adversaria
+                </button>
+              </div>
+            )}
+
+            <p className="welcome-footnote">
+              Denying doesn't delete anything — you can grant later in System Settings.
+              Adversaria never records unless you press Record.
+            </p>
+            <div className="welcome-actions">
+              <button className="btn-primary" onClick={() => finishStep("permissions").catch((error) => setMessage(String(error)))}>
+                {perms?.screen_recording === "granted" ? "Continue" : "Continue anyway"}
+              </button>
+            </div>
           </section>
         )}
 
@@ -595,7 +752,7 @@ export function Welcome() {
             <p className="welcome-sub">Your sample succeeded. A short recording test is optional; start one from the Record tab after entering the app.</p>
             <div className="welcome-summary-list">
               <span>Registration: {registration.status === "submitted" ? "submitted" : "queued for retry"}</span>
-              <span>Meeting engine: {provider === "local" ? "local on this Mac" : "explicit cloud provider"}</span>
+              <span>Meeting engine: {provider === "local" ? `local on this ${deviceLabel}` : "explicit cloud provider"}</span>
               <span>Recovery: interrupted setup resumes from this step</span>
             </div>
             <div className="welcome-actions"><button className="btn-primary" onClick={() => finishStep("capture", null, true).catch((error) => setMessage(String(error)))}>Finish setup</button></div>

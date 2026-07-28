@@ -18,12 +18,57 @@ from typing import Any
 
 from huggingface_hub import HfApi, constants, snapshot_download
 
+from .transcriber import backend_is_mlx
+
 
 @dataclass(frozen=True)
 class ModelPin:
     profile_id: str
     repo_id: str
     revision: str
+
+
+def _whisper_pins() -> dict[str, ModelPin]:
+    """The Whisper weights first-run setup pre-downloads, for THIS backend.
+
+    These were unconditionally `mlx-community/*`, so a Windows install spent the
+    setup step pulling ~3.5 GB of MLX weights that faster-whisper cannot load —
+    slow, and then useless. CTranslate2 and MLX weights are not interchangeable
+    in either direction, so the pins must follow the active backend exactly as
+    the runtime registry in `transcriber` does.
+
+    On CTranslate2, `whisper-live` deliberately points at the SAME repo as
+    `whisper-main`: `server._build_live_transcriber` only builds a dedicated fast
+    model for MLX and otherwise reuses the main transcriber, so pinning a
+    separate turbo model here would download 1.6 GB that nothing ever loads.
+    Give Windows its own live model and this should point at the turbo repo.
+    """
+    if backend_is_mlx():
+        return {
+            "whisper-main": ModelPin(
+                profile_id="whisper-main",
+                repo_id="mlx-community/whisper-large-v3-mlx",
+                revision="49e6aa286ad60c14352c404340ded53710378a11",
+            ),
+            "whisper-live": ModelPin(
+                profile_id="whisper-live",
+                repo_id="mlx-community/whisper-large-v3-turbo-q4",
+                revision="660c343bbf4e52ac257f0b7d952e5388e6f93bef",
+            ),
+        }
+    main = ModelPin(
+        profile_id="whisper-main",
+        repo_id="Systran/faster-whisper-large-v3",
+        revision="edaa852ec7e145841d8ffdb056a99866b5f0a478",
+    )
+    return {
+        "whisper-main": main,
+        "whisper-live": ModelPin(
+            profile_id="whisper-live",
+            repo_id=main.repo_id,
+            revision=main.revision,
+        ),
+    }
 
 
 MODEL_PINS = {
@@ -42,16 +87,7 @@ MODEL_PINS = {
         repo_id="mlx-community/Qwen3.5-4B-MLX-4bit",
         revision="32f3e8ecf65426fc3306969496342d504bfa13f3",
     ),
-    "whisper-main": ModelPin(
-        profile_id="whisper-main",
-        repo_id="mlx-community/whisper-large-v3-mlx",
-        revision="49e6aa286ad60c14352c404340ded53710378a11",
-    ),
-    "whisper-live": ModelPin(
-        profile_id="whisper-live",
-        repo_id="mlx-community/whisper-large-v3-turbo-q4",
-        revision="660c343bbf4e52ac257f0b7d952e5388e6f93bef",
-    ),
+    **_whisper_pins(),
 }
 
 

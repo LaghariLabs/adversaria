@@ -403,12 +403,19 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
     with _WHISPER_LOCK:
         vocab = (request.vocabulary or "").strip()
         _transcriber.initial_prompt = f"Glossary: {vocab}" if vocab else None
-        # On-device model selection (MLX loads per call, so we just swap the repo
-        # for this request and restore it after). Ignored for faster-whisper
-        # (Windows), which loads one model at startup.
+        # On-device model selection. The two backends need different handling:
+        # MLX loads per call, so we swap the repo for this request and restore it
+        # after; faster-whisper holds one loaded model for the process lifetime,
+        # so it reloads and *keeps* the new choice (see `ensure_model_repo`).
+        # Before this split the picker was a silent no-op on Windows — the
+        # assignment below landed on an attribute faster-whisper never reads.
         original_repo = getattr(_transcriber, "model_repo", None)
-        if request.whisper_model and isinstance(_transcriber, MlxWhisperTranscriber):
-            _transcriber.model_repo = whisper_repo_for(request.whisper_model)
+        if request.whisper_model:
+            repo = whisper_repo_for(request.whisper_model)
+            if isinstance(_transcriber, MlxWhisperTranscriber):
+                _transcriber.model_repo = repo
+            else:
+                _transcriber.ensure_model_repo(repo)
         try:
             logger.info("Transcribing audio file: %s", request.audio_path)
             if request.mic_audio_path:

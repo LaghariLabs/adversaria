@@ -84,3 +84,7 @@ marketing/launch-video-v4/
 
 # Other agent's AI-generated fake screenshots (garbled text) — never used; keep out.
 video/
+
+# HyperFrames render output (large binaries; source lives in marketing/*/index.html)
+marketing/product-demo/renders/
+marketing/product-demo/snapshots/

@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { OnboardingState, RegistrationState, SetupStatus } from "../types";
 import { appConfig } from "../test/fixtures";
-import { Welcome } from "./Welcome";
+import { Welcome, resolveProfile } from "./Welcome";
 
 const registration = (status: RegistrationState["status"] = "unregistered"): RegistrationState => ({
   schema_version: 1,
@@ -143,3 +143,30 @@ describe("Welcome", () => {
 });
 
 const STEP_NAMES = ["registration", "disclosure", "hardware", "model", "permissions", "sample", "capture"];
+
+describe("resolveProfile", () => {
+  const withProfiles = (ids: string[], recommended: string): SetupStatus => ({
+    ...setup(),
+    recommended_profile: recommended,
+    profiles: ids.map((id) => ({ ...setup().profiles[0], id })),
+  });
+
+  it("keeps a persisted choice this machine still offers", () => {
+    const status = withProfiles(["ollama:qwen3:8b", "ollama:llama3.1:8b"], "ollama:qwen3:8b");
+    expect(resolveProfile("ollama:llama3.1:8b", status)).toBe("ollama:llama3.1:8b");
+  });
+
+  it("drops a profile this machine no longer offers", () => {
+    // Regression: onboarding persists the model choice, so an MLX id picked on a
+    // build that offered MLX profiles was replayed on every resume — handed to
+    // the managed-runtime start, which fails with "Managed Rapid-MLX is
+    // currently available on Apple Silicon only" and strands setup on step 6/7.
+    const status = withProfiles(["ollama:qwen3.6:35b-a3b"], "ollama:qwen3.6:35b-a3b");
+    expect(resolveProfile("qwen-27b-quality", status)).toBe("ollama:qwen3.6:35b-a3b");
+  });
+
+  it("falls back to the recommendation when nothing is persisted", () => {
+    const status = withProfiles(["ollama:qwen3:8b"], "ollama:qwen3:8b");
+    expect(resolveProfile("", status)).toBe("ollama:qwen3:8b");
+  });
+});

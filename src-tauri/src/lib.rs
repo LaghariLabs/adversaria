@@ -22,6 +22,7 @@ pub mod detection;
 pub mod diagnostics;
 pub mod embeddings;
 pub mod http_client;
+pub mod permissions;
 pub mod recap;
 pub mod recording_spool;
 pub mod registration;
@@ -77,13 +78,25 @@ pub fn run() {
                 // unreadable. Explain it and exit cleanly instead of aborting with an
                 // opaque crash the user can't act on.
                 diagnostics::record("storage.init_failed", &error.to_string());
+                // Name the right credential store per platform — this dialog told
+                // Windows users to "allow keychain access when macOS asks", which
+                // is both impossible to act on and the wrong diagnosis.
+                #[cfg(target_os = "macos")]
+                let hint = "This usually means access to your keychain was denied. Reopen \
+                            Adversaria and allow keychain access when macOS asks.";
+                #[cfg(windows)]
+                let hint = "This usually means Adversaria could not read its key from \
+                            Windows Credential Manager. Reopen Adversaria, and allow \
+                            access if Windows asks.";
+                #[cfg(not(any(target_os = "macos", windows)))]
+                let hint = "This usually means Adversaria could not read its key from \
+                            the system credential store. Reopen Adversaria and allow \
+                            access if prompted.";
                 rfd::MessageDialog::new()
                     .set_level(rfd::MessageLevel::Error)
                     .set_title("Adversaria can't start")
                     .set_description(format!(
-                        "Adversaria couldn't open your local database.\n\n{error}\n\n\
-                         This usually means access to your keychain was denied. Reopen \
-                         Adversaria and allow keychain access when macOS asks."
+                        "Adversaria couldn't open your local database.\n\n{error}\n\n{hint}"
                     ))
                     .show();
                 std::process::exit(1);
@@ -263,6 +276,11 @@ pub fn run() {
             commands::calendar_upcoming_events,
             commands::calendar_event_at,
             commands::calendar_macos_enable,
+            commands::check_capture_permissions,
+            commands::request_microphone_permission,
+            commands::request_screen_permission,
+            commands::open_privacy_settings,
+            commands::relaunch_for_permissions,
             commands::calendar_macos_status,
             commands::get_meeting_stats,
             commands::get_person,

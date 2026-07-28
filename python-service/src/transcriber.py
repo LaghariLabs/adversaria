@@ -31,12 +31,21 @@ def _safe_end(start: float, end: float | None) -> float:
     return end
 
 
-# --- On-device Whisper model registry (MLX) ----------------------------------
-# Curated, HF-verified MLX Whisper repos. Friendly key -> repo + display info.
+# --- On-device Whisper model registry ----------------------------------------
+# Curated, HF-verified repos per backend. Friendly key -> repo + display info.
 # large-v3 is the default: 99 languages incl. Arabic. The others trade accuracy
-# for speed/size. mlx-whisper auto-downloads any repo on first use, so switching
-# is just changing `model_repo` — no restart.
-WHISPER_MODELS: dict[str, dict] = {
+# for speed/size.
+#
+# The KEYS are deliberately shared across backends so a `whisper_model` value in
+# config.json still resolves after the same account/settings move between a Mac
+# and a Windows box; only the weights differ. MLX weights cannot be loaded by
+# CTranslate2 (or vice versa), so the registry MUST be selected by the active
+# backend — a Windows build offering `mlx-community/*` would report bogus
+# download status and then fetch gigabytes faster-whisper can't open.
+
+#: Apple-Silicon (mlx-whisper) weights. Loaded per call, so switching is just a
+#: `model_repo` swap — no restart.
+_MLX_WHISPER_MODELS: dict[str, dict] = {
     "large-v3": {
         "repo": "mlx-community/whisper-large-v3-mlx",
         "label": "Large v3 — best accuracy, 99 languages (incl. Arabic)",
@@ -53,12 +62,67 @@ WHISPER_MODELS: dict[str, dict] = {
         "size": "~0.5 GB",
     },
 }
+
+#: CTranslate2 (faster-whisper) weights — Windows, Linux, and Intel Macs.
+#: There is no CT2 analogue of the MLX 4-bit build: faster-whisper quantizes at
+#: load time via `compute_type`, not by shipping separate weights, so the 4-bit
+#: tier is an alias rather than a third entry (see _CT2_KEY_ALIASES).
+_CT2_WHISPER_MODELS: dict[str, dict] = {
+    "large-v3": {
+        "repo": "Systran/faster-whisper-large-v3",
+        "label": "Large v3 — best accuracy, 99 languages (incl. Arabic)",
+        "size": "~3 GB",
+    },
+    "large-v3-turbo": {
+        "repo": "deepdml/faster-whisper-large-v3-turbo-ct2",
+        "label": "Large v3 Turbo — faster, near-large quality",
+        "size": "~1.6 GB",
+    },
+}
+
+#: Keys the CT2 registry does not carry, mapped to their nearest equivalent so a
+#: config written on a Mac resolves to a sensible model instead of silently
+#: snapping back to the (much larger) default.
+_CT2_KEY_ALIASES: dict[str, str] = {"large-v3-turbo-q4": "large-v3-turbo"}
+
 DEFAULT_WHISPER_MODEL = "large-v3"
 
 
+def backend_is_mlx() -> bool:
+    """True when transcription runs on mlx-whisper.
+
+    Mirrors :func:`create_transcriber`'s selection so the registry and the loaded
+    model never disagree. Read at call time, not import time, so the env var is
+    honoured by tests and by a service started with an explicit backend.
+
+    Note: `create_transcriber` also falls back to faster-whisper if MLX fails to
+    initialise on an Apple-Silicon Mac. That case is rare enough (a broken MLX
+    install) that the registry keeps reporting MLX rather than probing the import.
+    """
+    backend = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()
+    if backend == "mlx":
+        return True
+    if backend == "faster-whisper":
+        return False
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def active_whisper_models() -> dict[str, dict]:
+    """The curated model registry for this machine's transcription backend."""
+    return _MLX_WHISPER_MODELS if backend_is_mlx() else _CT2_WHISPER_MODELS
+
+
 def whisper_repo_for(key: str | None) -> str:
-    """Map a friendly model key to its MLX HF repo, falling back to the default."""
-    entry = WHISPER_MODELS.get((key or "").strip()) or WHISPER_MODELS[DEFAULT_WHISPER_MODEL]
+    """Map a friendly model key to the HF repo for the active backend.
+
+    Unknown keys fall back to the default model, so a corrupt or future config
+    value degrades to "best accuracy" rather than failing the transcription.
+    """
+    models = active_whisper_models()
+    name = (key or "").strip()
+    if name not in models:
+        name = _CT2_KEY_ALIASES.get(name, "") if not backend_is_mlx() else ""
+    entry = models.get(name) or models[DEFAULT_WHISPER_MODEL]
     return entry["repo"]
 
 
@@ -89,7 +153,7 @@ def list_whisper_models() -> list[dict]:
             "size": entry["size"],
             "downloaded": whisper_model_is_cached(entry["repo"]),
         }
-        for key, entry in WHISPER_MODELS.items()
+        for key, entry in active_whisper_models().items()
     ]
 
 
@@ -758,7 +822,17 @@ class WhisperTranscriber:
             compute_type: Quantization type ('int8_float16', 'int8', 'float16').
         """
         self._patch_cuda_path()
-        self.model_size = model_size or os.environ.get("WHISPER_MODEL", "large-v3")
+        raw_model = model_size or os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
+        # Resolve a friendly registry key ("large-v3") to this backend's repo id
+        # so it compares equal to what the Settings picker sends and
+        # `ensure_model_repo` doesn't reload an already-loaded model. Anything
+        # else — an explicit repo id, a local path, a bare size like "medium" —
+        # passes straight through to faster-whisper.
+        self.model_size = (
+            _CT2_WHISPER_MODELS[raw_model]["repo"]
+            if raw_model in _CT2_WHISPER_MODELS
+            else raw_model
+        )
         self.device = device or os.environ.get("WHISPER_DEVICE", "auto")
         # float16 is the correct CUDA default: INT8 GPU kernels are disabled on
         # Blackwell (sm_120, e.g. RTX 5090) since CTranslate2 4.6.2, so
@@ -863,6 +937,33 @@ class WhisperTranscriber:
                 self.model = self._create_model("cpu", "int8")
         else:
             self.model = self._create_model(self.device, self.compute_type)
+
+    def ensure_model_repo(self, repo: str) -> None:
+        """Switch the loaded model to *repo*, reloading only on a real change.
+
+        Unlike mlx-whisper (which loads per call, so the server can swap
+        `model_repo` for one request and restore it), faster-whisper holds one
+        model — and its GPU memory — for the life of the process. Honouring the
+        Settings picker therefore means reloading, which costs seconds and
+        briefly holds two models, so the new choice is *sticky*: we switch once
+        and keep it rather than restoring after every request.
+
+        A failed load keeps the previous model instead of leaving the
+        transcriber with none, so a bad pick degrades to the model that was
+        already working rather than breaking transcription outright.
+        """
+        if not repo or repo == self.model_size:
+            return
+        previous_size, previous_model = self.model_size, self.model
+        self.model_size = repo
+        try:
+            self._load_model()
+            logger.info("Whisper model switched to %s.", repo)
+        except Exception:
+            logger.exception(
+                "Whisper model switch to %s failed — keeping %s.", repo, previous_size
+            )
+            self.model_size, self.model = previous_size, previous_model
 
     def _create_model(self, device: str, compute_type: str) -> WhisperModel:
         """Instantiate a WhisperModel on the given device."""

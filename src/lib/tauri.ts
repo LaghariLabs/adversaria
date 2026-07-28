@@ -584,3 +584,45 @@ export function savePerson(p: {
 }): Promise<PersonProfile> {
   return invoke("save_person", p);
 }
+
+// ---- Capture permissions (asked during setup, not at first record) ----
+
+/** Rust marks capture-permission failures with this prefix so the UI can offer
+ *  "Open Settings" / "Relaunch" instead of printing an unactionable error.
+ *  Must match `PERMISSION_ERROR_PREFIX` in src-tauri/src/commands.rs. */
+export const PERMISSION_ERROR_PREFIX = "PERMISSION_REQUIRED:";
+
+export type PermissionState = "granted" | "denied" | "undetermined";
+
+export interface CapturePermissions {
+  microphone: PermissionState;
+  screen_recording: PermissionState;
+  /** Screen Recording was granted but macOS needs a relaunch to honour it. */
+  needs_relaunch: boolean;
+}
+
+/** Current microphone + screen-recording state. */
+export function checkCapturePermissions(): Promise<CapturePermissions> {
+  return invoke("check_capture_permissions");
+}
+
+/** Show the macOS microphone prompt; resolves once the user answers. */
+export function requestMicrophonePermission(): Promise<PermissionState> {
+  return invoke("request_microphone_permission");
+}
+
+/** Ask for Screen Recording. macOS only shows this prompt once per install —
+ *  a "denied" result means System Settings is the only remaining path. */
+export function requestScreenPermission(): Promise<PermissionState> {
+  return invoke("request_screen_permission");
+}
+
+/** Open the exact System Settings pane for a permission. */
+export function openPrivacySettings(which: "microphone" | "screen"): Promise<void> {
+  return invoke("open_privacy_settings", { which });
+}
+
+/** Restart so a freshly granted Screen Recording permission takes effect. */
+export function relaunchForPermissions(): Promise<void> {
+  return invoke("relaunch_for_permissions");
+}
