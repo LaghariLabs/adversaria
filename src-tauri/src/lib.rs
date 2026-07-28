@@ -22,6 +22,8 @@ pub mod detection;
 pub mod diagnostics;
 pub mod embeddings;
 pub mod http_client;
+pub mod llama_engine;
+pub mod meeting_reminders;
 pub mod permissions;
 pub mod recap;
 pub mod recording_spool;
@@ -131,6 +133,7 @@ pub fn run() {
             tray::setup_hotkeys(app.handle())?;
             detection::spawn_detector(app.handle().clone());
             reminders::spawn(app.handle().clone());
+            meeting_reminders::spawn(app.handle().clone());
             // Packaged builds only: start the bundled Python ML service sidecar.
             // No-op in dev (the bundled binary isn't present; use manual uvicorn).
             commands::spawn_sidecar(app.handle());
@@ -254,6 +257,8 @@ pub fn run() {
             commands::get_onboarding_state,
             commands::complete_onboarding_step,
             commands::get_setup_status,
+            commands::get_engine_install_plan,
+            commands::install_local_engine,
             commands::start_model_download,
             commands::get_model_download_status,
             commands::get_managed_llm_status,

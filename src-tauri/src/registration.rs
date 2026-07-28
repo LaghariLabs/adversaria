@@ -3,6 +3,11 @@
 use crate::types::{OnboardingState, RegistrationState};
 
 const CONSENT_VERSION: &str = "beta-registration-v1";
+// "registration" / "permissions" / "ready" are the 3-screen wizard
+// (SETUP_REDESIGN_SPEC §B); "sample" is recorded post-wizard by the
+// in-app status strip. The remaining names are legacy 7-step rows that
+// persisted onboarding states still contain — they stay accepted so a
+// half-finished old wizard resumes instead of erroring.
 const ALLOWED_STEPS: &[&str] = &[
     "registration",
     "disclosure",
@@ -11,6 +16,7 @@ const ALLOWED_STEPS: &[&str] = &[
     "permissions",
     "sample",
     "capture",
+    "ready",
 ];
 
 // The main webview can issue commands while the Tauri setup callback is still

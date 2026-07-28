@@ -26,6 +26,10 @@ class ModelPin:
     profile_id: str
     repo_id: str
     revision: str
+    # When set, only these repo files are fetched and verified. GGUF repos
+    # publish every quantization side by side (100+ GB total), so the pin
+    # names exactly one weight file instead of mirroring the whole repo.
+    allow_patterns: tuple[str, ...] | None = None
 
 
 def _whisper_pins() -> dict[str, ModelPin]:
@@ -71,22 +75,61 @@ def _whisper_pins() -> dict[str, ModelPin]:
     }
 
 
+def _qwen_pins() -> dict[str, ModelPin]:
+    """The meeting-model tiers, resolved per platform under the SAME ids.
+
+    The profile ids (`qwen-27b-quality` / `qwen-9b-balanced` / `qwen-4b-light`)
+    are the cross-platform contract — onboarding persists them and every Rust
+    gate keys on them. What they resolve to differs: Apple Silicon runs the
+    pinned MLX snapshots under Rapid-MLX; everywhere else the managed engine is
+    llama.cpp, so the ids pin one Q4_K_M GGUF each (unsloth's uploads — the
+    official Qwen account publishes no Qwen3.5/3.6 GGUF). Single-file pins via
+    `allow_patterns`: mirroring a GGUF repo would download every quantization.
+
+    Pinned 2026-07-28 against live Hugging Face state (SETUP_REDESIGN_SPEC §D).
+    """
+    if backend_is_mlx():
+        return {
+            "qwen-27b-quality": ModelPin(
+                profile_id="qwen-27b-quality",
+                repo_id="mlx-community/Qwen3.6-27B-4bit",
+                revision="c000ac2c2057d94be3fa931000c31723aac53282",
+            ),
+            "qwen-9b-balanced": ModelPin(
+                profile_id="qwen-9b-balanced",
+                repo_id="mlx-community/Qwen3.5-9B-MLX-4bit",
+                revision="938d8919941c6e7efd3c7150eff7fe9d12afa631",
+            ),
+            "qwen-4b-light": ModelPin(
+                profile_id="qwen-4b-light",
+                repo_id="mlx-community/Qwen3.5-4B-MLX-4bit",
+                revision="32f3e8ecf65426fc3306969496342d504bfa13f3",
+            ),
+        }
+    return {
+        "qwen-27b-quality": ModelPin(
+            profile_id="qwen-27b-quality",
+            repo_id="unsloth/Qwen3.6-27B-GGUF",
+            revision="82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+            allow_patterns=("Qwen3.6-27B-Q4_K_M.gguf",),
+        ),
+        "qwen-9b-balanced": ModelPin(
+            profile_id="qwen-9b-balanced",
+            repo_id="unsloth/Qwen3.5-9B-GGUF",
+            revision="3885219b6810b007914f3a7950a8d1b469d598a5",
+            allow_patterns=("Qwen3.5-9B-Q4_K_M.gguf",),
+        ),
+        "qwen-4b-light": ModelPin(
+            profile_id="qwen-4b-light",
+            repo_id="unsloth/Qwen3.5-4B-GGUF",
+            revision="e87f176479d0855a907a41277aca2f8ee7a09523",
+            allow_patterns=("Qwen3.5-4B-Q4_K_M.gguf",),
+        ),
+    }
+
+
 MODEL_PINS = {
-    "qwen-27b-quality": ModelPin(
-        profile_id="qwen-27b-quality",
-        repo_id="mlx-community/Qwen3.6-27B-4bit",
-        revision="c000ac2c2057d94be3fa931000c31723aac53282",
-    ),
-    "qwen-9b-balanced": ModelPin(
-        profile_id="qwen-9b-balanced",
-        repo_id="mlx-community/Qwen3.5-9B-MLX-4bit",
-        revision="938d8919941c6e7efd3c7150eff7fe9d12afa631",
-    ),
-    "qwen-4b-light": ModelPin(
-        profile_id="qwen-4b-light",
-        repo_id="mlx-community/Qwen3.5-4B-MLX-4bit",
-        revision="32f3e8ecf65426fc3306969496342d504bfa13f3",
-    ),
+    **_qwen_pins(),
     **_whisper_pins(),
 }
 
@@ -143,28 +186,71 @@ def _load_manifest(pin: ModelPin) -> tuple[ExpectedFile, ...]:
         size = int(_value(sibling, "size", 0) or 0)
         lfs = _value(sibling, "lfs")
         sha256 = str(_value(lfs, "sha256", "") or "").lower() or None
+        if pin.allow_patterns is not None and name not in pin.allow_patterns:
+            continue
         if name and size >= 0:
             files.append(ExpectedFile(name=name, size=size, sha256=sha256))
     if not files or not any(
-        file.name.endswith(".safetensors") or file.name == "weights.npz"
+        file.name.endswith((".safetensors", ".gguf")) or file.name == "weights.npz"
         for file in files
     ):
         raise RuntimeError("Pinned model manifest has no weight files.")
     return tuple(files)
 
 
-def _downloaded_bytes(profile_id: str) -> int:
-    pin = _pin(profile_id)
-    root = _snapshot_path(pin)
-    expected = _EXPECTED.get(profile_id, ())
-    total = 0
-    for file in expected:
-        path = root / file.name
+def _blobs_path(pin: ModelPin) -> Path:
+    """The repo's content-addressed blob directory, sibling of `snapshots/`."""
+    return _snapshot_path(pin).parents[1] / "blobs"
+
+
+def _incomplete_bytes(blobs: Path, sha256: str) -> int:
+    """Size of the largest in-flight blob for `sha256`, or 0 if none exists.
+
+    huggingface_hub 1.19 streams each download into a process-unique
+    `blobs/<sha256>.<uuid8>.incomplete` (`file_download.py:1848`); caches written
+    by older versions use the plain `blobs/<sha256>.incomplete`. The glob covers
+    both, and an interrupted download can leave several behind — the largest is
+    the one furthest along.
+    """
+    sizes = []
+    for path in blobs.glob(f"{sha256}*.incomplete"):
         try:
-            total += min(path.stat().st_size, file.size)
+            sizes.append(path.stat().st_size)
         except OSError:
             continue
-    return total
+    return max(sizes, default=0)
+
+
+def _file_bytes(snapshot: Path, blobs: Path, file: ExpectedFile) -> int:
+    """Bytes on disk for one expected file, counted through exactly one path.
+
+    A file only reaches `snapshots/<revision>/<name>` once it has fully
+    downloaded, so stating snapshots alone reports nothing at all while a
+    multi-GB shard streams — the progress bar sticks at the few percent the
+    small config files contribute. Probe the download's three stages in order
+    (linked snapshot, completed blob, in-flight blob) and stop at the first hit.
+    Non-LFS files have no manifest sha256 and therefore no predictable blob
+    name; they are KBs of config, so counting them on completion is enough.
+    """
+    candidates = [snapshot / file.name]
+    if file.sha256:
+        candidates.append(blobs / file.sha256)
+    for path in candidates:
+        try:
+            return min(path.stat().st_size, file.size)
+        except OSError:
+            continue
+    if not file.sha256:
+        return 0
+    return min(_incomplete_bytes(blobs, file.sha256), file.size)
+
+
+def _downloaded_bytes(profile_id: str) -> int:
+    pin = _pin(profile_id)
+    snapshot = _snapshot_path(pin)
+    blobs = _blobs_path(pin)
+    expected = _EXPECTED.get(profile_id, ())
+    return sum(_file_bytes(snapshot, blobs, file) for file in expected)
 
 
 def _sha256(path: Path) -> str:
@@ -229,7 +315,11 @@ def _run_download(profile_id: str) -> None:
             total_bytes=total,
             detail="Downloading the local meeting model…",
         )
-        snapshot_download(repo_id=pin.repo_id, revision=pin.revision)
+        snapshot_download(
+            repo_id=pin.repo_id,
+            revision=pin.revision,
+            allow_patterns=list(pin.allow_patterns) if pin.allow_patterns else None,
+        )
         _set_state(
             profile_id,
             state="verifying",

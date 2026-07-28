@@ -3813,6 +3813,34 @@ pub async fn get_setup_status(app: AppHandle) -> crate::types::SetupStatus {
     crate::setup::setup_status(&app).await
 }
 
+/// What the transparent Windows engine install WOULD do — versions, sizes,
+/// checksums, source URLs — for the consent card. Pure data, no side effects.
+#[tauri::command]
+pub fn get_engine_install_plan() -> crate::llama_engine::EngineInstallPlan {
+    let system = sysinfo::System::new_all();
+    let memory_gb = system.total_memory() / 1_000_000_000;
+    let disk_gb = {
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let data_dir = crate::config::app_data_dir();
+        disks
+            .list()
+            .iter()
+            .filter(|disk| data_dir.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+            .map_or(0, |disk| disk.available_space())
+            / 1_000_000_000
+    };
+    crate::llama_engine::install_plan(memory_gb, disk_gb)
+}
+
+/// Download, checksum-verify, and unpack the pinned llama.cpp engine the plan
+/// disclosed. The model itself downloads through `start_model_download` like
+/// every other pinned profile. Idempotent.
+#[tauri::command]
+pub async fn install_local_engine() -> Result<(), String> {
+    crate::llama_engine::install().await
+}
+
 #[tauri::command]
 pub async fn start_model_download(
     state: State<'_, AppState>,

@@ -4,6 +4,7 @@
  */
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
+  EngineInstallPlan,
   ActionItem,
   Meeting,
   MeetingStats,
@@ -469,6 +470,14 @@ export function stopManagedLlm(): Promise<void> {
  * pinned profile and restarts the managed runtime on it. */
 export function setLocalModelProfile(profileId: string): Promise<ManagedLlmStatus> {
   return invoke("set_local_model_profile", { profileId });
+}
+
+export function getEngineInstallPlan(): Promise<EngineInstallPlan> {
+  return invoke("get_engine_install_plan");
+}
+
+export function installLocalEngine(): Promise<void> {
+  return invoke("install_local_engine");
 }
 
 export function testLocalSetup(): Promise<string> {
