@@ -1941,7 +1941,12 @@ nav {
 
 .settings-select {
   width: 100%;
-  background: rgba(255, 255, 255, 0.04);
+  /* Opaque, NOT a translucent white overlay. macOS renders native selects
+     itself and ignores most of this; WebView2 paints the OS default (white)
+     underneath, so a 4%-white background left near-white text invisible on
+     Windows. color-scheme makes the native popup follow suit. */
+  background: var(--bg-tertiary);
+  color-scheme: dark;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   height: 38px;
@@ -1951,6 +1956,12 @@ nav {
   font-size: 13px;
   outline: none;
   cursor: pointer;
+}
+
+/* The option list is drawn by the OS and inherits nothing from the control. */
+.settings-select option {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 .checkbox-label {
