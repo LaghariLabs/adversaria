@@ -61,6 +61,16 @@ jobs:
           cd python-service
           uv sync --frozen --extra dev ${{ inputs.bundle_cuda && '--extra cuda' || '' }}
 
+      # tauri-build refuses to run while a declared bundle resource is
+      # missing, and the sidecar is only frozen AFTER these gates — so stub
+      # the path exactly like quality.yml does. The real freeze below
+      # replaces the stub (--noconfirm overwrites dist/). This step was the
+      # workflow's first-run failure: the gates died on
+      # "resource path ..\python-service\dist\adversaria-service doesn't exist".
+      - name: Stub bundled sidecar resources
+        shell: bash
+        run: mkdir -p python-service/dist/adversaria-service
+
       # Same gates as the macOS candidate. cargo's are the load-bearing ones
       # here: the WASAPI capture path is cfg(windows) and cannot be compiled,
       # linted, or tested on the macOS release runner at all.
