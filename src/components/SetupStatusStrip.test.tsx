@@ -6,139 +6,128 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import type { OnboardingState } from "../types";
-import { appConfig } from "../test/fixtures";
 import { SetupStatusStrip } from "./SetupStatusStrip";
 
 const onboarding = (overrides: Partial<OnboardingState> = {}): OnboardingState => ({
   schema_version: 1,
   completed_steps: ["registration", "permissions", "ready"],
-  selected_model_profile: "qwen-4b-light",
+  selected_model_profile: "",
   setup_complete: true,
   updated_at: "2026-07-28T10:00:00Z",
   ...overrides,
 });
 
+const status = (id: string, state: string, downloaded = 0, total = 0) => ({
+  profile_id: id,
+  state,
+  downloaded_bytes: downloaded,
+  total_bytes: total,
+  detail: state === "error" ? "The model download was interrupted." : "",
+  error_code: state === "error" ? "network" : null,
+  verified: state === "ready",
+  can_retry: true,
+});
+
 describe("SetupStatusStrip", () => {
-  it("runs the sample verification exactly once when the engine turns ready, keeping setup_complete true", async () => {
-    const calls: string[] = [];
-    let current = onboarding();
-    mockIPC((command, payload) => {
-      if (command === "get_onboarding_state") return current;
-      if (command === "get_config") return appConfig({ llm_provider: "local" });
-      if (command === "start_model_download" || command === "get_model_download_status") {
-        const args = payload as { profileId?: string };
-        return {
-          profile_id: args.profileId ?? "",
-          state: "ready",
-          downloaded_bytes: 1,
-          total_bytes: 1,
-          detail: "",
-          error_code: null,
-          verified: true,
-          can_retry: true,
-        };
-      }
-      if (command === "start_managed_llm") {
-        calls.push("start_managed_llm");
-        return { state: "ready", profile_id: "qwen-4b-light", detail: "" };
-      }
-      if (command === "test_local_setup") {
-        calls.push("test_local_setup");
-        return "Launch checklist approved";
-      }
-      if (command === "complete_onboarding_step") {
-        const args = payload as { step?: string; setupComplete?: boolean };
-        calls.push(`complete:${args.step}`);
-        // Regression guard: complete_step OVERWRITES setup_complete, so the
-        // strip must pass true or it would resurrect the wizard.
-        expect(args.setupComplete).toBe(true);
-        current = { ...current, completed_steps: [...current.completed_steps, "sample"] };
-        return current;
-      }
-      return null;
-    });
-
-    render(<SetupStatusStrip />);
-    await waitFor(() =>
-      expect(screen.getByText("✓ Your private engine is ready.")).toBeInTheDocument(),
-    );
-    expect(calls.filter((value) => value === "start_managed_llm")).toHaveLength(1);
-    expect(calls.filter((value) => value === "test_local_setup")).toHaveLength(1);
-    expect(calls).toContain("complete:sample");
-  });
-
-  it("renders nothing once the sample step is already recorded", async () => {
-    mockIPC((command) => {
-      if (command === "get_onboarding_state") {
-        return onboarding({ completed_steps: ["registration", "permissions", "ready", "sample"] });
-      }
-      if (command === "get_config") return appConfig({ llm_provider: "local" });
-      return null;
-    });
-    const { container } = render(<SetupStatusStrip />);
-    await waitFor(() => expect(container).toBeEmptyDOMElement());
-  });
-
-  it("renders nothing during the wizard and for machines with no local profile", async () => {
-    mockIPC((command) => {
-      if (command === "get_onboarding_state") {
-        return onboarding({ setup_complete: false, completed_steps: [] });
-      }
-      if (command === "get_config") return appConfig();
-      return null;
-    });
-    const { container } = render(<SetupStatusStrip />);
-    await waitFor(() => expect(container).toBeEmptyDOMElement());
-  });
-
-  it("surfaces a failed verification with a retry", async () => {
-    let fail = true;
+  it("shows the aggregate bar while a download is in flight, and only kicks whisper", async () => {
+    const started: string[] = [];
     mockIPC((command, payload) => {
       if (command === "get_onboarding_state") return onboarding();
-      if (command === "get_config") return appConfig({ llm_provider: "local" });
-      if (command === "start_model_download" || command === "get_model_download_status") {
+      if (command === "start_model_download") {
         const args = payload as { profileId?: string };
-        return {
-          profile_id: args.profileId ?? "",
-          state: "ready",
-          downloaded_bytes: 1,
-          total_bytes: 1,
-          detail: "",
-          error_code: null,
-          verified: true,
-          can_retry: true,
-        };
+        started.push(args.profileId ?? "");
+        return status(args.profileId ?? "", "downloading");
       }
-      if (command === "start_managed_llm") {
-        if (fail) {
-          fail = false;
-          throw new Error("The local meeting model did not become ready.");
-        }
-        return { state: "ready", profile_id: "qwen-4b-light", detail: "" };
+      if (command === "get_model_download_status") {
+        const args = payload as { profileId?: string };
+        return status(args.profileId ?? "", "downloading", 1_000_000_000, 3_000_000_000);
       }
-      if (command === "test_local_setup") return "Launch checklist approved";
-      if (command === "complete_onboarding_step") return onboarding({ completed_steps: ["ready", "sample"] });
       return null;
     });
 
     render(<SetupStatusStrip />);
     expect(
-      await screen.findByText("Your notes engine couldn't verify itself."),
+      await screen.findByText("Downloading in the background — Adversaria stays usable."),
     ).toBeInTheDocument();
+    // SPEC v2: the strip resumes the whisper cache only; LLM downloads start
+    // exclusively from an explicit click in Settings.
+    expect(started.length).toBeGreaterThan(0);
+    expect(started.every((id) => id.startsWith("whisper-"))).toBe(true);
+  });
+
+  it("renders nothing when nothing is downloading", async () => {
+    mockIPC((command, payload) => {
+      if (command === "get_onboarding_state") return onboarding();
+      if (command === "start_model_download" || command === "get_model_download_status") {
+        const args = payload as { profileId?: string };
+        return status(args.profileId ?? "", "ready", 1, 1);
+      }
+      return null;
+    });
+    const { container } = render(<SetupStatusStrip />);
+    // Give the first poll a tick, then confirm it stayed invisible.
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
+  });
+
+  it("renders nothing during the wizard", async () => {
+    mockIPC((command) => {
+      if (command === "get_onboarding_state") {
+        return onboarding({ setup_complete: false, completed_steps: [] });
+      }
+      return null;
+    });
+    const { container } = render(<SetupStatusStrip />);
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
+  });
+
+  it("surfaces a failed download with a retry", async () => {
+    mockIPC((command, payload) => {
+      if (command === "get_onboarding_state") return onboarding();
+      if (command === "start_model_download") {
+        const args = payload as { profileId?: string };
+        return status(args.profileId ?? "", "downloading");
+      }
+      if (command === "get_model_download_status") {
+        const args = payload as { profileId?: string };
+        return args.profileId === "whisper-main"
+          ? status("whisper-main", "error")
+          : status(args.profileId ?? "", "ready", 1, 1);
+      }
+      return null;
+    });
+
+    render(<SetupStatusStrip />);
+    expect(await screen.findByText("The model download was interrupted.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
+  it("never runs sample verification or touches onboarding (SPEC v2)", async () => {
+    const forbidden: string[] = [];
+    mockIPC((command, payload) => {
+      if (["start_managed_llm", "test_local_setup", "complete_onboarding_step"].includes(String(command))) {
+        forbidden.push(String(command));
+      }
+      if (command === "get_onboarding_state") return onboarding();
+      if (command === "start_model_download" || command === "get_model_download_status") {
+        const args = payload as { profileId?: string };
+        return status(args.profileId ?? "", "ready", 1, 1);
+      }
+      return null;
+    });
+    const { container } = render(<SetupStatusStrip />);
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
+    expect(forbidden).toEqual([]);
   });
 });
 
-describe("wizard copy", () => {
-  it("keeps engine jargon out of the first-run screens", () => {
-    // Placement names like Rapid-MLX belong in Settings' technical disclosures
-    // and code identifiers, never in first-run copy (SETUP_REDESIGN_SPEC §B).
-    const sources = ["Welcome.tsx", "SetupStatusStrip.tsx"].map((name) =>
+describe("first-run copy", () => {
+  it("keeps engine jargon out of the wizard, strip, and tour", () => {
+    // Placement names like Rapid-MLX belong in code identifiers and comments,
+    // never in first-run copy (SETUP_REDESIGN_SPEC §B + v2 addendum).
+    const sources = ["Welcome.tsx", "SetupStatusStrip.tsx", "GuidedTour.tsx"].map((name) =>
       readFileSync(join(__dirname, name), "utf-8"),
     );
     for (const source of sources) {
-      // Strings the user can see are the JSX text and quoted literals; comments
-      // legitimately mention engine names, so strip them first.
       const withoutComments = source
         .replace(/\/\*[\s\S]*?\*\//g, "")
         .replace(/^\s*\/\/.*$/gm, "");

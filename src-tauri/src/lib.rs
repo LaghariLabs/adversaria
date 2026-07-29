@@ -257,6 +257,7 @@ pub fn run() {
             commands::get_onboarding_state,
             commands::complete_onboarding_step,
             commands::get_setup_status,
+            commands::engine_configured,
             commands::get_engine_install_plan,
             commands::install_local_engine,
             commands::start_model_download,
