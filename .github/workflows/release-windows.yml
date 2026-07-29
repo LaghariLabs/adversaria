@@ -104,6 +104,7 @@ jobs:
       # office-box acceptance needs the exe, not auto-update artifacts. The
       # first signed run died here with "failed to decode secret key".
       - name: Build the NSIS installer
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
