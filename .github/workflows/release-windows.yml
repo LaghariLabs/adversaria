@@ -98,11 +98,23 @@ jobs:
       # tauri.windows.conf.json is merged automatically on this target: it
       # selects the NSIS bundle and drops the Apple-only rapid-mlx resource.
       # The channel config only overrides the updater endpoint.
+      # Updater-artifact signing needs the private key in repo secrets. When
+      # it's absent (it has only ever lived on the macOS release machine),
+      # build an installer-only candidate instead of dying at the last step:
+      # office-box acceptance needs the exe, not auto-update artifacts. The
+      # first signed run died here with "failed to decode secret key".
       - name: Build the NSIS installer
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- --config "src-tauri/tauri.${{ inputs.channel }}.conf.json"
+        run: |
+          EXTRA=()
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "==> No updater signing key in repo secrets — building an installer-only candidate (no auto-update artifacts)."
+            printf '{"bundle":{"createUpdaterArtifacts":false}}' > no-updater.conf.json
+            EXTRA=(--config no-updater.conf.json)
+          fi
+          npm run tauri build -- --config "src-tauri/tauri.${{ inputs.channel }}.conf.json" "${EXTRA[@]}"
 
       - name: Upload immutable candidate for clean-machine acceptance
         uses: actions/upload-artifact@v7
