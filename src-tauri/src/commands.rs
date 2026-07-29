@@ -3813,6 +3813,25 @@ pub async fn get_setup_status(app: AppHandle) -> crate::types::SetupStatus {
     crate::setup::setup_status(&app).await
 }
 
+/// Whether ANY notes engine can actually serve right now: an API provider
+/// with credentials, or a local model that is installed (pinned snapshot,
+/// pulled Ollama tag, or downloaded GGUF — all surfaced through
+/// `setup_status` profiles). Drives the no-engine empty state: a meeting with
+/// no engine keeps its transcript and offers "choose an engine" instead of a
+/// raw summarization error.
+#[tauri::command]
+pub async fn engine_configured(app: AppHandle) -> Result<bool, String> {
+    let config = crate::config::load_config();
+    if config.llm_provider != "local" {
+        return Ok(!config.llm_base_url.trim().is_empty() && !config.llm_api_key.trim().is_empty());
+    }
+    let status = crate::setup::setup_status(&app).await;
+    Ok(status
+        .profiles
+        .iter()
+        .any(|profile| profile.installed && profile.model_alias == config.ollama_model))
+}
+
 /// What the transparent Windows engine install WOULD do — versions, sizes,
 /// checksums, source URLs — for the consent card. Pure data, no side effects.
 #[tauri::command]

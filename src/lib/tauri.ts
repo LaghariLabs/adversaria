@@ -472,6 +472,10 @@ export function setLocalModelProfile(profileId: string): Promise<ManagedLlmStatu
   return invoke("set_local_model_profile", { profileId });
 }
 
+export function engineConfigured(): Promise<boolean> {
+  return invoke("engine_configured");
+}
+
 export function getEngineInstallPlan(): Promise<EngineInstallPlan> {
   return invoke("get_engine_install_plan");
 }

@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { OnboardingState, RegistrationState, SetupStatus } from "../types";
 import { appConfig } from "../test/fixtures";
-import { Welcome, resolveProfile, resolveScreen } from "./Welcome";
+import { Welcome, resolveScreen } from "./Welcome";
 
 const registration = (status: RegistrationState["status"] = "unregistered"): RegistrationState => ({
   schema_version: 1,
@@ -68,7 +68,8 @@ const downloadStatus = (id: string) => ({
 describe("Welcome", () => {
   it("requires explicit consent, then lands on permissions after registering", async () => {
     let submitted = false;
-    mockIPC((command) => {
+    const llmDownloadsStarted: string[] = [];
+    mockIPC((command, payload) => {
       if (command === "get_config") return appConfig();
       if (command === "get_registration_state") return registration();
       if (command === "get_setup_status") return setup();
@@ -80,7 +81,9 @@ describe("Welcome", () => {
         return registration("pending");
       }
       if (command === "start_model_download" || command === "get_model_download_status") {
-        return downloadStatus("whisper-main");
+        const args = payload as { profileId?: string };
+        if (command === "start_model_download") llmDownloadsStarted.push(args.profileId ?? "");
+        return downloadStatus(args.profileId ?? "whisper-main");
       }
       return null;
     });
@@ -100,15 +103,12 @@ describe("Welcome", () => {
     expect(await screen.findByText("Recording permissions")).toBeInTheDocument();
     expect(screen.getByText("Registration queued")).toBeInTheDocument();
     expect(screen.getByText(/Local setup can continue offline/)).toBeInTheDocument();
+    // SPEC v2: only Whisper may download during setup — never an LLM profile.
+    expect(llmDownloadsStarted.every((id) => id.startsWith("whisper-"))).toBe(true);
   });
 
-  it("resumes a legacy 7-step wizard on Ready and persists profile + completion", async () => {
-    // A user who finished everything except the old sample/capture steps must
-    // NOT restart setup — they land on Ready and finish in one click.
-    let current: OnboardingState = {
-      ...onboarding(["registration", "disclosure", "hardware", "model", "permissions"]),
-      selected_model_profile: "qwen-4b-light",
-    };
+  it("finishes from the final screen with NO model chosen and persists the reminder toggle", async () => {
+    let current: OnboardingState = onboarding(["registration", "permissions"]);
     let savedReminder: boolean | null = null;
     mockIPC((command, payload) => {
       if (command === "get_config") return appConfig();
@@ -123,7 +123,8 @@ describe("Welcome", () => {
       if (command === "complete_onboarding_step") {
         const args = payload as { step?: string; selectedModelProfile?: string | null; setupComplete?: boolean };
         expect(args.step).toBe("ready");
-        expect(args.selectedModelProfile).toBe("qwen-4b-light");
+        // SPEC v2: the wizard never selects a model — the tour + Settings do.
+        expect(args.selectedModelProfile).toBeNull();
         expect(args.setupComplete).toBe(true);
         current = {
           ...current,
@@ -134,19 +135,17 @@ describe("Welcome", () => {
       }
       if (command === "start_model_download" || command === "get_model_download_status") {
         const args = payload as { profileId?: string };
-        return downloadStatus(args.profileId ?? "qwen-4b-light");
+        return downloadStatus(args.profileId ?? "whisper-main");
       }
       return null;
     });
 
     const user = userEvent.setup();
     render(<Welcome />);
-    expect(await screen.findByText("You're ready")).toBeInTheDocument();
-    // The pre-meeting notification question lives HERE, not buried in
-    // Settings; it defaults on and persists when setup finishes.
+    expect(await screen.findByText("You're all set")).toBeInTheDocument();
     expect(screen.getByRole("checkbox")).toBeChecked();
     await user.click(screen.getByRole("button", { name: "Start using Adversaria" }));
-    await waitFor(() => expect(screen.queryByText("You're ready")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("You're all set")).not.toBeInTheDocument());
     expect(savedReminder).toBe(true);
   });
 
@@ -164,7 +163,7 @@ describe("Welcome", () => {
     });
 
     render(<Welcome />);
-    expect(await screen.findByText("You're ready")).toBeInTheDocument();
+    expect(await screen.findByText("You're all set")).toBeInTheDocument();
     expect(screen.queryByText("Recording permissions")).not.toBeInTheDocument();
     // Two visible steps on Windows, and this is the last of them.
     expect(screen.getByText("2 / 2")).toBeInTheDocument();
@@ -217,32 +216,5 @@ describe("resolveScreen", () => {
 
   it("never shows permissions on Windows", () => {
     expect(resolveScreen(["registration"], "windows")).toBe("ready");
-  });
-});
-
-describe("resolveProfile", () => {
-  const withProfiles = (ids: string[], recommended: string): SetupStatus => ({
-    ...setup(),
-    recommended_profile: recommended,
-    profiles: ids.map((id) => ({ ...setup().profiles[0], id })),
-  });
-
-  it("keeps a persisted choice this machine still offers", () => {
-    const status = withProfiles(["ollama:qwen3:8b", "ollama:llama3.1:8b"], "ollama:qwen3:8b");
-    expect(resolveProfile("ollama:llama3.1:8b", status)).toBe("ollama:llama3.1:8b");
-  });
-
-  it("drops a profile this machine no longer offers", () => {
-    // Regression: onboarding persists the model choice, so an MLX id picked on a
-    // build that offered MLX profiles was replayed on every resume — handed to
-    // the managed-runtime start, which fails with "Managed Rapid-MLX is
-    // currently available on Apple Silicon only" and strands setup on step 6/7.
-    const status = withProfiles(["ollama:qwen3.6:35b-a3b"], "ollama:qwen3.6:35b-a3b");
-    expect(resolveProfile("qwen-27b-quality", status)).toBe("ollama:qwen3.6:35b-a3b");
-  });
-
-  it("falls back to the recommendation when nothing is persisted", () => {
-    const status = withProfiles(["ollama:qwen3:8b"], "ollama:qwen3:8b");
-    expect(resolveProfile("", status)).toBe("ollama:qwen3:8b");
   });
 });

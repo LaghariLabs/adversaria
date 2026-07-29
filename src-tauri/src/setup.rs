@@ -170,6 +170,16 @@ struct OllamaModel {
 ///
 /// Returns empty when Ollama isn't reachable; the wizard renders that as "no
 /// local engine found" rather than a broken build.
+/// Embedding models are pulled alongside chat models for the knowledge-graph
+/// index but cannot summarize a meeting. Offering one would produce empty
+/// notes with no error, so keep them out of a "meeting model" picker. The
+/// name-based check has to know the common embedding families that don't say
+/// "embed" — bge-m3 was literally in the first real `ollama list` we tested.
+fn summarization_capable(name: &str) -> bool {
+    let lowered = name.to_lowercase();
+    !(lowered.contains("embed") || lowered.starts_with("bge") || lowered.starts_with("nomic"))
+}
+
 async fn ollama_profiles(memory_gb: u64) -> Vec<ModelProfile> {
     let request = reqwest::Client::new()
         .get(format!("{OLLAMA_URL}/api/tags"))
@@ -183,13 +193,10 @@ async fn ollama_profiles(memory_gb: u64) -> Vec<ModelProfile> {
         return Vec::new();
     };
 
-    // Embedding models are pulled alongside chat models for the knowledge-graph
-    // index but cannot summarize a meeting. Offering one would produce empty
-    // notes with no error, so keep them out of a "meeting model" picker.
     let mut models: Vec<OllamaModel> = tags
         .models
         .into_iter()
-        .filter(|model| !model.name.contains("embed"))
+        .filter(|model| summarization_capable(&model.name))
         .collect();
     // Largest first: quality tracks size, so the best model that fits wins.
     models.sort_by_key(|model| std::cmp::Reverse(model.size));
@@ -313,7 +320,16 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
         };
     }
 
-    let profiles = vec![
+    // Meetily-pattern (SPEC v2): models the user already has beat models we
+    // could download — so a Mac running Ollama lists its pulled models right
+    // next to the pinned tiers. The pinned recommendation stays the product
+    // default (managed Rapid-MLX is the engine we QA); Ollama entries carry
+    // installed=true and are simply available.
+    let mut detected_ollama = ollama_profiles(memory_gb).await;
+    for profile in &mut detected_ollama {
+        profile.recommended = false;
+    }
+    let mut profiles = vec![
         ModelProfile {
             id: "qwen-27b-quality".to_string(),
             display_name: "Qwen 3.6 27B — best meeting quality".to_string(),
@@ -377,7 +393,10 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
             "qwen-4b-light"
         }
         .to_string(),
-        profiles,
+        profiles: {
+            profiles.append(&mut detected_ollama);
+            profiles
+        },
         // Apple Silicon's engine is the bundled Rapid-MLX; the managed
         // llama.cpp fields only mean something off this platform.
         gpu_name: None,
@@ -499,6 +518,13 @@ pub async fn start(
     // Resuming setup replays it here and it fell straight through to
     // `runtime_path()`, failing with "Managed Rapid-MLX is currently available on
     // Apple Silicon only" on a machine that was never going to run Rapid-MLX.
+    // An explicitly selected Ollama model serves through Ollama everywhere —
+    // including Apple Silicon, where the pinned tiers otherwise run managed.
+    // Without this, picking a detected Ollama model on a Mac fell through to
+    // the Rapid-MLX path and failed with "Unknown model profile: ollama:…".
+    if let Some(tag) = profile_id.strip_prefix("ollama:") {
+        return ollama_ready(tag).await;
+    }
     // A stale id resolves to the configured Ollama tag instead.
     if !rapid_mlx_supported() {
         // Managed llama.cpp first: a pinned GGUF tier whose engine + weights
@@ -748,6 +774,18 @@ mod tests {
     /// `complete_step` and `set_selected_model_profile` gate on it — so choosing
     /// any Ollama model failed with "Unknown model profile: ollama:<tag>" and
     /// setup could not be completed on Windows.
+    #[test]
+    fn embedding_models_never_appear_as_meeting_models() {
+        // bge-m3 was in the first real `ollama list` we tested against — it
+        // contains no "embed" substring and would have produced empty notes.
+        assert!(!summarization_capable("bge-m3:latest"));
+        assert!(!summarization_capable("nomic-embed-text"));
+        assert!(!summarization_capable("snowflake-arctic-embed"));
+        assert!(summarization_capable("qwen3.6:35b"));
+        assert!(summarization_capable("qwen3.5:0.8b-mlx"));
+        assert!(summarization_capable("llama3:8b"));
+    }
+
     #[test]
     fn ollama_profiles_resolve_to_their_tag() {
         assert_eq!(

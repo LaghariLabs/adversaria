@@ -17,6 +17,7 @@ import { ErrorBanner } from "./components/ErrorBanner";
 import { UpdatePrompt } from "./components/UpdatePrompt";
 import { Welcome } from "./components/Welcome";
 import { SetupStatusStrip } from "./components/SetupStatusStrip";
+import { GuidedTour } from "./components/GuidedTour";
 import {
   getConfig,
   deleteMeeting,
@@ -61,6 +62,8 @@ type View = "meetings" | "settings" | "todos" | "weekly" | "ask" | "graph";
 
 function App() {
   const [view, setView] = useState<View>("meetings");
+  // Set by the guided tour so its last step can land on Settings › AI Model.
+  const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined);
   // Service health powers the header "Local ML Service" status pill.
   const [serviceOnline, setServiceOnline] = useState<boolean | null>(null);
   // Sovereignty: "full" = both transcription + LLM local (blue), "partial" = one
@@ -627,6 +630,12 @@ function App() {
     <div className={`h-screen flex flex-col${companionActive ? " companion-mode" : ""}`}>
       <Welcome />
       <SetupStatusStrip />
+      <GuidedTour
+        onNavigate={(nextView, tab) => {
+          setSettingsTab(tab);
+          setView(nextView as View);
+        }}
+      />
       <UpdatePrompt />
       {/* Intro / loading splash */}
       {showSplash && (
@@ -673,6 +682,7 @@ function App() {
           ).map(([v, label]) => (
             <button
               key={v}
+              data-tour={v}
               onClick={() => setView(v)}
               className={`nav-btn${view === v ? " active" : ""}`}
             >
@@ -950,7 +960,7 @@ function App() {
         <div className="content-area">
           <Suspense fallback={<div className="empty-state">Loading view…</div>}>
             {view === "settings" ? (
-              <Settings />
+              <Settings initialTab={settingsTab} />
             ) : view === "todos" ? (
               <TodosView
                 meetings={meetings}
