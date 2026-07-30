@@ -346,7 +346,10 @@ export function NoteViewer({
   // Empty-summary meetings show the choose-an-engine CTA; check whether an
   // engine can actually serve so the copy tells the truth.
   useEffect(() => {
-    if (meeting.summary.trim() !== "") return;
+    // Only meaningful for a transcribed meeting awaiting notes — an
+    // untranscribed recording has its own "Not transcribed yet" panel and
+    // must never be told its transcript is saved.
+    if (meeting.summary.trim() !== "" || meeting.transcript.trim() === "") return;
     engineConfigured()
       .then(setHasEngine)
       .catch(() => setHasEngine(null));
@@ -955,21 +958,49 @@ export function NoteViewer({
               marginBottom: 16,
             }}
           >
+            {/* Three DIFFERENT situations used to share one alarming message
+                claiming the service was unreachable. Stopping a recording
+                normally defers transcription to the background queue, so the
+                common case is simply "waiting its turn" — telling that user
+                their recording failed is how a perfectly good 26-minute
+                meeting reads as a lost one. */}
             <h3 style={{ margin: "0 0 6px", fontSize: 14 }}>
-              Not transcribed yet
+              {isTranscribing || transcribing
+                ? "Transcribing…"
+                : isQueued
+                  ? "Waiting to be transcribed"
+                  : "Not transcribed yet"}
             </h3>
             <p style={{ margin: "0 0 12px", fontSize: 13, color: "var(--text-secondary)" }}>
-              This recording was saved but couldn't be transcribed — the AI
-              service was unreachable when you stopped. Your audio is kept on
-              this device until you transcribe it; press the button below once
-              the service is running.
+              {isTranscribing || transcribing ? (
+                <>
+                  Your audio is safe on this device and is being transcribed now.
+                  A long meeting can take several minutes — you can keep using
+                  Adversaria while it works.
+                </>
+              ) : isQueued ? (
+                <>
+                  Your audio is safe on this device. Transcription runs one
+                  recording at a time and this one is next in line.
+                </>
+              ) : (
+                <>
+                  Your audio is safe on this device — it isn't deleted until a
+                  transcription succeeds. Press the button below to transcribe
+                  it now.
+                </>
+              )}
             </p>
             <button
               className="btn-primary"
               onClick={handleTranscribe}
-              disabled={transcribing}
+              disabled={transcribing || isTranscribing || isQueued}
             >
-              {transcribing ? "Transcribing…" : "Transcribe now"}
+              {transcribing || isTranscribing
+                ? "Transcribing…"
+                : isQueued
+                  ? "Queued…"
+                  : "Transcribe now"}
             </button>
             {transcribeError && (
               <p style={{ marginTop: 10, fontSize: 12, color: "var(--accent-red)" }}>
@@ -1118,7 +1149,7 @@ export function NoteViewer({
                   were picked up as separate people, or fix any other detail.
                 </p>
               </>
-            ) : meeting.summary.trim() === "" ? (
+            ) : meeting.summary.trim() === "" && meeting.transcript.trim() !== "" ? (
               /* No-engine-yet is a legal state (SPEC v2): the transcript is
                  safe, and notes generate retroactively once an engine exists. */
               <div className="summary-empty-state">

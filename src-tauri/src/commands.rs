@@ -569,6 +569,34 @@ pub async fn bubble_stop_recording(app: AppHandle) -> Result<(), String> {
 // Transcription + summarisation pipeline
 // ---------------------------------------------------------------------------
 
+/// One in-flight transcription per meeting id, across every caller.
+struct TranscriptionJobGuard(i64);
+
+static TRANSCRIPTION_JOBS: std::sync::Mutex<Option<std::collections::HashSet<i64>>> =
+    std::sync::Mutex::new(None);
+
+impl TranscriptionJobGuard {
+    fn acquire(id: i64) -> Result<Self, String> {
+        let mut guard = TRANSCRIPTION_JOBS.lock().unwrap();
+        let jobs = guard.get_or_insert_with(std::collections::HashSet::new);
+        if !jobs.insert(id) {
+            return Err(
+                "This recording is already being transcribed — it will appear when it finishes."
+                    .to_string(),
+            );
+        }
+        Ok(Self(id))
+    }
+}
+
+impl Drop for TranscriptionJobGuard {
+    fn drop(&mut self) {
+        if let Some(jobs) = TRANSCRIPTION_JOBS.lock().unwrap().as_mut() {
+            jobs.remove(&self.0);
+        }
+    }
+}
+
 /// Transcribe an audio file via the Python service, summarise the
 /// result, store the meeting in SQLite, and return the new `Meeting`.
 /// On success the WAV recordings are deleted — audio never outlives a
@@ -753,7 +781,11 @@ fn save_pending_meeting(audio_path: &str, template: &str, notes: &str) -> Result
         id: 0,
         title: "Untranscribed recording".to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
-        duration_seconds: 0.0,
+        // The spool knows how long it recorded before a single word is
+        // transcribed — showing 0 here is what made a finished 26-minute
+        // meeting look like a lost one.
+        duration_seconds: crate::recording_spool::recorded_duration_seconds(audio_path)
+            .unwrap_or(0.0),
         transcript: String::new(),
         summary: String::new(),
         template_used: template.to_string(),
@@ -1035,6 +1067,14 @@ pub async fn transcribe_meeting(
     state: State<'_, AppState>,
     id: i64,
 ) -> Result<Option<Meeting>, String> {
+    // Two independent callers drive this command: the frontend's background
+    // queue and the NoteViewer's manual "Transcribe" button. Each guards only
+    // ITSELF, so pressing the button while the queue was already working the
+    // same row ran the whole job twice — two full decrypt passes into
+    // `.processing` and two Whisper runs competing for the one transcription
+    // model. On a 26-minute recording that is the difference between "slow"
+    // and "the app is broken". One job per meeting id, app-wide.
+    let _job = TranscriptionJobGuard::acquire(id)?;
     let meeting = crate::storage::get_meeting(id)
         .map_err(|e| format!("Failed to load meeting: {e}"))?
         .ok_or_else(|| format!("Meeting not found: {id}"))?;
@@ -1451,10 +1491,20 @@ fn configured_language() -> Option<String> {
 /// The cloud LLM base URL from config, or `None` when the provider is local or
 /// the URL is blank. Read fresh so a Settings change takes effect next request.
 fn configured_llm_base_url() -> Option<String> {
+    let config = crate::config::load_config();
+    // An Ollama tag can NEVER be served by Rapid-MLX, so it has to be routed
+    // to Ollama before the managed-credentials branch below. macOS made
+    // Ollama models selectable (setup_status lists what the user already
+    // pulled) but the Python summarizer hardcodes the openai backend on Apple
+    // Silicon — so the tag went to Rapid-MLX and 404'd with "The model
+    // `qwen3.6:35b` does not exist". Ollama's own OpenAI-compatible endpoint
+    // keeps that one code path and needs no key.
+    if config.llm_provider == "local" && is_ollama_tag(&config.ollama_model) {
+        return Some(OLLAMA_OPENAI_BASE_URL.to_string());
+    }
     if let Some((base_url, _)) = crate::setup::managed_credentials() {
         return Some(base_url);
     }
-    let config = crate::config::load_config();
     if config.llm_provider == "local" {
         return None;
     }
@@ -1462,8 +1512,25 @@ fn configured_llm_base_url() -> Option<String> {
     (!url.is_empty()).then_some(url)
 }
 
+/// Ollama's OpenAI-compatible surface, so an Ollama model reuses the same
+/// request path as every other openai-compatible engine.
+const OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+
+/// Whether a configured model name is an Ollama tag rather than a managed
+/// Rapid-MLX alias. Ollama names are always `model:tag`; the pinned MLX
+/// aliases (`qwen3.6-27b-4bit`, `qwen3.6-35b`, …) never contain a colon.
+fn is_ollama_tag(model: &str) -> bool {
+    model.contains(':')
+}
+
 /// The cloud LLM API key from config, or `None` when blank. Read fresh.
 fn configured_llm_api_key() -> Option<String> {
+    let config = crate::config::load_config();
+    // Mirror the base-URL routing: when the request is going to Ollama, the
+    // managed Rapid-MLX key is the wrong credential to attach.
+    if config.llm_provider == "local" && is_ollama_tag(&config.ollama_model) {
+        return None;
+    }
     if let Some((_, api_key)) = crate::setup::managed_credentials() {
         return Some(api_key);
     }
@@ -4597,6 +4664,19 @@ fn spawn_live_caption(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ollama_tags_are_told_apart_from_managed_aliases() {
+        // Rapid-MLX aliases never contain a colon; Ollama names always do.
+        // Getting this wrong sent `qwen3.6:35b` to the MLX server, which
+        // 404'd with "The model `qwen3.6:35b` does not exist".
+        assert!(super::is_ollama_tag("qwen3.6:35b"));
+        assert!(super::is_ollama_tag("llama3:8b"));
+        assert!(super::is_ollama_tag("qwen3.5:0.8b-mlx"));
+        assert!(!super::is_ollama_tag("qwen3.6-35b"));
+        assert!(!super::is_ollama_tag("qwen3.6-27b-4bit"));
+        assert!(!super::is_ollama_tag("qwen3.5-9b-4bit"));
+    }
+
     /// The frontend branches on this prefix to decide whether to show the
     /// "Open Settings" / "Relaunch" buttons. If the two copies drift, the
     /// banner silently degrades to unactionable text — so pin them together.
