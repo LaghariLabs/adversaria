@@ -254,3 +254,14 @@ docs/superpowers/     Design spec and phase plan
   is keyword/FTS5 today; **semantic embeddings** are a follow-up.
 - **Calendar integration** (Google/Microsoft, read-only) is specced
   (`docs/SPEC_CALENDAR.md`) but not built — it needs your own OAuth client IDs.
+
+## License
+
+Adversaria is **source-available** under the [Elastic License 2.0](./LICENSE).
+
+In plain terms: read it, run it, modify it, and self-host it freely — for
+yourself, your team, or your company. The one thing you may not do is offer
+Adversaria to others as a hosted or managed service.
+
+Releases up to and including v0.3.68 were published under the MIT license and
+remain available under those terms.

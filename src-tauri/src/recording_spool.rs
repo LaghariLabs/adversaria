@@ -651,6 +651,29 @@ pub fn read_session(root: &Path) -> Result<SessionManifest, String> {
         .map_err(|e| format!("Could not read recording manifest: {e}"))
 }
 
+/// Seconds of audio a spool already holds, from the channel manifests.
+///
+/// A just-stopped recording is saved with the transcript still to come, and
+/// its row used to report `0 minutes` until transcription finished — so a
+/// 26-minute meeting displayed as "Untranscribed recording · 0 min", which
+/// reads exactly like "your recording is gone". The spool has always known
+/// the real length; nothing had asked it. Returns None for legacy WAV paths
+/// and unreadable spools — callers keep their previous default.
+pub fn recorded_duration_seconds(path: &str) -> Option<f64> {
+    let root = Path::new(path);
+    if !root.is_dir() || root.extension().and_then(|v| v.to_str()) != Some("adversaria-spool") {
+        return None;
+    }
+    let longest = ["system", "mic"]
+        .iter()
+        .filter_map(|channel| {
+            read_json::<ChannelManifest>(&root.join(format!("{channel}.json"))).ok()
+        })
+        .map(|manifest| manifest.committed_duration_ms)
+        .max()?;
+    (longest > 0).then(|| longest as f64 / 1000.0)
+}
+
 pub fn asset_snapshot(root: &Path) -> Result<(String, String, u64), String> {
     let session = read_session(root)?;
     let mut channels = Vec::new();

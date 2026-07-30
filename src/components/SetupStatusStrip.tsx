@@ -47,7 +47,14 @@ export function SetupStatusStrip() {
     };
   }, [onboarding?.setup_complete]);
 
-  const active = Boolean(onboarding?.setup_complete);
+  // Poll ONLY while there is a reason to. This used to be
+  // `onboarding.setup_complete` alone, which meant every user with finished
+  // setup hammered the ML service with 3 status requests per second forever —
+  // the strip hid itself when idle but never stopped polling, stealing cycles
+  // from the transcription running on that same service. Once everything is
+  // ready, we stop for the rest of the session.
+  const [settled, setSettled] = useState(false);
+  const active = Boolean(onboarding?.setup_complete) && !settled;
 
   // Watched ids: the Whisper pair always (resume-kicked once, a no-op when
   // cached) plus the persisted model profile IF it is a downloadable pinned id
@@ -67,12 +74,22 @@ export function SetupStatusStrip() {
       });
     }
     const poll = () => {
-      watchedIds.forEach((id) => {
-        getModelDownloadStatus(id)
-          .then((status) => {
-            setDownloads((current) => ({ ...current, [id]: status }));
-          })
-          .catch(() => {});
+      Promise.all(
+        watchedIds.map((id) =>
+          getModelDownloadStatus(id)
+            .then((status) => {
+              setDownloads((current) => ({ ...current, [id]: status }));
+              return status;
+            })
+            .catch(() => null),
+        ),
+      ).then((statuses) => {
+        // Every watched model finished (or is idle because nothing needs
+        // downloading) — stop polling entirely.
+        const done = statuses.every(
+          (status) => status !== null && ["ready", "idle"].includes(status.state),
+        );
+        if (done) setSettled(true);
       });
     };
     poll();

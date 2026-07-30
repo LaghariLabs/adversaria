@@ -21,8 +21,9 @@ interface EngineInstallCardProps {
  * Sovereignty means the app never installs anything it hasn't named: this
  * card lists the exact engine build (version, size, SHA-256, source URL) and
  * the exact model file it will download, and nothing happens until the user
- * presses Install. Every value comes from pins checked into the open-source
- * repo — auditable before, during, and after. */
+ * presses Install. Every value comes from pins compiled into the app and
+ * shown in full before consent — auditable at install time regardless of
+ * whether the source is published. */
 export function EngineInstallCard({ onInstalled, onDismiss }: EngineInstallCardProps) {
   const [plan, setPlan] = useState<EngineInstallPlan | null>(null);
   const [busy, setBusy] = useState(false);
@@ -56,9 +57,10 @@ export function EngineInstallCard({ onInstalled, onDismiss }: EngineInstallCardP
     <div className="engine-install-card" role="region" aria-label="Local engine install plan">
       <strong>Set up your local notes engine</strong>
       <p>
-        Adversaria will install the following, verified against the checksums
-        pinned in its open-source code — nothing else, and only when you press
-        Install:
+        Adversaria will install the following, verified against checksums
+        pinned in the app — nothing else, and only when you press Install. Every
+        version, size, source and hash is listed here before anything is
+        downloaded:
       </p>
       <ul className="engine-install-list">
         <li>

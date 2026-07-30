@@ -5,6 +5,36 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.68] - 2026-07-29
+
+### Fixed
+- **A recording that is waiting to be transcribed no longer looks lost.** It now
+  shows its real length straight away instead of "0 minutes", and says whether
+  it is transcribing, queued, or waiting for you — starting with the important
+  part: your audio is safe on this device.
+- **A meeting can no longer be transcribed twice at once.** Pressing Transcribe
+  while the background queue was already working the same recording ran the
+  whole job a second time, competing with itself and making long meetings
+  crawl.
+- **Local models you already have now work.** Choosing one of your own Ollama
+  models could fail with "the model does not exist" — those requests are now
+  sent to Ollama instead of the built-in engine.
+- **Dropdowns in Settings are readable on Windows** (they rendered white on
+  white).
+- Adversaria no longer keeps polling its own service after everything is ready,
+  which was stealing capacity from transcription.
+- The "generate notes" prompt no longer appears on a recording that has not
+  been transcribed yet.
+
+## [0.3.67] - 2026-07-29
+
+### Fixed
+- **Beta registration reaches the list again.** 0.3.66 shipped without a
+  registration endpoint, so sign-ups were stored on-device and retried
+  forever. This build carries the endpoint: anything queued on your machine
+  is delivered automatically the first time you open this version — nothing
+  was lost.
+
 ## [0.3.66] - 2026-07-28
 
 ### Changed
