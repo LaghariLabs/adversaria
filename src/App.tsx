@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useRef } from "react";
+import { lazy, Suspense, useCallback, useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   CalendarDays,
@@ -18,14 +18,16 @@ import { UpdatePrompt } from "./components/UpdatePrompt";
 import { Welcome } from "./components/Welcome";
 import { SetupStatusStrip } from "./components/SetupStatusStrip";
 import { GuidedTour } from "./components/GuidedTour";
+import { TranscriptionSetupChip } from "./components/TranscriptionSetupChip";
+import { useTranscriptionSetup } from "./hooks/useTranscriptionSetup";
 import {
   getConfig,
+  updateConfig,
   deleteMeeting,
   setMeetingPinned,
   setMeetingArchived,
   setMeetingLocked,
   updateAttendees,
-  checkServiceHealth,
   importAudio,
   importMeetingBundle,
   pickAudioFile,
@@ -62,10 +64,14 @@ type View = "meetings" | "settings" | "todos" | "weekly" | "ask" | "graph";
 
 function App() {
   const [view, setView] = useState<View>("meetings");
-  // Set by the guided tour so its last step can land on Settings › AI Model.
+  // Set by the guided tour, the setup wizard and the transcription chip so they
+  // can land on Settings › AI Model. `settingsNav` is bumped on every request so
+  // an already-open Settings switches tabs even when the target is unchanged.
   const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined);
-  // Service health powers the header "Local ML Service" status pill.
-  const [serviceOnline, setServiceOnline] = useState<boolean | null>(null);
+  const [settingsNav, setSettingsNav] = useState(0);
+  // On-device transcription: powers the guide chip, the service pill, and the
+  // "waiting for the model" copy inside a pending meeting.
+  const transcription = useTranscriptionSetup();
   // Sovereignty: "full" = both transcription + LLM local (blue), "partial" = one
   // of them cloud (amber), "none" = both cloud (red). null = not yet known.
   const [sovereign, setSovereign] = useState<"full" | "partial" | "none" | null>(
@@ -307,6 +313,16 @@ function App() {
       return keep.size === prev.size ? prev : keep;
     });
   }, [selectedMeeting?.id]);
+
+  const openSettingsTab = useCallback((tab?: string) => {
+    setSettingsTab(tab);
+    setSettingsNav((n) => n + 1);
+    setView("settings");
+  }, []);
+  const openModelSettings = useCallback(
+    () => openSettingsTab("model"),
+    [openSettingsTab],
+  );
 
   const handleRecordDetected = () => {
     setDetectedApp(null);
@@ -606,32 +622,29 @@ function App() {
           }
           archiveAfterDays={archiveAfterDays}
           sidebarView={sidebarView}
+          transcriptionSetup={transcription}
         />
       </div>
     </>
   );
 
-  // Poll the local ML service health for the header status pill (every 20s).
-  useEffect(() => {
-    let alive = true;
-    const ping = () =>
-      checkServiceHealth()
-        .then(() => alive && setServiceOnline(true))
-        .catch(() => alive && setServiceOnline(false));
-    ping();
-    const id = setInterval(ping, 20000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
+  const serviceOnline = transcription.serviceOnline;
 
   return (
     <div className={`h-screen flex flex-col${companionActive ? " companion-mode" : ""}`}>
-      <Welcome />
+      <Welcome onOpenModelSettings={openModelSettings} />
       <SetupStatusStrip />
       <GuidedTour
+        currentView={view}
+        suspend={transcription.state === "failed"}
+        transcriptionMissing={
+          transcription.state === "missing" || transcription.state === "downloading"
+        }
         onNavigate={(nextView, tab) => {
+          if (nextView === "settings") {
+            openSettingsTab(tab);
+            return;
+          }
           setSettingsTab(tab);
           setView(nextView as View);
         }}
@@ -738,41 +751,50 @@ function App() {
               </span>
             );
           })()}
-          <span
-            style={{
-              fontSize: 11,
-              fontWeight: 600, // match the sovereignty line above
-              color:
+          <div className="header-status-row">
+            <TranscriptionSetupChip
+              setup={transcription}
+              onOpenModelSettings={openModelSettings}
+            />
+            {/* Actionable, not decorative: clicking re-checks instead of leaving
+                the user staring at a red word they can do nothing about. */}
+            <button
+              type="button"
+              className="chrome-chip"
+              onClick={transcription.refresh}
+              title={
                 serviceOnline === false
-                  ? "var(--accent-red)"
-                  : serviceOnline
-                    ? "var(--accent-green)"
-                    : "var(--text-muted)",
-              display: "flex",
-              alignItems: "center",
-              gap: 4,
-            }}
-          >
-            <span
+                  ? "The on-device AI isn't answering. Click to check again."
+                  : "On-device AI — transcription and notes run here. Click to check again."
+              }
               style={{
-                width: 6,
-                height: 6,
-                backgroundColor:
+                color:
                   serviceOnline === false
                     ? "var(--accent-red)"
                     : serviceOnline
                       ? "var(--accent-green)"
                       : "var(--text-muted)",
-                borderRadius: "50%",
               }}
-            />
-            Local ML Service:{" "}
-            {serviceOnline === null
-              ? "Checking…"
-              : serviceOnline
-                ? "Online"
-                : "Offline"}
-          </span>
+            >
+              <span
+                className="chrome-chip-dot"
+                style={{
+                  backgroundColor:
+                    serviceOnline === false
+                      ? "var(--accent-red)"
+                      : serviceOnline
+                        ? "var(--accent-green)"
+                        : "var(--text-muted)",
+                }}
+              />
+              Local AI:{" "}
+              {serviceOnline === null
+                ? "Checking…"
+                : serviceOnline
+                  ? "Online"
+                  : "Offline — check again"}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -960,7 +982,18 @@ function App() {
         <div className="content-area">
           <Suspense fallback={<div className="empty-state">Loading view…</div>}>
             {view === "settings" ? (
-              <Settings initialTab={settingsTab} />
+              <Settings
+                initialTab={settingsTab}
+                tabNonce={settingsNav}
+                onReplayTour={() => {
+                  // Clear the flag, then leave Settings — the tour never
+                  // starts over Settings, and its first stop is Meetings.
+                  getConfig()
+                    .then((cfg) => updateConfig({ ...cfg, tour_completed: false }))
+                    .catch(() => {});
+                  setView("meetings");
+                }}
+              />
             ) : view === "todos" ? (
               <TodosView
                 meetings={meetings}
@@ -1026,6 +1059,8 @@ function App() {
                   onDelete={handleDeleteMeeting}
                   isTranscribing={selectedMeeting.id === transcribingId}
                   isQueued={transcriptionQueue.includes(selectedMeeting.id)}
+                  transcriptionSetup={transcription}
+                  onOpenModelSettings={openModelSettings}
                   onDiscarded={() => {
                     setNotice("Recording discarded — no speech was detected.");
                     clearSelection();

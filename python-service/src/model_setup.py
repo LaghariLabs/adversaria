@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import logging
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from huggingface_hub import HfApi, constants, snapshot_download
 
 from .transcriber import backend_is_mlx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,8 +47,9 @@ def _whisper_pins() -> dict[str, ModelPin]:
     On CTranslate2, `whisper-live` deliberately points at the SAME repo as
     `whisper-main`: `server._build_live_transcriber` only builds a dedicated fast
     model for MLX and otherwise reuses the main transcriber, so pinning a
-    separate turbo model here would download 1.6 GB that nothing ever loads.
-    Give Windows its own live model and this should point at the turbo repo.
+    separate model here would download gigabytes that nothing ever loads.
+    Since V3 (2026-07-31) the CT2 main model is large-v3-turbo — CPU int8
+    runs large-v3 painfully slowly, and turbo halves the download too.
     """
     if backend_is_mlx():
         return {
@@ -62,8 +66,8 @@ def _whisper_pins() -> dict[str, ModelPin]:
         }
     main = ModelPin(
         profile_id="whisper-main",
-        repo_id="Systran/faster-whisper-large-v3",
-        revision="edaa852ec7e145841d8ffdb056a99866b5f0a478",
+        repo_id="deepdml/faster-whisper-large-v3-turbo-ct2",
+        revision="4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
     )
     return {
         "whisper-main": main,
@@ -73,6 +77,39 @@ def _whisper_pins() -> dict[str, ModelPin]:
             revision=main.revision,
         ),
     }
+
+
+#: Pinned revisions for every curated Settings whisper model, per backend —
+#: keys match the runtime registry in `transcriber` (`active_whisper_models`).
+#: These power the `whisper-model:<key>` profile family so the Settings picker
+#: downloads with the same byte progress / resume / checksum pipeline as the
+#: LLM tiers, instead of the old fire-and-pray `/whisper_download` endpoint.
+#: Verified against live Hugging Face state 2026-07-31.
+_WHISPER_KEY_REVISIONS_MLX = {
+    "large-v3": ("mlx-community/whisper-large-v3-mlx", "49e6aa286ad60c14352c404340ded53710378a11"),
+    "large-v3-turbo": ("mlx-community/whisper-large-v3-turbo", "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"),
+    "large-v3-turbo-q4": ("mlx-community/whisper-large-v3-turbo-q4", "660c343bbf4e52ac257f0b7d952e5388e6f93bef"),
+}
+_WHISPER_KEY_REVISIONS_CT2 = {
+    "large-v3": ("Systran/faster-whisper-large-v3", "edaa852ec7e145841d8ffdb056a99866b5f0a478"),
+    "large-v3-turbo": ("deepdml/faster-whisper-large-v3-turbo-ct2", "4df90f75321148c3a29a9e2351b7ddf8f5b115a8"),
+}
+
+WHISPER_MODEL_PROFILE_PREFIX = "whisper-model:"
+
+
+def _whisper_model_pins() -> dict[str, ModelPin]:
+    """One pin per curated Settings whisper model: `whisper-model:<key>`."""
+    revisions = (
+        _WHISPER_KEY_REVISIONS_MLX if backend_is_mlx() else _WHISPER_KEY_REVISIONS_CT2
+    )
+    pins: dict[str, ModelPin] = {}
+    for key, (repo_id, revision) in revisions.items():
+        profile_id = f"{WHISPER_MODEL_PROFILE_PREFIX}{key}"
+        pins[profile_id] = ModelPin(
+            profile_id=profile_id, repo_id=repo_id, revision=revision
+        )
+    return pins
 
 
 def _qwen_pins() -> dict[str, ModelPin]:
@@ -131,6 +168,7 @@ def _qwen_pins() -> dict[str, ModelPin]:
 MODEL_PINS = {
     **_qwen_pins(),
     **_whisper_pins(),
+    **_whisper_model_pins(),
 }
 
 
@@ -156,6 +194,17 @@ class ExpectedFile:
 _LOCK = threading.Lock()
 _STATES = {profile_id: DownloadState(profile_id) for profile_id in MODEL_PINS}
 _EXPECTED: dict[str, tuple[ExpectedFile, ...]] = {}
+
+#: Called with the profile_id after a download reaches `ready` (verified).
+#: The server registers a transcriber re-init here so a finished whisper
+#: download brings transcription alive without an app restart.
+_READY_CALLBACKS: list[Callable[[str], None]] = []
+
+
+def on_download_ready(callback: Callable[[str], None]) -> None:
+    """Register a callback for verified download completion (idempotent)."""
+    if callback not in _READY_CALLBACKS:
+        _READY_CALLBACKS.append(callback)
 
 
 def _pin(profile_id: str) -> ModelPin:
@@ -190,8 +239,11 @@ def _load_manifest(pin: ModelPin) -> tuple[ExpectedFile, ...]:
             continue
         if name and size >= 0:
             files.append(ExpectedFile(name=name, size=size, sha256=sha256))
+    # `.bin` covers CTranslate2 whisper repos (`model.bin`) — without it every
+    # CT2 whisper pin failed here with "no weight files" before any byte moved.
     if not files or not any(
-        file.name.endswith((".safetensors", ".gguf")) or file.name == "weights.npz"
+        file.name.endswith((".safetensors", ".gguf", ".bin"))
+        or file.name == "weights.npz"
         for file in files
     ):
         raise RuntimeError("Pinned model manifest has no weight files.")
@@ -337,6 +389,11 @@ def _run_download(profile_id: str) -> None:
             verified=True,
             can_retry=False,
         )
+        for callback in list(_READY_CALLBACKS):
+            try:
+                callback(profile_id)
+            except Exception:  # a listener must never poison the download state
+                logger.exception("Model-ready callback failed for %s", profile_id)
     except Exception as exc:  # worker boundary: expose only a redacted code/message
         code, detail = _safe_failure(exc)
         _set_state(

@@ -3,6 +3,7 @@ import type { Meeting, ActionItem } from "../types";
 import { splitLabel, isRtl } from "../lib/summary";
 import { dateLocale } from "../lib/dateFormat";
 import {
+  acceptAgentWork,
   getActionItems,
   setActionItemDone,
   updateActionItem,
@@ -111,6 +112,12 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
 
   const toggle = (item: ActionItem) => {
     setActionItemDone(item.id, !item.done).then(refresh);
+  };
+
+  // Work an agent reported through the MCP server. It is deliberately NOT done
+  // until the user accepts it — an agent can reach "ai_done" and no further.
+  const accept = (item: ActionItem) => {
+    acceptAgentWork(item.id).then(refresh);
   };
 
   const patchDue = (item: ActionItem, due: string) => {
@@ -234,7 +241,27 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   // ---- Triage view data ----
   const thisWeekEnd = addDays(t, 6);
 
-  const triageItems = scoped.filter((it) => !it.done && !isNotMine(it.assignee));
+  const triageItemsAll = scoped.filter((it) => !it.done && !isNotMine(it.assignee));
+
+  // An agent is holding these right now: working on them, or waiting for you to
+  // accept what it did. They lift OUT of the due-date lanes into one place and
+  // drop back the moment you accept — so the lane is only ever busy while an
+  // agent actually is. Empty lane = no agent activity, and it collapses away.
+  const withAi = triageItemsAll
+    .filter((it) => it.status === "in_progress" || it.status === "ai_done")
+    .sort((a, b) => {
+      // Work awaiting YOUR decision sits above work still running.
+      if (a.status !== b.status) return a.status === "ai_done" ? -1 : 1;
+      return (b.completed_at || "").localeCompare(a.completed_at || "");
+    });
+  // Scope-independent: an agent finishing work you filtered away is work you
+  // would simply never hear about. The lane still follows the scope; the
+  // notice does not.
+  const withAiAnywhere = items.filter(
+    (it) => !it.done && (it.status === "in_progress" || it.status === "ai_done"),
+  );
+  const withAiIds = new Set(withAi.map((it) => it.id));
+  const triageItems = triageItemsAll.filter((it) => !withAiIds.has(it.id));
 
   const overdue = triageItems
     .filter((it) => it.due && it.due < t)
@@ -380,7 +407,7 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   // ---- JSX ----
 
   return (
-    <div className="todos-layout">
+    <div className="todos-layout" data-tour="todo-board">
       {/* Header */}
       <div className="todos-header">
         <h1 className="todos-title">Action Items</h1>
@@ -401,6 +428,29 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
             </button>
           </div>
           {/* Filter tabs — only in Focus view */}
+          {/* Agent work needs your attention in EITHER view. The lane itself
+              lives on the triage board, but someone who works in Focus would
+              otherwise never learn their agent had finished something. */}
+          {(view === "focus" || (view === "triage" && withAi.length === 0 && withAiAnywhere.length > 0)) &&
+            (view === "focus" ? withAi.length > 0 : true) && (
+            <button
+              className="agent-focus-note"
+              onClick={() => {
+                onScopeChange(null);
+                setViewPersisted("triage");
+              }}
+            >
+              <strong>
+                {withAiAnywhere.filter((it) => it.status === "ai_done").length > 0
+                  ? `${withAiAnywhere.filter((it) => it.status === "ai_done").length} finished by AI — waiting for you`
+                  : `AI is working on ${withAiAnywhere.length} of your to-dos`}
+              </strong>
+              <span>
+                {view === "triage" ? "In another meeting — show all →" : "Open the board to review →"}
+              </span>
+            </button>
+          )}
+
           {view === "focus" && total > 0 && (
             <div className="todos-filter-tabs">
               {FILTER_TABS.map((tab) => {
@@ -592,7 +642,7 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
       ) : (
         /* ---- Triage view ---- */
         <div>
-          <div className="triage-lanes">
+          <div className={`triage-lanes${withAi.length > 0 ? " has-ai" : ""}`}>
             {/* Overdue */}
             <div
               className={`triage-lane hot ${dropTarget === "overdue" ? "drop-ok" : ""}`}
@@ -689,6 +739,41 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
                 later.map(renderTriageCard)
               )}
             </div>
+
+            {/* With AI — only present while an agent is actually holding work. */}
+            {withAi.length > 0 && (
+              <div className="triage-lane with-ai">
+                <h4>With AI · {withAi.length}</h4>
+                {withAi.map((item) => (
+                  <div
+                    className={`triage-card agent-card${item.status === "ai_done" ? " awaiting" : ""}`}
+                    key={item.id}
+                  >
+                    <span className="triage-card-text">{item.text}</span>
+                    {item.status === "ai_done" ? (
+                      <>
+                        {item.evidence && <span className="agent-evidence">{item.evidence}</span>}
+                        <div className="agent-card-foot">
+                          <small>
+                            {item.completed_by.replace("agent:", "by ")}
+                            {item.due && item.due < t ? " · was overdue" : ""}
+                          </small>
+                          <button className="btn-primary agent-accept" onClick={() => accept(item)}>
+                            Accept
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="agent-card-foot">
+                        <small>
+                          {item.completed_by.replace("agent:", "")} is working on this…
+                        </small>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Done tray */}

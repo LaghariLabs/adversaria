@@ -8,6 +8,175 @@ use crate::types::{
     WhisperModelInfo,
 };
 
+// ---------------------------------------------------------------------------
+// Error translation
+//
+// Every string produced below can end up rendered verbatim in the app (a
+// fresh Windows user saw `Transcription failed: {"detail":"Transcriber not
+// initialized"}`). Raw response bodies, reqwest errors and internal component
+// names must never reach the webview — same bar the frontend's jargon guard
+// holds React copy to.
+// ---------------------------------------------------------------------------
+
+/// The local service didn't answer at all (not started yet, or mid-respawn).
+const SERVICE_DOWN: &str =
+    "The local AI service isn't running. It restarts automatically — try again in a moment.";
+/// No Whisper model is cached, so nothing can transcribe yet.
+const TRANSCRIBER_MISSING: &str = "No transcription model is downloaded yet. Open Settings → AI \
+     Model and download one — this meeting will be transcribed once it's ready.";
+/// A model exists but is still loading into memory.
+const TRANSCRIBER_LOADING: &str = "The transcription engine is still starting up. Your meeting is \
+     saved and will transcribe shortly — try again in a moment.";
+/// Anything else that went wrong while transcribing.
+const TRANSCRIBE_FAILED: &str =
+    "Transcription didn't finish. Your recording is saved — try again in a moment.";
+/// The notes (summarization) engine could not be reached or used.
+const NOTES_UNREACHABLE: &str = "The notes model isn't reachable. Check Settings → AI Model.";
+/// A grounded question couldn't be answered because the notes engine is down.
+const ANSWER_UNREACHABLE: &str =
+    "That question couldn't be answered — the notes model isn't reachable. \
+     Check Settings → AI Model.";
+/// Note templates couldn't be read from the service.
+const TEMPLATES_UNAVAILABLE: &str = "Note templates couldn't be loaded — try again in a moment.";
+/// The service answered, but not with anything we could read. A serde error
+/// here is a bug or a version mismatch — never something to show verbatim.
+const UNEXPECTED_RESPONSE: &str =
+    "The local AI service returned something unexpected — try again in a moment.";
+
+/// Internal component names, repo ids and stack noise that must never appear in
+/// a user-facing sentence, even when the service put them in a `detail` field.
+fn mentions_internals(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "ollama",
+        "mlx",
+        "rapid",
+        "sidecar",
+        "huggingface",
+        "hf_",
+        "traceback",
+        "faster-whisper",
+        "ct2",
+        "/",
+        "{",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Symptoms of "the engine process isn't answering" in a service `detail`.
+fn mentions_connection_failure(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "connect",
+        "connection",
+        "refused",
+        "request failed",
+        "timed out",
+        "timeout",
+        "unreachable",
+        "not initialized",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// The human part of a FastAPI error body: either the structured
+/// `{"detail": {"code", "message"}}` the service now sends, or a legacy plain
+/// `{"detail": "…"}` string. `None` when the body isn't one of those.
+enum ServiceError {
+    Coded { code: String, message: String },
+    Detail(String),
+}
+
+fn parse_service_error(body: &str) -> Option<ServiceError> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let detail = value.get("detail")?;
+    if let Some(code) = detail.get("code").and_then(serde_json::Value::as_str) {
+        return Some(ServiceError::Coded {
+            code: code.to_string(),
+            message: detail
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        });
+    }
+    detail
+        .as_str()
+        .map(|text| ServiceError::Detail(text.trim().to_string()))
+}
+
+/// A sentence a user can act on for a failed `/transcribe`.
+fn transcribe_error(body: &str) -> String {
+    match parse_service_error(body) {
+        Some(ServiceError::Coded { code, message }) => match code.as_str() {
+            "transcriber_missing" => TRANSCRIBER_MISSING.to_string(),
+            "transcriber_loading" => TRANSCRIBER_LOADING.to_string(),
+            // `transcriber_error` carries the service's own human sentence.
+            _ if !message.is_empty() && !mentions_internals(&message) => message,
+            _ => TRANSCRIBE_FAILED.to_string(),
+        },
+        // Legacy plain-string detail (a service older than the V3 addendum).
+        // "Transcriber not initialized" is that service's way of saying no
+        // model is loaded — the 2026-07-31 Windows failure, verbatim. It is
+        // jargon, and it is actionable, so translate rather than echo it.
+        Some(ServiceError::Detail(detail)) if detail.to_lowercase().contains("not initialized") => {
+            TRANSCRIBER_MISSING.to_string()
+        }
+        Some(ServiceError::Detail(detail))
+            if !detail.is_empty()
+                && !mentions_internals(&detail)
+                && !mentions_connection_failure(&detail)
+                && detail.len() < 200 =>
+        {
+            format!("Transcription failed: {detail}")
+        }
+        _ => TRANSCRIBE_FAILED.to_string(),
+    }
+}
+
+/// A sentence a user can act on for a failed `/summarize`. A fresh install's
+/// most likely failure is "no notes engine configured yet", which arrives as a
+/// connection error naming the engine — never show that.
+fn summarize_error(body: &str) -> String {
+    match parse_service_error(body) {
+        Some(ServiceError::Coded { message, .. })
+            if !message.is_empty() && !mentions_internals(&message) =>
+        {
+            message
+        }
+        Some(ServiceError::Detail(detail)) if !detail.is_empty() => {
+            if mentions_connection_failure(&detail) || mentions_internals(&detail) {
+                NOTES_UNREACHABLE.to_string()
+            } else if detail.len() < 200 {
+                format!("Notes could not be written: {detail}")
+            } else {
+                NOTES_UNREACHABLE.to_string()
+            }
+        }
+        _ => NOTES_UNREACHABLE.to_string(),
+    }
+}
+
+/// `text` when it reads like a sentence a user can be shown, else `fallback`.
+fn safe_sentence(text: &str, fallback: &str) -> String {
+    if text.is_empty() || text.len() >= 200 || mentions_internals(text) {
+        return fallback.to_string();
+    }
+    text.to_string()
+}
+
+/// The service's own `detail` when it is safe to show, else `fallback`.
+fn service_error(body: &str, fallback: &str) -> String {
+    match parse_service_error(body) {
+        Some(ServiceError::Coded { message, .. }) => safe_sentence(&message, fallback),
+        Some(ServiceError::Detail(detail)) => safe_sentence(&detail, fallback),
+        None => fallback.to_string(),
+    }
+}
+
 /// Owned parameters for the final-transcription HTTP boundary.
 #[derive(serde::Serialize)]
 pub struct TranscribeParams {
@@ -82,16 +251,19 @@ impl HttpClient {
             .get(format!("{}/health", base_url))
             .send()
             .await
-            .map_err(|e| format!("Health check failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Service unhealthy: {body}"));
+            return Err(service_error(
+                &body,
+                "The local AI service isn't ready yet — try again in a moment.",
+            ));
         }
 
         resp.json::<HealthResponse>()
             .await
-            .map_err(|e| format!("Failed to parse health response: {e}"))
+            .map_err(|_| UNEXPECTED_RESPONSE.to_string())
     }
 
     /// Send audio file path(s) to the transcription endpoint.  When a
@@ -105,16 +277,16 @@ impl HttpClient {
             .json(&params)
             .send()
             .await
-            .map_err(|e| format!("Transcribe request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Transcription failed: {body}"));
+            return Err(transcribe_error(&body));
         }
 
         resp.json::<TranscribeResponse>()
             .await
-            .map_err(|e| format!("Failed to parse transcribe response: {e}"))
+            .map_err(|_| TRANSCRIBE_FAILED.to_string())
     }
 
     /// Transcribe a single-track import file (no mic, no dual merge). The Python
@@ -135,14 +307,14 @@ impl HttpClient {
             })
             .send()
             .await
-            .map_err(|e| format!("Transcribe request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Transcription failed: {body}"));
+            return Err(transcribe_error(&body));
         }
         resp.json::<TranscribeResponse>()
             .await
-            .map_err(|e| format!("Failed to parse transcribe response: {e}"))
+            .map_err(|_| TRANSCRIBE_FAILED.to_string())
     }
 
     /// List curated on-device Whisper models with their download status.
@@ -153,16 +325,17 @@ impl HttpClient {
             .get(format!("{}/whisper_models", base_url))
             .send()
             .await
-            .map_err(|e| format!("Whisper models request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "Whisper models failed: {}",
-                resp.text().await.unwrap_or_default()
+            let body = resp.text().await.unwrap_or_default();
+            return Err(service_error(
+                &body,
+                "The list of transcription models couldn't be loaded — try again in a moment.",
             ));
         }
         resp.json::<Vec<WhisperModelInfo>>()
             .await
-            .map_err(|e| format!("Failed to parse whisper models: {e}"))
+            .map_err(|_| UNEXPECTED_RESPONSE.to_string())
     }
 
     /// Download (cache) an on-device Whisper model so it's ready before recording.
@@ -179,11 +352,12 @@ impl HttpClient {
             .json(&Req { model })
             .send()
             .await
-            .map_err(|e| format!("Whisper download request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "Whisper download failed: {}",
-                resp.text().await.unwrap_or_default()
+            let body = resp.text().await.unwrap_or_default();
+            return Err(service_error(
+                &body,
+                "The transcription model couldn't be downloaded — check your connection and try again.",
             ));
         }
         Ok(())
@@ -345,16 +519,16 @@ impl HttpClient {
             .json(&params)
             .send()
             .await
-            .map_err(|e| format!("Summarize request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Summarization failed: {body}"));
+            return Err(summarize_error(&body));
         }
 
         resp.json::<SummarizeResponse>()
             .await
-            .map_err(|e| format!("Failed to parse summarize response: {e}"))
+            .map_err(|_| UNEXPECTED_RESPONSE.to_string())
     }
 
     /// Ask a grounded question about a meeting transcript; returns the answer text.
@@ -396,17 +570,17 @@ impl HttpClient {
             })
             .send()
             .await
-            .map_err(|e| format!("Chat request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Chat failed: {body}"));
+            return Err(service_error(&body, ANSWER_UNREACHABLE));
         }
 
         let parsed: ChatResp = resp
             .json()
             .await
-            .map_err(|e| format!("Failed to parse chat response: {e}"))?;
+            .map_err(|_| ANSWER_UNREACHABLE.to_string())?;
         Ok(parsed.answer)
     }
 
@@ -448,11 +622,11 @@ impl HttpClient {
             })
             .send()
             .await
-            .map_err(|e| format!("Chat request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Chat failed: {body}"));
+            return Err(service_error(&body, ANSWER_UNREACHABLE));
         }
 
         // Buffer raw bytes and decode only COMPLETE SSE frames (split on a blank
@@ -463,7 +637,7 @@ impl HttpClient {
         while let Some(chunk) = resp
             .chunk()
             .await
-            .map_err(|e| format!("Chat stream error: {e}"))?
+            .map_err(|_| ANSWER_UNREACHABLE.to_string())?
         {
             buf.extend_from_slice(&chunk);
             while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
@@ -481,7 +655,7 @@ impl HttpClient {
                             on_token(t);
                             answer.push_str(t);
                         } else if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
-                            return Err(format!("Chat failed: {e}"));
+                            return Err(service_error(e, ANSWER_UNREACHABLE));
                         }
                     }
                 }
@@ -498,14 +672,14 @@ impl HttpClient {
             .get(format!("{}/templates", base_url))
             .send()
             .await
-            .map_err(|e| format!("Templates request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Templates request failed: {body}"));
+            return Err(service_error(&body, TEMPLATES_UNAVAILABLE));
         }
         resp.json::<Vec<TemplateInfo>>()
             .await
-            .map_err(|e| format!("Failed to parse templates response: {e}"))
+            .map_err(|_| TEMPLATES_UNAVAILABLE.to_string())
     }
 
     /// Fetch one template's raw markdown content.
@@ -520,15 +694,15 @@ impl HttpClient {
             .get(format!("{}/templates/{}", base_url, name))
             .send()
             .await
-            .map_err(|e| format!("Get-template request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Get-template failed: {body}"));
+            return Err(service_error(&body, TEMPLATES_UNAVAILABLE));
         }
         resp.json::<Resp>()
             .await
             .map(|r| r.content)
-            .map_err(|e| format!("Failed to parse template: {e}"))
+            .map_err(|_| TEMPLATES_UNAVAILABLE.to_string())
     }
 
     /// Create or overwrite a template.
@@ -546,10 +720,13 @@ impl HttpClient {
             })
             .send()
             .await
-            .map_err(|e| format!("Save-template request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Save-template failed: {body}"));
+            return Err(service_error(
+                &body,
+                "That note template could not be saved.",
+            ));
         }
         Ok(())
     }
@@ -562,10 +739,13 @@ impl HttpClient {
             .delete(format!("{}/templates/{}", base_url, name))
             .send()
             .await
-            .map_err(|e| format!("Delete-template request failed: {e}"))?;
+            .map_err(|_| SERVICE_DOWN.to_string())?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Delete-template failed: {body}"));
+            return Err(service_error(
+                &body,
+                "That note template could not be deleted.",
+            ));
         }
         Ok(())
     }
@@ -610,5 +790,89 @@ impl HttpClient {
             .await
             .map(|parsed| (parsed.embeddings, parsed.model))
             .map_err(|e| format!("Failed to parse embed response: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact body a fresh Windows 0.3.68 install produced. It reached the
+    /// user verbatim as `Transcription failed: {"detail":"Transcriber not
+    /// initialized"}` — the failure that triggered the V3 addendum.
+    #[test]
+    fn legacy_transcriber_body_never_reaches_the_user() {
+        let message = transcribe_error(r#"{"detail":"Transcriber not initialized"}"#);
+        assert_eq!(message, TRANSCRIBER_MISSING);
+        assert!(!message.contains('{'));
+        assert!(!message
+            .to_lowercase()
+            .contains("transcriber not initialized"));
+    }
+
+    /// A plain sentence from the service is still worth showing.
+    #[test]
+    fn legacy_human_detail_survives() {
+        assert_eq!(
+            transcribe_error(r#"{"detail":"The audio file is empty."}"#),
+            "Transcription failed: The audio file is empty."
+        );
+    }
+
+    #[test]
+    fn structured_transcriber_codes_become_instructions() {
+        assert_eq!(
+            transcribe_error(
+                r#"{"detail":{"code":"transcriber_missing","message":"No model cached"}}"#
+            ),
+            TRANSCRIBER_MISSING
+        );
+        assert_eq!(
+            transcribe_error(
+                r#"{"detail":{"code":"transcriber_loading","message":"Still loading"}}"#
+            ),
+            TRANSCRIBER_LOADING
+        );
+    }
+
+    #[test]
+    fn transcriber_error_keeps_a_human_sentence_but_drops_internals() {
+        assert_eq!(
+            transcribe_error(
+                r#"{"detail":{"code":"transcriber_error","message":"The recording could not be read."}}"#
+            ),
+            "The recording could not be read."
+        );
+        // A traceback / repo id / path must never survive translation.
+        assert_eq!(
+            transcribe_error(
+                r#"{"detail":{"code":"transcriber_error","message":"Traceback: faster-whisper failed"}}"#
+            ),
+            TRANSCRIBE_FAILED
+        );
+    }
+
+    #[test]
+    fn summarize_connection_failures_point_at_settings() {
+        assert_eq!(
+            summarize_error(r#"{"detail":"Ollama request failed: Connection refused"}"#),
+            NOTES_UNREACHABLE
+        );
+        assert_eq!(summarize_error("not json at all"), NOTES_UNREACHABLE);
+    }
+
+    #[test]
+    fn service_error_falls_back_when_the_body_is_unusable() {
+        assert_eq!(
+            service_error("", TEMPLATES_UNAVAILABLE),
+            TEMPLATES_UNAVAILABLE
+        );
+        assert_eq!(
+            service_error(
+                r#"{"detail":"That template name is already taken."}"#,
+                TEMPLATES_UNAVAILABLE
+            ),
+            "That template name is already taken."
+        );
     }
 }

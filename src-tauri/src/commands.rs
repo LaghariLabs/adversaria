@@ -53,6 +53,10 @@ pub struct AppState {
     /// The bundled Python ML service child process (packaged builds only); kept
     /// so it can be killed on app exit. `None` in dev (manual uvicorn).
     pub sidecar: Mutex<Option<std::process::Child>>,
+    /// Set by `shutdown_sidecar` before it kills the child, so the watchdog
+    /// tells "the app is quitting" apart from "the service crashed" and doesn't
+    /// respawn a service on the way out.
+    pub shutting_down: Arc<AtomicBool>,
     /// Bundled Rapid-MLX child. Its loopback URL and per-launch credential are
     /// process-only and never written to config or logs.
     pub managed_llm: Mutex<Option<crate::setup::ManagedLlmProcess>>,
@@ -72,6 +76,7 @@ impl AppState {
             recording: Arc::new(AtomicBool::new(false)),
             recording_started: Mutex::new(None),
             sidecar: Mutex::new(None),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             managed_llm: Mutex::new(None),
         }
     }
@@ -83,14 +88,57 @@ impl Default for AppState {
     }
 }
 
-/// Spawn the bundled Python ML service sidecar — **packaged builds only**. In dev
-/// the bundled binary isn't present, so this is a no-op and the manually-started
-/// uvicorn service (per the dev runbook) is used instead. Picks a free port,
-/// points the HTTP client at it, and stashes the child for shutdown.
+/// How often the watchdog checks that the sidecar is still alive.
+const SIDECAR_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+/// A sidecar that survives this long is considered healthy — the restart
+/// backoff resets, so an occasional crash days apart never exhausts the budget.
+const SIDECAR_HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_secs(60);
+/// Consecutive fast deaths before the watchdog stops trying. Past this the
+/// service is broken in a way restarting won't fix; the log file says why.
+const SIDECAR_MAX_FAST_DEATHS: u32 = 5;
+/// Rotate (truncate) the sidecar log once it passes this size.
+const SIDECAR_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Where the bundled sidecar's stdout/stderr are captured. The frozen service
+/// writes to devnull when it has no stdout handle (`run_service.py`), which is
+/// why the 2026-07-31 Windows failure left nothing to read — a real file handle
+/// from here makes uvicorn's log flow to disk.
+fn sidecar_log_stdio() -> Option<(std::process::Stdio, std::process::Stdio)> {
+    let dir = crate::config::app_data_dir().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("adversaria-service.log");
+    // Append across respawns — a crash loop's first death is the interesting
+    // one — but start clean once the file gets big.
+    let oversized = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > SIDECAR_LOG_MAX_BYTES);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(!oversized)
+        .truncate(oversized)
+        .open(&path)
+        .ok()?;
+    let errors = file.try_clone().ok()?;
+    Some((
+        std::process::Stdio::from(file),
+        std::process::Stdio::from(errors),
+    ))
+}
+
+/// Spawn the bundled Python ML service sidecar — **packaged builds only** — and
+/// watch it for the rest of the session. In dev the bundled binary isn't
+/// present, so this is a no-op and the manually-started uvicorn service (per the
+/// dev runbook) is used instead.
 pub fn spawn_sidecar(app: &AppHandle) {
-    let Ok(resource_dir) = app.path().resource_dir() else {
-        return;
-    };
+    if launch_sidecar(app).is_some() {
+        spawn_sidecar_watchdog(app.clone());
+    }
+}
+
+/// Start one sidecar process: pick a free port, point the HTTP client at it,
+/// and stash the child for shutdown. Returns the port, or `None` when the app
+/// isn't packaged (dev) or the process couldn't be started.
+fn launch_sidecar(app: &AppHandle) -> Option<u16> {
+    let resource_dir = app.path().resource_dir().ok()?;
     let exe = resource_dir
         .join("adversaria-service")
         .join(if cfg!(windows) {
@@ -99,16 +147,16 @@ pub fn spawn_sidecar(app: &AppHandle) {
             "adversaria-service"
         });
     if !exe.exists() {
-        return; // dev / not bundled — use the manually-run service
+        return None; // dev / not bundled — use the manually-run service
     }
 
-    let Some(port) = std::net::TcpListener::bind("127.0.0.1:0")
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-    else {
+        .map(|a| a.port());
+    let Some(port) = port else {
         eprintln!("[sidecar] could not find a free port");
-        return;
+        return None;
     };
 
     let mut command = std::process::Command::new(&exe);
@@ -117,18 +165,26 @@ pub fn spawn_sidecar(app: &AppHandle) {
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
-        .current_dir(exe.parent().unwrap());
+        .current_dir(exe.parent().unwrap())
+        // Every platform: the hf_xet transfer backend stalls model downloads at
+        // 0 bytes (LESSONS_LEARNED.md, 2026-06). The pairing that does it ships
+        // on Windows too, which is where the first real user hit it.
+        .env("HF_HUB_DISABLE_XET", "1");
 
-    // Ensure ffmpeg (mlx-whisper shells out to it) resolves, and keep HF model
-    // downloads working on this box (broken hf_xet). Both are macOS-specific:
-    // the Windows sidecar has no ffmpeg dependency (faster-whisper decodes via
-    // the bundled `av`), and prepending POSIX paths to a Windows PATH is noise.
+    // Ensure ffmpeg (mlx-whisper shells out to it) resolves. macOS-only: the
+    // Windows sidecar has no ffmpeg dependency (faster-whisper decodes via the
+    // bundled `av`), and prepending POSIX paths to a Windows PATH is noise.
     #[cfg(target_os = "macos")]
     {
         let path = std::env::var("PATH").unwrap_or_default();
-        command
-            .env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"))
-            .env("HF_HUB_DISABLE_XET", "1");
+        command.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"));
+    }
+
+    // Capture the service's own logs. Without a handle the frozen build logs to
+    // devnull and a failed launch is undiagnosable. Best-effort: if the file
+    // can't be opened, inherit as before rather than refusing to start.
+    if let Some((out, err)) = sidecar_log_stdio() {
+        command.stdout(out).stderr(err);
     }
 
     // The sidecar is a background service with no UI. Without CREATE_NO_WINDOW a
@@ -149,13 +205,82 @@ pub fn spawn_sidecar(app: &AppHandle) {
                 .client
                 .set_base_url(format!("http://127.0.0.1:{port}"));
             eprintln!("[sidecar] adversaria-service spawned on port {port}");
+            Some(port)
         }
-        Err(e) => eprintln!("[sidecar] failed to spawn: {e}"),
+        Err(e) => {
+            eprintln!("[sidecar] failed to spawn: {e}");
+            None
+        }
     }
+}
+
+/// Watch the bundled sidecar and restart it when it dies. Without this a
+/// crashed service leaves the app permanently unable to transcribe or write
+/// notes, with no signal beyond every request failing. Plain thread (no async
+/// runtime, no lock held across a wait) polling `try_wait`; restarts back off
+/// 2s/4s/8s… and stop after `SIDECAR_MAX_FAST_DEATHS` consecutive fast deaths.
+fn spawn_sidecar_watchdog(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut started = std::time::Instant::now();
+        let mut fast_deaths: u32 = 0;
+        loop {
+            std::thread::sleep(SIDECAR_WATCHDOG_INTERVAL);
+            let state = app.state::<AppState>();
+            if state.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            // Reap without blocking, then drop the guard immediately — nothing
+            // below (backoff sleep, respawn) may hold it.
+            let alive = {
+                let mut guard = state.sidecar.lock().unwrap();
+                match guard.as_mut() {
+                    Some(child) => matches!(child.try_wait(), Ok(None)),
+                    None => false,
+                }
+            };
+            if alive {
+                continue;
+            }
+            // Take the handle out FIRST so the guard is released before the
+            // reaping wait, whatever `try_wait` reported.
+            let dead = state.sidecar.lock().unwrap().take();
+            if let Some(mut child) = dead {
+                let _ = child.wait();
+            }
+
+            if started.elapsed() >= SIDECAR_HEALTHY_UPTIME {
+                fast_deaths = 0;
+            }
+            fast_deaths += 1;
+            if fast_deaths > SIDECAR_MAX_FAST_DEATHS {
+                eprintln!(
+                    "[sidecar] gave up after {SIDECAR_MAX_FAST_DEATHS} failed restarts — see \
+                     logs/adversaria-service.log"
+                );
+                return;
+            }
+            let backoff = std::time::Duration::from_secs(1 << fast_deaths.min(6));
+            eprintln!(
+                "[sidecar] service is not running — restarting in {}s (attempt {fast_deaths})",
+                backoff.as_secs()
+            );
+            std::thread::sleep(backoff);
+            if state.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            // A successful relaunch points the HTTP client at the new port, so
+            // in-flight callers recover on their next request.
+            launch_sidecar(&app);
+            started = std::time::Instant::now();
+        }
+    });
 }
 
 /// Stop the bundled sidecar on app exit (kill + reap). No-op in dev.
 pub fn shutdown_sidecar(state: &AppState) {
+    // Tell the watchdog this exit is intentional BEFORE the child dies, so it
+    // doesn't race us and start a fresh service on the way out.
+    state.shutting_down.store(true, Ordering::SeqCst);
     crate::setup::stop(&state.managed_llm);
     if let Some(mut child) = state.sidecar.lock().unwrap().take() {
         // `kill()` is TerminateProcess on Windows, which terminates ONLY the
@@ -597,12 +722,24 @@ impl Drop for TranscriptionJobGuard {
     }
 }
 
+/// Whether any transcription is in flight, from any caller. The retroactive
+/// drain waits its turn rather than competing for the one transcription model.
+fn transcription_in_flight() -> bool {
+    TRANSCRIPTION_JOBS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|jobs| !jobs.is_empty())
+}
+
 /// Transcribe an audio file via the Python service, summarise the
 /// result, store the meeting in SQLite, and return the new `Meeting`.
-/// On success the WAV recordings are deleted — audio never outlives a
-/// *successful* transcription (privacy guarantee). On failure (e.g. the ML
-/// service is unreachable) the audio is KEPT and a "pending" meeting is saved
-/// so the recording isn't lost; the user can retry via `transcribe_meeting`.
+/// The transcript is stored (and the WAV recordings deleted — audio never
+/// outlives a *successful* transcription, the privacy guarantee) BEFORE
+/// summarization is attempted, so a missing notes engine costs notes, not the
+/// meeting. If transcription itself fails (e.g. the ML service is unreachable)
+/// the audio is KEPT and a "pending" meeting is saved so the recording isn't
+/// lost; the user can retry via `transcribe_meeting`.
 ///
 /// Returns `Ok(None)` when the recording contained no speech and was
 /// auto-discarded (no typed notes).
@@ -620,6 +757,11 @@ pub async fn transcribe_and_summarize(
         .clone()
         .or_else(|| state.mic_recording_path.lock().unwrap().clone());
     let notes = user_notes.unwrap_or_default();
+    // Set as soon as the transcript is safely in the database. Past that point a
+    // failure must NOT save a second "pending" row — the recording already
+    // exists as a meeting, and its audio has already been deleted. (An atomic,
+    // not a Cell: this is read across the command future's await points.)
+    let transcript_saved = AtomicBool::new(false);
 
     let result: Result<Option<Meeting>, String> = async {
         // 1. Transcribe — include the mic recording (if one was captured)
@@ -676,92 +818,124 @@ pub async fn transcribe_and_summarize(
             }));
         }
 
-        // 2. Summarise with the user's configured model + default language.
-        let model = configured_model();
-        let language = configured_language();
-        let llm_base_url = configured_llm_base_url();
-        let llm_api_key = configured_llm_api_key();
-        let notes_for_prompt = notes.clone();
-        let summarize_resp = state
-            .client
-            .summarize(SummarizeParams {
-                transcript: transcribe_resp.text.clone(),
-                template_name: template.clone(),
-                model,
-                output_language: language,
-                user_notes: Some(notes_for_prompt),
-                llm_base_url,
-                llm_api_key,
-                known_attendees: None, // TODO: calendar roster
-                category_hint: transcribe_resp.category_hint.clone(),
-                auto_template: template == "general",
-                viewer_label: configured_viewer_label(),
-            })
-            .await?;
-
-        // 3. Prefer the model's structured title; fall back to deriving one.
-        let title = meeting_title(&summarize_resp);
-        prefill_people_from_summary(&summarize_resp.attendee_details);
-
-        // 4. Build the meeting record (no audio path stored).
+        // 2. Persist the transcript BEFORE summarizing. Notes need an LLM engine
+        // a fresh install may not have; writing the row only after summarization
+        // meant a no-engine meeting lost its transcript and looped on the audio.
         let transcript_text = transcribe_resp.text.clone();
         let turns = if transcribe_resp.turns.is_empty() {
             crate::storage::parse_transcript_turns(&transcript_text)
         } else {
             transcribe_resp.turns.clone()
         };
-        let meeting = Meeting {
+        let mut meeting = Meeting {
             id: 0, // auto-assigned by SQLite
-            title,
+            // Replaced by the model's structured title in step 4, if it runs.
+            title: transcript_only_title(PENDING_MEETING_TITLE, &transcript_text),
             recorded_at: chrono::Utc::now().to_rfc3339(),
             duration_seconds: transcribe_resp.duration_seconds,
             transcript: transcript_text.clone(),
-            summary: summarize_resp.summary,
-            template_used: summarize_resp.template_used,
+            summary: String::new(),
+            template_used: template.clone(),
             audio_file_path: None,
-            attendees: summarize_resp.attendees,
+            attendees: Vec::new(),
             user_notes: notes.clone(),
             link: String::new(),
-            tags: category_tag(&summarize_resp.category).into_iter().collect(),
+            tags: Vec::new(),
             pinned: false,
             locked: false,
             archived: false,
             transcript_turns: turns,
         };
-
-        // 5. Persist.
         let new_id = crate::storage::insert_meeting(&meeting)
             .map_err(|e| format!("Failed to save meeting: {e}"))?;
+        meeting.id = new_id;
+        transcript_saved.store(true, Ordering::SeqCst);
 
-        // 6. Sync action items from the summary.
+        // 3. Summarise with the user's configured model + default language. A
+        // failure leaves the meeting with its transcript and no notes;
+        // `spawn_notes_drain` fills them in once an engine exists.
+        let summarize_resp = match state
+            .client
+            .summarize(SummarizeParams {
+                transcript: transcribe_resp.text.clone(),
+                template_name: template.clone(),
+                model: configured_model(),
+                output_language: configured_language(),
+                user_notes: Some(notes.clone()),
+                llm_base_url: configured_llm_base_url(),
+                llm_api_key: configured_llm_api_key(),
+                known_attendees: None, // TODO: calendar roster
+                category_hint: transcribe_resp.category_hint.clone(),
+                auto_template: template == "general",
+                viewer_label: configured_viewer_label(),
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                crate::second_brain::sync_async();
+                return Err(error);
+            }
+        };
+
+        // 4. Fold the notes in — the model's structured title wins.
+        prefill_people_from_summary(&summarize_resp.attendee_details);
+        meeting.title = meeting_title(&summarize_resp);
+        meeting.summary = summarize_resp.summary;
+        meeting.template_used = summarize_resp.template_used;
+        meeting.attendees = summarize_resp.attendees;
+        meeting.tags = category_tag(&summarize_resp.category).into_iter().collect();
+        crate::storage::update_meeting_transcription(
+            new_id,
+            &meeting.title,
+            meeting.duration_seconds,
+            &transcript_text,
+            &meeting.transcript_turns,
+            &meeting.summary,
+            &meeting.template_used,
+            &meeting.attendees,
+            &meeting.tags,
+        )
+        .map_err(|e| format!("Failed to save the meeting notes: {e}"))?;
+
+        // 5. Sync action items from the summary.
         sync_actions_for_meeting(new_id, &meeting.summary);
         crate::second_brain::sync_async();
         crate::embeddings::spawn_sync(state.client.current_base_url());
 
-        Ok(Some(Meeting {
-            id: new_id,
-            ..meeting
-        }))
+        Ok(Some(meeting))
     }
     .await;
 
+    // The audio has served its purpose the moment a transcript is stored —
+    // whether or not the notes were written (privacy guarantee).
+    let discard_audio = || {
+        if let Err(error) = cleanup_recordings(&audio_path, mic_path.as_deref()) {
+            eprintln!("Warning: {error}");
+        }
+    };
     let final_result = match result {
-        // Success: the audio has served its purpose — delete it (privacy).
         Ok(opt) => {
-            if let Err(error) = cleanup_recordings(&audio_path, mic_path.as_deref()) {
-                eprintln!("Warning: {error}");
-            }
+            discard_audio();
             Ok(opt)
         }
-        // Failure (e.g. ML service down): DON'T delete the audio. Save a
-        // "pending" meeting that points at the kept WAV so the recording isn't
-        // lost; the user retries later with the Transcribe button.
-        Err(err) => match save_pending_meeting(&audio_path, &template, &notes) {
-            Ok(pending) => Ok(Some(pending)),
-            Err(save_err) => Err(format!(
-                "{err} (and the recording could not be saved for retry: {save_err})"
-            )),
-        },
+        // Transcription itself failed (e.g. ML service down): DON'T delete the
+        // audio. Save a "pending" meeting that points at the kept WAV so the
+        // recording isn't lost; the user retries later with the Transcribe
+        // button, and the transcription drain retries it automatically.
+        Err(err) if !transcript_saved.load(Ordering::SeqCst) => {
+            match save_pending_meeting(&audio_path, &template, &notes) {
+                Ok(pending) => Ok(Some(pending)),
+                Err(save_err) => Err(format!(
+                    "{err} (and the recording could not be saved for retry: {save_err})"
+                )),
+            }
+        }
+        // Only the notes failed. The transcript is saved; surface the error.
+        Err(err) => {
+            discard_audio();
+            Err(err)
+        }
     };
 
     *state.recording_path.lock().unwrap() = None;
@@ -779,7 +953,7 @@ pub async fn transcribe_and_summarize(
 fn save_pending_meeting(audio_path: &str, template: &str, notes: &str) -> Result<Meeting, String> {
     let meeting = Meeting {
         id: 0,
-        title: "Untranscribed recording".to_string(),
+        title: PENDING_MEETING_TITLE.to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
         // The spool knows how long it recorded before a single word is
         // transcribed — showing 0 here is what made a finished 26-minute
@@ -847,6 +1021,20 @@ fn mic_path_for(system_path: &str) -> Option<String> {
     system_path
         .strip_suffix(".wav")
         .map(|stem| format!("{stem}_mic.wav"))
+}
+
+/// Title of a recording that hasn't been transcribed yet.
+const PENDING_MEETING_TITLE: &str = "Untranscribed recording";
+
+/// Title for a meeting whose transcript landed but whose notes haven't been
+/// written yet (no engine configured, or the engine failed). The summarizer
+/// normally names the meeting; until it runs, keeping the pending placeholder
+/// would tell the user the recording was never transcribed.
+fn transcript_only_title(existing: &str, transcript: &str) -> String {
+    if !existing.trim().is_empty() && existing != PENDING_MEETING_TITLE {
+        return existing.to_string();
+    }
+    notes_only_title(transcript)
 }
 
 /// Title for a meeting kept only for its typed notes (the audio had no speech):
@@ -1056,9 +1244,11 @@ impl Drop for ProcessingAssetGuard {
 
 /// Retry the transcription + summarisation pipeline for a "pending" meeting —
 /// one whose audio was kept because the ML service was unreachable at stop time.
-/// Runs the pipeline on the stored WAV(s), updates the meeting row in place,
-/// and — only on success — deletes the audio (restoring the privacy guarantee).
-/// On failure the audio is kept so the user can retry again.
+/// Runs the pipeline on the stored WAV(s) and updates the meeting row in place.
+/// The audio is deleted as soon as *transcription* succeeds (the privacy
+/// guarantee); if writing the notes then fails, the meeting keeps its transcript
+/// and gains notes later — nothing is lost and nothing is re-recorded. Only a
+/// failed transcription keeps the audio for another retry.
 ///
 /// Returns `Ok(None)` when the recording contained no speech and was
 /// auto-discarded (no typed notes).
@@ -1173,8 +1363,50 @@ pub async fn transcribe_meeting(
             .map(Some);
     }
 
-    // 2. Summarise — reuse the meeting's template and the notes typed live.
-    let summarize_resp = state
+    // 2. Persist the transcript FIRST. Notes need an LLM engine a fresh install
+    // may not have yet; summarizing before this write meant a no-engine meeting
+    // threw its transcript away and looped forever on the audio. The pending
+    // row's "Needs transcription" tag is cleared here — it is no longer true.
+    let transcript_text = transcribe_resp.text.clone();
+    let turns = if transcribe_resp.turns.is_empty() {
+        crate::storage::parse_transcript_turns(&transcript_text)
+    } else {
+        transcribe_resp.turns.clone()
+    };
+    crate::storage::update_meeting_transcription(
+        id,
+        &transcript_only_title(&meeting.title, &transcript_text),
+        transcribe_resp.duration_seconds,
+        &transcript_text,
+        &turns,
+        "",
+        &meeting.template_used,
+        &[],
+        &[],
+    )
+    .map_err(|e| format!("Failed to save the transcription: {e}"))?;
+
+    // 3. Transcription succeeded, so the audio has served its purpose — delete
+    // the encrypted asset before clearing its DB reference (privacy guarantee,
+    // unchanged). A deletion failure stays visible/retryable as cleanup_pending.
+    match cleanup_recordings(&audio_path, legacy_mic_path.as_deref()) {
+        Ok(()) => {
+            crate::storage::clear_meeting_audio_path(id)
+                .map_err(|e| format!("Audio was deleted but its DB reference remained: {e}"))?;
+            crate::storage::delete_recording_asset(&audio_path)
+                .map_err(|e| format!("Could not clear completed recording asset: {e}"))?;
+        }
+        Err(error) => {
+            update_asset_state(&audio_path, "cleanup_pending", Some(&error))?;
+        }
+    }
+    asset_guard.complete();
+
+    // 4. Summarise — reuse the meeting's template and the notes typed live.
+    // A failure here is survivable: the transcript is saved, NoteViewer offers
+    // "Generate notes", and `spawn_notes_drain` retries every note-less meeting
+    // as soon as an engine is configured. The error still reaches the caller.
+    let summarize_resp = match state
         .client
         .summarize(SummarizeParams {
             transcript: transcribe_resp.text.clone(),
@@ -1189,17 +1421,18 @@ pub async fn transcribe_meeting(
             auto_template: meeting.template_used == "general",
             viewer_label: configured_viewer_label(),
         })
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            crate::second_brain::sync_async();
+            return Err(error);
+        }
+    };
 
-    // 3. Update the row in place; this also clears the pending audio path.
+    // 5. Fold the notes into the row.
     let title = meeting_title(&summarize_resp);
     prefill_people_from_summary(&summarize_resp.attendee_details);
-    let transcript_text = transcribe_resp.text.clone();
-    let turns = if transcribe_resp.turns.is_empty() {
-        crate::storage::parse_transcript_turns(&transcript_text)
-    } else {
-        transcribe_resp.turns.clone()
-    };
     let tags: Vec<crate::types::Tag> = category_tag(&summarize_resp.category).into_iter().collect();
     crate::storage::update_meeting_transcription(
         id,
@@ -1212,26 +1445,11 @@ pub async fn transcribe_meeting(
         &summarize_resp.attendees,
         &tags,
     )
-    .map_err(|e| format!("Failed to save the transcription: {e}"))?;
+    .map_err(|e| format!("Failed to save the meeting notes: {e}"))?;
 
-    // 4. Sync action items from the new summary.
+    // 6. Sync action items from the new summary.
     sync_actions_for_meeting(id, &summarize_resp.summary);
     crate::embeddings::spawn_sync(state.client.current_base_url());
-
-    // 5. Success — delete the encrypted asset before clearing its DB reference.
-    // A deletion failure remains visible and retryable as cleanup_pending.
-    match cleanup_recordings(&audio_path, legacy_mic_path.as_deref()) {
-        Ok(()) => {
-            crate::storage::clear_meeting_audio_path(id)
-                .map_err(|e| format!("Audio was deleted but its DB reference remained: {e}"))?;
-            crate::storage::delete_recording_asset(&audio_path)
-                .map_err(|e| format!("Could not clear completed recording asset: {e}"))?;
-        }
-        Err(error) => {
-            update_asset_state(&audio_path, "cleanup_pending", Some(&error))?;
-        }
-    }
-    asset_guard.complete();
     crate::second_brain::sync_async();
 
     crate::storage::get_meeting(id)
@@ -1260,6 +1478,172 @@ pub fn retry_recording_cleanup(id: i64) -> Result<Meeting, String> {
     crate::storage::get_meeting(id)
         .map_err(|e| format!("Failed to reload meeting: {e}"))?
         .ok_or_else(|| format!("Meeting not found after cleanup: {id}"))
+}
+
+// ---------------------------------------------------------------------------
+// Retroactive drains — the "it heals itself" half of the degrade-but-honest
+// rule. Nothing downloads or blocks during setup, so meetings can legitimately
+// exist without a transcript (no Whisper model yet) or without notes (no LLM
+// engine yet). These two sweeps finish that work the moment the missing piece
+// arrives, instead of leaving the user to retry by hand.
+// ---------------------------------------------------------------------------
+
+/// One notes sweep at a time, app-wide.
+static NOTES_DRAIN_RUNNING: AtomicBool = AtomicBool::new(false);
+/// How long after launch the transcription poller takes its first look.
+const TRANSCRIPTION_DRAIN_FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often it looks afterwards.
+const TRANSCRIPTION_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Write the notes for one stored meeting that has a transcript but none.
+/// Mirrors `resummarize_meeting` minus its per-call template/language override:
+/// the meeting keeps the template it was recorded with. Tags are left alone,
+/// exactly as the manual "Generate notes" path leaves them.
+async fn write_missing_notes(client: &HttpClient, id: i64) -> Result<(), String> {
+    let meeting = crate::storage::get_meeting(id)
+        .map_err(|e| format!("Failed to load meeting: {e}"))?
+        .ok_or_else(|| format!("Meeting not found: {id}"))?;
+    // Re-read rather than trust the queued snapshot: the user may have hit
+    // "Generate notes" on this meeting while the sweep was working through it.
+    if meeting.transcript.trim().is_empty() || !meeting.summary.trim().is_empty() {
+        return Ok(());
+    }
+    let summarize_resp = client
+        .summarize(SummarizeParams {
+            transcript: meeting.transcript.clone(),
+            template_name: meeting.template_used.clone(),
+            model: configured_model(),
+            output_language: configured_language(),
+            user_notes: Some(meeting.user_notes.clone()),
+            llm_base_url: configured_llm_base_url(),
+            llm_api_key: configured_llm_api_key(),
+            known_attendees: (!meeting.attendees.is_empty()).then(|| meeting.attendees.clone()),
+            category_hint: None,  // the stored transcript is post-bleed-strip
+            auto_template: false, // keep the template the meeting was recorded with
+            viewer_label: configured_viewer_label(),
+        })
+        .await?;
+    let title = meeting_title(&summarize_resp);
+    prefill_people_from_summary(&summarize_resp.attendee_details);
+    crate::storage::update_meeting_summary(
+        id,
+        &title,
+        &summarize_resp.summary,
+        &summarize_resp.template_used,
+        &summarize_resp.attendees,
+    )
+    .map_err(|e| format!("Failed to save the meeting notes: {e}"))?;
+    sync_actions_for_meeting(id, &summarize_resp.summary);
+    Ok(())
+}
+
+/// Write the missing notes for every meeting that has a transcript but none.
+/// Call this whenever an LLM engine *becomes* configured — the meetings a user
+/// recorded before choosing an engine then fill themselves in. Fire-and-forget;
+/// a per-meeting failure is logged and the sweep moves on.
+pub fn spawn_notes_drain(app: &AppHandle) {
+    if NOTES_DRAIN_RUNNING.swap(true, Ordering::SeqCst) {
+        return; // a sweep is already running
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let ids = crate::storage::meetings_missing_summary().unwrap_or_else(|error| {
+            eprintln!("[notes-drain] could not list meetings without notes: {error}");
+            Vec::new()
+        });
+        if !ids.is_empty() {
+            eprintln!("[notes-drain] {} meeting(s) waiting for notes", ids.len());
+        }
+        let mut written = 0usize;
+        for id in ids {
+            let state = app.state::<AppState>();
+            match write_missing_notes(&state.client, id).await {
+                Ok(()) => written += 1,
+                Err(error) => eprintln!("[notes-drain] meeting {id} still has no notes: {error}"),
+            }
+        }
+        if written > 0 {
+            eprintln!("[notes-drain] wrote notes for {written} meeting(s)");
+            let base_url = app.state::<AppState>().client.current_base_url();
+            crate::second_brain::sync_async();
+            crate::embeddings::spawn_sync(base_url);
+        }
+        NOTES_DRAIN_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Poll the local service and transcribe every recording that was kept because
+/// no Whisper model existed when it was made. Runs for the life of the app: the
+/// model can be downloaded at any point, and V3 promises those recordings
+/// transcribe themselves when it lands.
+pub fn spawn_transcription_drain(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(TRANSCRIPTION_DRAIN_FIRST_DELAY).await;
+        loop {
+            drain_pending_transcriptions(&app).await;
+            tokio::time::sleep(TRANSCRIPTION_DRAIN_INTERVAL).await;
+        }
+    });
+}
+
+/// One pass of the transcription drain. Cheap and silent when there is nothing
+/// to do: a single indexed query, and the health check only runs when something
+/// is actually waiting.
+async fn drain_pending_transcriptions(app: &AppHandle) {
+    // Never compete with a recording (live captions need the model) or with a
+    // transcription the user or the frontend queue already started.
+    if app.state::<AppState>().recording.load(Ordering::SeqCst) || transcription_in_flight() {
+        return;
+    }
+    let ids = crate::storage::meetings_awaiting_transcription().unwrap_or_else(|error| {
+        eprintln!("[transcribe-drain] could not list waiting recordings: {error}");
+        Vec::new()
+    });
+    if ids.is_empty() {
+        return;
+    }
+    let ready = match app.state::<AppState>().client.check_health().await {
+        // `transcriber_state` is absent on services older than the V3 addendum;
+        // there, a healthy service is the best signal available.
+        Ok(health) => match health.transcriber_state.as_deref() {
+            Some(state) => state == "ready",
+            None => health.status == "ok",
+        },
+        Err(_) => false,
+    };
+    if !ready {
+        return;
+    }
+    eprintln!(
+        "[transcribe-drain] transcription model is ready — {} recording(s) waiting",
+        ids.len()
+    );
+    for id in ids {
+        // Re-check between meetings: a recording may have started, or the user
+        // may have hit Transcribe on the next one themselves.
+        if app.state::<AppState>().recording.load(Ordering::SeqCst) {
+            return;
+        }
+        // `transcribe_meeting` owns the whole pipeline (job guard, transcript-
+        // first persistence, audio deletion, notes) — the drain only decides
+        // *when*. Its own guard makes a collision a no-op, not a double run.
+        match transcribe_meeting(app.state::<AppState>(), id).await {
+            Ok(_) => eprintln!("[transcribe-drain] transcribed meeting {id}"),
+            Err(error) => {
+                eprintln!("[transcribe-drain] meeting {id} did not finish: {error}");
+                // A *notes* failure is not a transcription failure — the
+                // transcript is stored, so keep going. Anything else means the
+                // model went away; stop hammering it until the next poll.
+                let transcribed = crate::storage::get_meeting(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|meeting| !meeting.transcript.trim().is_empty());
+                if !transcribed {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 const NO_SPEECH_IMPORT: &str = "__no_speech_import__";
@@ -3741,6 +4125,11 @@ pub async fn update_config(
     }
     if config.llm_provider != "local" {
         crate::setup::stop(&state.managed_llm);
+        // A cloud/BYOK engine is now configured: any meeting transcribed before
+        // there was one can finally get its notes.
+        if !config.llm_base_url.trim().is_empty() && !config.llm_api_key.trim().is_empty() {
+            spawn_notes_drain(&app);
+        }
     } else if state.managed_llm.lock().unwrap().is_none() {
         let onboarding = crate::storage::get_onboarding_state()
             .map_err(|e| format!("Could not load local model setup: {e}"))?;
@@ -3749,9 +4138,9 @@ pub async fn update_config(
             let profile = onboarding.selected_model_profile;
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
-                if let Err(error) = crate::setup::start(&handle, &state.managed_llm, &profile).await
-                {
-                    eprintln!("[local-model] settings start failed: {error}");
+                match crate::setup::start(&handle, &state.managed_llm, &profile).await {
+                    Ok(_) => spawn_notes_drain(&handle),
+                    Err(error) => eprintln!("[local-model] settings start failed: {error}"),
                 }
             });
         }
@@ -3886,6 +4275,14 @@ pub async fn get_setup_status(app: AppHandle) -> crate::types::SetupStatus {
 /// `setup_status` profiles). Drives the no-engine empty state: a meeting with
 /// no engine keeps its transcript and offers "choose an engine" instead of a
 /// raw summarization error.
+/// Accept work an agent reported on a to-do: `ai_done` → `done`, keeping the
+/// evidence and the credit. The human gate in the agent loop — an agent can
+/// move an item to `ai_done` but never to `done`.
+#[tauri::command]
+pub fn accept_agent_work(id: i64) -> Result<(), String> {
+    crate::storage::accept_agent_work(id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn engine_configured(app: AppHandle) -> Result<bool, String> {
     let config = crate::config::load_config();
@@ -3996,7 +4393,11 @@ pub async fn set_local_model_profile(
     }
     crate::registration::set_selected_model_profile(&profile_id)?;
     crate::setup::stop(&state.managed_llm);
-    crate::setup::start(&app, &state.managed_llm, &profile_id).await
+    let status = crate::setup::start(&app, &state.managed_llm, &profile_id).await?;
+    // An engine now exists — write the notes for every meeting transcribed
+    // before one did.
+    spawn_notes_drain(&app);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -4806,6 +5207,27 @@ mod tests {
     }
 
     #[test]
+    fn transcript_title_replaces_the_pending_placeholder() {
+        // A transcript exists, so "Untranscribed recording" would be a lie.
+        assert_eq!(
+            transcript_only_title(PENDING_MEETING_TITLE, "Them: Let's start the review"),
+            "Them: Let's start the review"
+        );
+        assert_eq!(
+            transcript_only_title("", "Them: Let's start the review"),
+            "Them: Let's start the review"
+        );
+    }
+
+    #[test]
+    fn transcript_title_keeps_a_real_title() {
+        assert_eq!(
+            transcript_only_title("Q3 planning", "Them: Let's start the review"),
+            "Q3 planning"
+        );
+    }
+
+    #[test]
     fn router_parses_relevant_with_condense() {
         let raw = r#"{"relevant": true, "standalone_question": "Which company is Wajee Khan in?", "refusal_message": ""}"#;
         let d = parse_router(raw);
@@ -5109,6 +5531,10 @@ mod tests {
             assignee: assignee.to_string(),
             due: due.to_string(),
             done,
+            status: "todo".to_string(),
+            completed_by: String::new(),
+            completed_at: String::new(),
+            evidence: String::new(),
         }
     }
 
@@ -5167,6 +5593,10 @@ mod tests {
             assignee: "Hamza".to_string(),
             due: "2026-07-04".to_string(),
             done: false,
+            status: "todo".to_string(),
+            completed_by: String::new(),
+            completed_at: String::new(),
+            evidence: String::new(),
         }];
 
         let bundle_meeting = meeting_to_bundle_json(&meeting, &items);
@@ -5260,6 +5690,10 @@ mod tests {
                 assignee: "Bob".to_string(),
                 due: String::new(),
                 done: false,
+                status: "todo".to_string(),
+                completed_by: String::new(),
+                completed_at: String::new(),
+                evidence: String::new(),
             },
             // References a meeting NOT in the set (id 99) — edge must be dropped.
             ActionItem {
@@ -5270,6 +5704,10 @@ mod tests {
                 assignee: "Zoe".to_string(),
                 due: String::new(),
                 done: false,
+                status: "todo".to_string(),
+                completed_by: String::new(),
+                completed_at: String::new(),
+                evidence: String::new(),
             },
             // Generic diarization label — excluded.
             ActionItem {
@@ -5280,6 +5718,10 @@ mod tests {
                 assignee: "Speaker 3".to_string(),
                 due: String::new(),
                 done: false,
+                status: "todo".to_string(),
+                completed_by: String::new(),
+                completed_at: String::new(),
+                evidence: String::new(),
             },
             // Pure owner (never an attendee) + a case-duplicate second item —
             // one owner node, one deduped owns-action edge.
@@ -5291,6 +5733,10 @@ mod tests {
                 assignee: "Rita".to_string(),
                 due: String::new(),
                 done: false,
+                status: "todo".to_string(),
+                completed_by: String::new(),
+                completed_at: String::new(),
+                evidence: String::new(),
             },
             ActionItem {
                 id: 5,
@@ -5300,6 +5746,10 @@ mod tests {
                 assignee: "rita".to_string(),
                 due: String::new(),
                 done: false,
+                status: "todo".to_string(),
+                completed_by: String::new(),
+                completed_at: String::new(),
+                evidence: String::new(),
             },
         ];
         let g = build_graph(&meetings, &items, "", "");
@@ -5422,6 +5872,10 @@ mod tests {
                 assignee: "Me و Basim".to_string(),
                 due: String::new(),
                 done: false,
+                status: "todo".to_string(),
+                completed_by: String::new(),
+                completed_at: String::new(),
+                evidence: String::new(),
             },
         ];
         let g = build_graph(&meetings, &items, "Hamza", "Tatweer OS, Claude");

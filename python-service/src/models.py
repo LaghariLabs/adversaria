@@ -365,3 +365,8 @@ class HealthResponse(BaseModel):
     status: str
     whisper_model: str
     ollama_available: bool
+    # Why transcription is (un)available: loading | ready | missing | error.
+    # "missing" means no model is downloaded — the UI guides the user to
+    # Settings instead of showing a dead service (SETUP_REDESIGN_SPEC V3).
+    transcriber_state: str = "ready"
+    transcriber_detail: str | None = None

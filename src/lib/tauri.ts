@@ -472,6 +472,10 @@ export function setLocalModelProfile(profileId: string): Promise<ManagedLlmStatu
   return invoke("set_local_model_profile", { profileId });
 }
 
+export function acceptAgentWork(id: number): Promise<void> {
+  return invoke("accept_agent_work", { id });
+}
+
 export function engineConfigured(): Promise<boolean> {
   return invoke("engine_configured");
 }

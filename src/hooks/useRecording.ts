@@ -185,12 +185,17 @@ export function useRecording(): UseRecordingReturn {
         }
       })
       .catch((e) => {
-        // Transcription failed (e.g. ML service unreachable). The meeting stays a
-        // pending row with its audio kept, so the NoteViewer "Transcribe now"
-        // banner can retry it manually.
+        // Transcription failed (e.g. the transcription model isn't on this
+        // machine yet). The meeting stays a pending row with its audio kept, so
+        // it can be retried — but silence here meant a recording that quietly
+        // never became a transcript, with only the console to say why. The
+        // message arrives already human from the Rust boundary.
         console.warn(
           `[queue] background transcription failed for meeting ${job.id} (audio kept for retry):`,
           e,
+        );
+        setError(
+          `${String(e)} The recording is safe on this device — open it and press "Transcribe now" to retry.`,
         );
       })
       .finally(() => {

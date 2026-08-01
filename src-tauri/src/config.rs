@@ -88,7 +88,10 @@ impl Default for AppConfig {
         Self {
             python_service_url: "http://127.0.0.1:9876".to_string(),
             default_prompt_template: "general".to_string(),
-            auto_detect_meetings: false,
+            // On by default (Hamza, 2026-08-01): detection only OFFERS to
+            // record when a call app uses the mic — it never records on its
+            // own, so the safe default is the helpful one.
+            auto_detect_meetings: true,
             ollama_model: default_llm_model(),
             summary_language: "en".to_string(),
             user_name: String::new(),
@@ -106,7 +109,7 @@ impl Default for AppConfig {
             transcription_base_url: String::new(),
             transcription_api_key: String::new(),
             transcription_model: "whisper-large-v3".to_string(),
-            whisper_model: "large-v3".to_string(),
+            whisper_model: crate::types::default_whisper_model(),
             encrypt_db: true,
             biometric_unlock: true,
             user_email: String::new(),
@@ -114,7 +117,10 @@ impl Default for AppConfig {
             signup_synced: false,
             date_format: "system".to_string(),
             archive_after_days: 30,
-            sidebar_view: "compact".to_string(),
+            // Full cards by default (Hamza, 2026-08-01): the welcome meeting —
+            // and every meeting — should greet the user as a card with its
+            // preview, not a one-line row. Compact stays a Settings choice.
+            sidebar_view: "full".to_string(),
             recording_view: "balanced".to_string(),
             notch_pill_style: "minimal".to_string(),
             meeting_alert_style: "notch_drop".to_string(),

@@ -88,6 +88,18 @@ _CT2_KEY_ALIASES: dict[str, str] = {"large-v3-turbo-q4": "large-v3-turbo"}
 DEFAULT_WHISPER_MODEL = "large-v3"
 
 
+def default_whisper_key() -> str:
+    """The default model key for the active backend.
+
+    CTranslate2 machines (Windows, Linux, Intel Macs) mostly run Whisper on
+    CPU int8, where large-v3 is both a ~3 GB download and painfully slow —
+    turbo is ~1.6 GB at near-large quality and several times faster (decided
+    2026-07-31, SETUP_REDESIGN_SPEC V3). Apple-Silicon keeps large-v3: the GPU
+    absorbs it, and changing the default would re-download for existing users.
+    """
+    return DEFAULT_WHISPER_MODEL if backend_is_mlx() else "large-v3-turbo"
+
+
 def backend_is_mlx() -> bool:
     """True when transcription runs on mlx-whisper.
 
@@ -122,7 +134,7 @@ def whisper_repo_for(key: str | None) -> str:
     name = (key or "").strip()
     if name not in models:
         name = _CT2_KEY_ALIASES.get(name, "") if not backend_is_mlx() else ""
-    entry = models.get(name) or models[DEFAULT_WHISPER_MODEL]
+    entry = models.get(name) or models[default_whisper_key()]
     return entry["repo"]
 
 
@@ -138,10 +150,33 @@ def _hf_cache_root() -> Path:
         return Path(hf_home) / "hub"
 
 
+#: Weight files that prove a whisper snapshot is actually usable, per backend:
+#: CT2 ships `model.bin`, MLX ships `weights.npz` (older) or `.safetensors`.
+_WEIGHT_NAMES = ("model.bin", "weights.npz")
+_WEIGHT_SUFFIXES = (".safetensors", ".gguf")
+
+
 def whisper_model_is_cached(repo: str) -> bool:
-    """True if an HF snapshot for `repo` is already on disk (so no download needed)."""
+    """True if a COMPLETE HF snapshot for `repo` is on disk.
+
+    huggingface_hub links each file into `snapshots/<rev>/` the moment that
+    file finishes, so config.json appears seconds into a multi-GB download —
+    a non-empty snapshot directory is NOT "downloaded". V3 gates transcriber
+    init, the ready state, and MLX's call-time fetch on this predicate, so a
+    partial or interrupted download must read as absent (the state stays
+    "missing" while the pinned download runs), never as ready — which made
+    MLX fetch unpinned weights mid-transcription — nor as a load error.
+    """
     snap = _hf_cache_root() / ("models--" + repo.replace("/", "--")) / "snapshots"
-    return snap.is_dir() and any(snap.iterdir())
+    if not snap.is_dir():
+        return False
+    for revision in snap.iterdir():
+        if not revision.is_dir():
+            continue
+        for file in revision.iterdir():
+            if file.name in _WEIGHT_NAMES or file.name.endswith(_WEIGHT_SUFFIXES):
+                return True
+    return False
 
 
 def list_whisper_models() -> list[dict]:
@@ -822,7 +857,7 @@ class WhisperTranscriber:
             compute_type: Quantization type ('int8_float16', 'int8', 'float16').
         """
         self._patch_cuda_path()
-        raw_model = model_size or os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
+        raw_model = model_size or os.environ.get("WHISPER_MODEL") or default_whisper_key()
         # Resolve a friendly registry key ("large-v3") to this backend's repo id
         # so it compares equal to what the Settings picker sends and
         # `ensure_model_repo` doesn't reload an already-loaded model. Anything
@@ -966,14 +1001,26 @@ class WhisperTranscriber:
             self.model_size, self.model = previous_size, previous_model
 
     def _create_model(self, device: str, compute_type: str) -> WhisperModel:
-        """Instantiate a WhisperModel on the given device."""
+        """Instantiate a WhisperModel on the given device.
+
+        `local_files_only=True`: the model must already be in the HF cache.
+        Downloads are sanctioned exclusively through `model_setup`'s pinned,
+        checksum-verified pipeline (SETUP_REDESIGN_SPEC V3) — loading here used
+        to fetch ~3 GB synchronously inside service startup, which left the
+        port unbound for the whole download and killed the process on failure.
+        """
         logger.info(
             "Loading whisper model: size=%s device=%s compute_type=%s",
             self.model_size,
             device,
             compute_type,
         )
-        model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+        model = WhisperModel(
+            self.model_size,
+            device=device,
+            compute_type=compute_type,
+            local_files_only=True,
+        )
         logger.info("Whisper model loaded successfully on %s.", device)
         return model
 
@@ -1312,12 +1359,16 @@ class MlxWhisperTranscriber:
         return _merge_dual(self._collect_segments, audio_path, mic_audio_path, diarize, initial_prompt=self.initial_prompt)
 
 
-def create_transcriber():
+def create_transcriber(model_key: str | None = None):
     """Build the transcription backend for this machine.
 
     Selection order: `WHISPER_BACKEND` env (`mlx` | `faster-whisper` | `auto`),
     then auto-detect — MLX on Apple-Silicon macOS, faster-whisper elsewhere.
     Falls back to faster-whisper if MLX can't be initialised.
+
+    `model_key` pins a specific registry model (e.g. the caller found only
+    that one cached); None keeps the env-var / backend-default resolution.
+    Loading never downloads — see `WhisperTranscriber._create_model`.
     """
     backend = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()
     if backend == "auto":
@@ -1326,9 +1377,11 @@ def create_transcriber():
 
     if backend == "mlx":
         try:
-            return MlxWhisperTranscriber()
+            return MlxWhisperTranscriber(
+                model_repo=whisper_repo_for(model_key) if model_key else None
+            )
         except Exception as exc:
             logger.warning(
                 "MLX backend unavailable (%s) — falling back to faster-whisper.", exc
             )
-    return WhisperTranscriber()
+    return WhisperTranscriber(model_size=model_key)

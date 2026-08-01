@@ -67,7 +67,7 @@ export function WeeklyView({ onOpenMeeting }: WeeklyViewProps) {
     offset === 0 ? "This week" : offset === -1 ? "Last week" : fmtRange();
 
   return (
-    <div className="weekly-layout">
+    <div className="weekly-layout" data-tour="weekly-view">
       {/* Header: title + nav */}
       <div className="weekly-header weekly-header--row">
         <div>

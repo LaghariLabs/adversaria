@@ -58,9 +58,26 @@ The native shell. Owns audio capture, persistence, config, the tray/hotkey, and
 all communication with the Python service.
 
 - **`lib.rs`** — app entry. Registers plugins (shell, global-shortcut), manages
-  `AppState`, and in `setup()` ensures the config dir, inits the DB, builds the
-  tray, and registers the hotkey. Lists all IPC commands in the
-  `generate_handler!` macro.
+  `AppState`, and in `setup()` ensures the config dir, inits the DB, seeds the
+  demo meeting, builds the tray, registers the hotkey, and starts the
+  transcription drain. Lists all IPC commands in the `generate_handler!` macro.
+- **`demo.rs`** (V3 Phase B) — the seeded sample meeting: one ordinary,
+  deletable meeting row (dual-capture-shaped transcript + house-format notes;
+  its **Action Items** feed the to-dos board via the normal
+  `sync_action_items` path). Fresh installs only: gated on
+  `onboarding_state.demo_meeting_seeded` AND an empty meetings table, flag set
+  either way so it never re-evaluates.
+- **Sidecar lifecycle (V3, in `commands.rs`)** — `spawn_sidecar` logs the
+  child's stdout/stderr to `<app_data>/logs/adversaria-service.log`, sets
+  `HF_HUB_DISABLE_XET=1` on all platforms, and a watchdog thread respawns a
+  dead sidecar with backoff (an `AppState.shutting_down` flag keeps an
+  intentional quit from being raced into a respawn). Two **retroactive
+  drains** make degraded states heal themselves: pending recordings
+  transcribe once `/health` reports the transcriber ready, and note-less
+  transcripts summarize once an LLM engine is configured. `http_client.rs`
+  translates every service error (including the structured
+  `{"detail":{code,message}}` 503s) into human sentences — raw response
+  bodies never reach the webview.
 - **`commands.rs`** — the IPC commands and `AppState` (holds the `AudioCapture`,
   the `HttpClient`, and the current recording paths). The default record→notes
   path is now **decoupled** for back-to-back meetings: Stop → `enqueue_recording`
@@ -122,15 +139,20 @@ all communication with the Python service.
 
 ## Layer 3 — Python ML service (`python-service/`)
 
-A FastAPI app (uvicorn, port 9876) that does the heavy ML. Singletons for the
-Whisper model and Ollama client are created once in the FastAPI **lifespan**
-context and reused.
+A FastAPI app (uvicorn, port 9876) that does the heavy ML. Since V3
+(2026-08-01) the service **always serves within seconds, model-less if need
+be**: the transcriber loads on a background thread with `local_files_only`
+(never downloads — model bytes arrive only through `model_setup`'s pinned
+pipeline on an explicit user action), and a module-level state machine
+(`loading | ready | missing | error`) is reported by `/health` and re-attempts
+init on demand and when a whisper download completes. The summarizer/embedder
+singletons still come from the lifespan.
 
 Endpoints:
 
 | Method/Path | Purpose | Request → Response |
 |-------------|---------|--------------------|
-| `GET /health` | readiness | → `{status, whisper_model, ollama_available}` |
+| `GET /health` | readiness | → `{status, whisper_model, ollama_available, transcriber_state, transcriber_detail}` |
 | `GET /templates` | list templates | → `[{name, description}]` |
 | `GET /templates/{name}` | raw template | → `{name, content}` |
 | `POST /transcribe` | speech→text (+ diarization) | `{audio_path, mic_audio_path?, me_label?, vocabulary?, diarize}` → `{text, language, duration_seconds}` |

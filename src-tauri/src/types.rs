@@ -56,6 +56,17 @@ pub struct HealthResponse {
     pub status: String,
     pub whisper_model: String,
     pub ollama_available: bool,
+    /// Transcription readiness reported by the service:
+    /// `loading` | `ready` | `missing` | `error`. Absent on older services —
+    /// and re-serialized as ABSENT (not null), matching the webview's
+    /// `transcriber_state?:` contract; a null here read as "not ready" and
+    /// kept the setup chip fast-polling forever against a pre-V3 service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcriber_state: Option<String>,
+    /// Human detail for a non-`ready` `transcriber_state` (e.g. which model is
+    /// missing). `None` when the transcriber is ready or the service is older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcriber_detail: Option<String>,
 }
 
 // ---- Meeting ----
@@ -156,6 +167,25 @@ pub struct ActionItem {
     pub assignee: String,
     pub due: String, // 'YYYY-MM-DD' or ''
     pub done: bool,
+    /// "todo" | "in_progress" | "ai_done" | "done". `done` stays the boolean
+    /// everything already understands; this is the richer state an agent walks
+    /// through. "ai_done" means an agent reported it finished and is waiting
+    /// for the user to accept — deliberately NOT done.
+    #[serde(default = "default_item_status")]
+    pub status: String,
+    /// "" | "you" | "agent:<name>" — who completed it.
+    #[serde(default)]
+    pub completed_by: String,
+    #[serde(default)]
+    pub completed_at: String,
+    /// What the agent actually did: a one-line summary, ideally with a path or
+    /// link. Without this, "done by AI" is a claim nobody can check.
+    #[serde(default)]
+    pub evidence: String,
+}
+
+fn default_item_status() -> String {
+    "todo".to_string()
 }
 
 // ---- People profiles ----
@@ -510,8 +540,15 @@ pub struct AppConfig {
     pub tour_completed: bool,
 }
 
-fn default_whisper_model() -> String {
-    "large-v3".to_string()
+/// Default on-device Whisper model for a fresh config. Windows gets the turbo
+/// build (~1.6 GB, and the CT2 default the Python service already ships);
+/// elsewhere the full `large-v3` stays the default.
+pub(crate) fn default_whisper_model() -> String {
+    if cfg!(windows) {
+        "large-v3-turbo".to_string()
+    } else {
+        "large-v3".to_string()
+    }
 }
 
 fn default_date_format() -> String {
@@ -523,7 +560,7 @@ fn default_archive_after_days() -> u32 {
 }
 
 fn default_sidebar_view() -> String {
-    "compact".to_string()
+    "full".to_string()
 }
 
 fn default_recording_view() -> String {

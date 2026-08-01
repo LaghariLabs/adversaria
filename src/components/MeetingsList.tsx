@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { formatDateTime, formatDate, dateLocale } from "../lib/dateFormat";
 import type { Meeting, Tag } from "../types";
+import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { TAG_COLORS } from "../lib/tags";
 import { updateMeetingTags } from "../lib/tauri";
 import { cleanMeetingTitle } from "../lib/summary";
@@ -41,6 +42,9 @@ interface MeetingsListProps {
   archiveAfterDays?: number;
   /** Sidebar meeting-list style: "compact" (one-line rows) | "full" (cards). */
   sidebarView?: string;
+  /** On-device transcription state, so an untranscribed recording can say it is
+   *  waiting for the model rather than looking like a failure. */
+  transcriptionSetup?: TranscriptionSetup;
 }
 
 function formatDuration(seconds: number): string {
@@ -72,8 +76,29 @@ export function MeetingsList({
   selectedId,
   archiveAfterDays,
   sidebarView,
+  transcriptionSetup,
 }: MeetingsListProps) {
   const queuedSet = new Set(queuedIds ?? []);
+
+  // The live badge on a meeting row. Note the last case is keyed off the DATA,
+  // never the "Needs transcription" tag: writing a transcript now clears that
+  // tag (and rewrites the title), so the tag can't carry this state any more.
+  // The backend drains these automatically once the model lands, so "waiting"
+  // is a promise the app keeps rather than a chore for the user.
+  const waitingForModel =
+    transcriptionSetup?.state === "missing" ||
+    transcriptionSetup?.state === "loading" ||
+    transcriptionSetup?.state === "downloading";
+  const pipelineLabelFor = (meeting: Meeting): string | null => {
+    if (meeting.id === transcribingId) return "Transcribing…";
+    if (queuedSet.has(meeting.id)) return "Queued";
+    if (waitingForModel && meeting.transcript === "" && meeting.audio_file_path != null) {
+      return transcriptionSetup?.state === "downloading" && transcriptionSetup.percent !== null
+        ? `Waiting for the model — ${transcriptionSetup.percent}%`
+        : "Waiting for the model";
+    }
+    return null;
+  };
   // Pinned first, then newest first
   const sorted = [...meetings].sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -324,12 +349,7 @@ export function MeetingsList({
     const isArchived = opts.isArchive ?? false;
     const bin = opts.bin ?? "flat";
     const hidden = meeting.locked && !(unlockedIds?.has(meeting.id) ?? false);
-    const pipelineLabel =
-      meeting.id === transcribingId
-        ? "Transcribing…"
-        : queuedSet.has(meeting.id)
-          ? "Queued"
-          : null;
+    const pipelineLabel = pipelineLabelFor(meeting);
     const displayTags = pipelineLabel
       ? (meeting.tags ?? []).filter((t) => t.label !== "Needs transcription")
       : meeting.tags ?? [];
@@ -557,12 +577,7 @@ export function MeetingsList({
     // Background-transcription status (the queue). While in the pipeline,
     // hide the orange "Needs transcription" tag — that's the failed/idle
     // state; the live badge below says what's actually happening.
-    const pipelineLabel =
-      meeting.id === transcribingId
-        ? "Transcribing…"
-        : queuedSet.has(meeting.id)
-          ? "Queued"
-          : null;
+    const pipelineLabel = pipelineLabelFor(meeting);
     const displayTags = pipelineLabel
       ? (meeting.tags ?? []).filter((t) => t.label !== "Needs transcription")
       : meeting.tags ?? [];
@@ -836,7 +851,10 @@ export function MeetingsList({
   const [archiveOpen, setArchiveOpen] = useState(false);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+    <div
+      data-tour="meeting-list"
+      style={{ display: "flex", flexDirection: "column", height: "100%" }}
+    >
       {/* Search + date filter */}
       <div style={{ position: "relative" }}>
         <div className="search-container">

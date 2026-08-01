@@ -1630,6 +1630,12 @@ nav {
   gap: 16px;
   margin-bottom: 20px;
 }
+/* The With AI lane is a FOURTH column. Without this the grid keeps its three
+   tracks and wraps the lane onto a second row — under a "Later" column that
+   can hold hundreds of items, i.e. rendered but effectively invisible. */
+.triage-lanes.has-ai {
+  grid-template-columns: repeat(4, 1fr);
+}
 @media (max-width: 900px) {
   .triage-lanes {
     grid-template-columns: 1fr;
@@ -1870,7 +1876,8 @@ nav {
   flex: 1;
   padding: 30px;
   overflow-y: auto;
-  max-width: 680px;
+  /* Fill the view like every other page (Hamza, 2026-08-01) — the old
+     680px cap left a dead gutter wider than the content. */
 }
 
 /* Glassmorphism card for inner sections */
@@ -2992,6 +2999,9 @@ nav {
 .welcome-download > div { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; font-size: 11px; }
 .welcome-download progress { width: 100%; accent-color: var(--accent-blue, #24a0ed); }
 .welcome-download.error { background: color-mix(in srgb, #ff453a 10%, transparent); }
+/* V3: the Ready screen states what's missing instead of fetching it. */
+.welcome-ready-line { margin-top: 14px; font-size: 12px; color: var(--accent-green, #34c759); }
+.welcome-guide-copy { margin: 0 0 10px; font-size: 12px; color: var(--text-secondary); }
 /* Live permission rows: status dot · copy · action, granted up-front in setup
    so macOS can't interrupt the user's first recording. */
 .perm-live li { align-items: center; }
@@ -4292,6 +4302,50 @@ nav {
   width: 120px;
   flex: none;
 }
+.setup-strip-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+/* Chrome chips in the header status stack: the transcription guide chip and
+   the on-device service pill. Both are buttons — a status you can act on. */
+.chrome-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  cursor: pointer;
+  text-align: left;
+}
+.chrome-chip:hover { text-decoration: underline; }
+.chrome-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+/* Guide chip and service pill share one line, so the status stack stays two
+   rows tall and can't outgrow the fixed-height header. */
+.header-status-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+@media (max-width: 1120px) {
+  /* The narrow breakpoint folds the status stack away — but never the guide
+     chip: a missing transcription model has no other persistent prompt. */
+  .header-status:has(.chrome-chip-guide) { display: flex; }
+  .header-status:has(.chrome-chip-guide) > *:not(.header-status-row),
+  .header-status .header-status-row > *:not(.chrome-chip-guide) { display: none; }
+}
 
 /* setup redesign — transparent engine-install consent card */
 .engine-install-card {
@@ -4395,3 +4449,61 @@ nav {
   font-size: 13px;
   color: var(--text-muted, #8b93a7);
 }
+
+/* Agent write-back — the "With AI" lane: work an agent is holding right now */
+.triage-lane.with-ai {
+  border-color: color-mix(in srgb, var(--accent-orange, #e0a458) 45%, transparent);
+  background: color-mix(in srgb, var(--accent-orange, #e0a458) 7%, transparent);
+}
+.agent-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.agent-card.awaiting {
+  border-color: color-mix(in srgb, var(--accent-orange, #e0a458) 50%, transparent);
+}
+.agent-evidence {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary, #a1a1aa);
+  border-left: 2px solid var(--accent-orange, #e0a458);
+  padding-left: 8px;
+  word-break: break-word;
+}
+.agent-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.agent-card-foot small {
+  font-size: 11px;
+  color: var(--text-muted, #71717a);
+}
+.agent-accept {
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+/* Agent work surfaced in Focus view, where the With AI lane isn't rendered */
+.agent-focus-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin: 10px 0 4px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-orange, #e0a458) 45%, transparent);
+  background: color-mix(in srgb, var(--accent-orange, #e0a458) 9%, transparent);
+  color: var(--text-primary, #f4f4f5);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.agent-focus-note strong { font-size: 13.5px; }
+.agent-focus-note span { font-size: 12px; color: var(--text-muted, #8b93a7); white-space: nowrap; }
+.agent-focus-note:hover { filter: brightness(1.08); }

@@ -4,26 +4,42 @@ import type { ModelDownloadStatus, OnboardingState } from "../types";
 import {
   getModelDownloadStatus,
   getOnboardingState,
+  getSetupStatus,
+  listWhisperModels,
   startModelDownload,
 } from "../lib/tauri";
-import { ENGINE_WHISPER_IDS } from "./Welcome";
+import {
+  ENGINE_WHISPER_IDS,
+  downloadLabel,
+  formatGb,
+  isInFlight,
+  isTranscriptionProfile,
+  whisperModelId,
+} from "../lib/modelDownloads";
 
-function formatGb(bytes: number): string {
-  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
-}
+/** Brisk while something is running, a slow heartbeat otherwise — the strip has
+ *  to notice a download the user started in Settings without hammering the
+ *  service for the rest of the session (which the old session-latch "fixed" by
+ *  going permanently blind instead). */
+const POLL_ACTIVE_MS = 1_000;
+const POLL_IDLE_MS = 4_000;
+/** How long "✓ Transcription ready" stays up before the strip hides again. */
+const DONE_MS = 5_000;
 
-/** In-flight download visibility, nothing else (SPEC v2).
+/** In-flight download visibility, by name (SPEC V3 addendum).
  *
- * Shows the byte-accurate aggregate for model downloads that are actually
- * running — the background Whisper cache disclosed during setup, plus any
- * model download the user started from Settings › AI Model — and disappears
- * when nothing is in flight. It never STARTS an LLM download (downloads begin
- * only from an explicit click in Settings); it only resumes the Whisper cache
- * after a relaunch, which is a no-op when already cached. */
+ * Shows byte-accurate progress for any model download that is actually
+ * running — transcription or notes, started anywhere in the app — says WHICH
+ * one it is, confirms transcription once when it lands, and otherwise stays
+ * invisible. It never STARTS a download; the only button here is Retry, on a
+ * download that already failed. */
 export function SetupStatusStrip() {
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
   const [downloads, setDownloads] = useState<Record<string, ModelDownloadStatus>>({});
-  const whisperKicked = useRef(false);
+  const [watchedIds, setWatchedIds] = useState<string[]>([...ENGINE_WHISPER_IDS]);
+  const [transcriptionDone, setTranscriptionDone] = useState(false);
+  // Ids seen mid-download on the previous poll, so a completion can be noticed.
+  const runningRef = useRef<Set<string>>(new Set());
 
   // Re-read onboarding until setup completes (the wizard finishes in a
   // sibling component this strip can't observe).
@@ -47,80 +63,135 @@ export function SetupStatusStrip() {
     };
   }, [onboarding?.setup_complete]);
 
-  // Poll ONLY while there is a reason to. This used to be
-  // `onboarding.setup_complete` alone, which meant every user with finished
-  // setup hammered the ML service with 3 status requests per second forever —
-  // the strip hid itself when idle but never stopped polling, stealing cycles
-  // from the transcription running on that same service. Once everything is
-  // ready, we stop for the rest of the session.
-  const [settled, setSettled] = useState(false);
-  const active = Boolean(onboarding?.setup_complete) && !settled;
+  const active = Boolean(onboarding?.setup_complete);
 
-  // Watched ids: the Whisper pair always (resume-kicked once, a no-op when
-  // cached) plus the persisted model profile IF it is a downloadable pinned id
-  // — so a Settings-started download stays visible after leaving Settings.
-  const profile = onboarding?.selected_model_profile ?? "";
-  const watchedIds =
-    profile && !profile.startsWith("ollama:") && profile !== "legacy-existing-setup"
-      ? [...ENGINE_WHISPER_IDS, profile]
-      : [...ENGINE_WHISPER_IDS];
+  // Everything that CAN be downloading: the transcription engine pair, one id
+  // per curated transcription model, and the pinned notes-model tiers. The
+  // catalogue doesn't change while the app runs — but in a packaged build this
+  // mounts before the sidecar has bound its port, so retry until BOTH reads
+  // land or the strip stays blind to per-model downloads all session.
+  useEffect(() => {
+    if (!active) return;
+    let alive = true;
+    let timer: number | undefined;
+    const read = () => {
+      Promise.allSettled([listWhisperModels(), getSetupStatus()]).then(
+        ([models, setup]) => {
+          if (!alive) return;
+          if (models.status !== "fulfilled" && setup.status !== "fulfilled") {
+            return; // sidecar still booting — the interval retries
+          }
+          const whisper =
+            models.status === "fulfilled"
+              ? models.value.map((m) => whisperModelId(m.key))
+              : [];
+          const llm =
+            setup.status === "fulfilled"
+              ? setup.value.profiles
+                  .map((profile) => profile.id)
+                  .filter((id) => !id.startsWith("ollama:"))
+              : [];
+          setWatchedIds([...ENGINE_WHISPER_IDS, ...whisper, ...llm]);
+          if (models.status === "fulfilled" && setup.status === "fulfilled") {
+            window.clearInterval(timer);
+          }
+        },
+      );
+    };
+    read();
+    timer = window.setInterval(read, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [active]);
+
+  // Only a live download earns the fast cadence — a failed one sits there until
+  // the user hits Retry, and polling it every second changes nothing.
+  const anyRunning = watchedIds.some((id) => {
+    const status = downloads[id];
+    return status ? isInFlight(status) : false;
+  });
 
   useEffect(() => {
     if (!active) return;
-    if (!whisperKicked.current) {
-      whisperKicked.current = true;
-      ENGINE_WHISPER_IDS.forEach((id) => {
-        startModelDownload(id).catch(() => {});
-      });
-    }
+    let alive = true;
     const poll = () => {
       Promise.all(
         watchedIds.map((id) =>
           getModelDownloadStatus(id)
-            .then((status) => {
-              setDownloads((current) => ({ ...current, [id]: status }));
-              return status;
-            })
+            .then((status) => status)
             .catch(() => null),
         ),
       ).then((statuses) => {
-        // Every watched model finished (or is idle because nothing needs
-        // downloading) — stop polling entirely.
-        const done = statuses.every(
-          (status) => status !== null && ["ready", "idle"].includes(status.state),
+        if (!alive) return;
+        const next: Record<string, ModelDownloadStatus> = {};
+        statuses.forEach((status) => {
+          if (status) next[status.profile_id] = status;
+        });
+        setDownloads(next);
+
+        // A transcription download that WAS running and now isn't gets one
+        // brief confirmation, so the user sees the thing they waited for land.
+        const previously = runningRef.current;
+        const landed = [...previously].some(
+          (id) => isTranscriptionProfile(id) && next[id]?.state === "ready",
         );
-        if (done) setSettled(true);
+        if (landed) setTranscriptionDone(true);
+        runningRef.current = new Set(
+          Object.values(next)
+            .filter(isInFlight)
+            .map((status) => status.profile_id),
+        );
       });
     };
     poll();
-    const timer = window.setInterval(poll, 1000);
-    return () => window.clearInterval(timer);
-  }, [active, profile]);
+    const timer = window.setInterval(poll, anyRunning ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [active, watchedIds, anyRunning]);
+
+  useEffect(() => {
+    if (!transcriptionDone) return;
+    const timer = window.setTimeout(() => setTranscriptionDone(false), DONE_MS);
+    return () => window.clearTimeout(timer);
+  }, [transcriptionDone]);
 
   if (!active) return null;
 
   const statuses = watchedIds
     .map((id) => downloads[id])
     .filter((status): status is ModelDownloadStatus => Boolean(status));
-  const inFlight = statuses.filter((status) =>
-    ["preparing", "downloading", "verifying"].includes(status.state),
-  );
+  const inFlight = statuses.filter(isInFlight);
   const failed = statuses.find((status) => status.state === "error");
 
-  // Nothing running and nothing failed → invisible. This is the normal state.
-  if (inFlight.length === 0 && !failed) return null;
+  if (inFlight.length === 0 && !failed) {
+    return transcriptionDone ? (
+      <div className="setup-strip" role="status" aria-live="polite">
+        <div className="setup-strip-text">
+          <strong>✓ Transcription ready</strong>
+          <span>Recordings turn into text on this machine from now on.</span>
+        </div>
+      </div>
+    ) : null;
+  }
 
   const total = inFlight.reduce((sum, status) => sum + status.total_bytes, 0);
   const done = inFlight.reduce(
     (sum, status) => sum + Math.min(status.downloaded_bytes, status.total_bytes),
     0,
   );
+  const bytesLine = total > 0 ? `${formatGb(done)} of ${formatGb(total)}` : "Preparing…";
+
+  // Say WHICH model is downloading — "Downloading in the background" told the
+  // user nothing about what they were waiting for.
+  const names = [...new Set(inFlight.map((status) => downloadLabel(status.profile_id)))];
 
   const retry = () => {
-    watchedIds.forEach((id) => {
-      if (downloads[id]?.state === "error") {
-        startModelDownload(id).catch(() => {});
-      }
+    statuses.forEach((status) => {
+      if (status.state === "error") startModelDownload(status.profile_id).catch(() => {});
     });
   };
 
@@ -129,16 +200,18 @@ export function SetupStatusStrip() {
       {failed ? (
         <>
           <div className="setup-strip-text">
-            <strong>{failed.detail}</strong>
-            <span>{total > 0 ? `${formatGb(done)} / ${formatGb(total)}` : ""}</span>
+            <strong>{downloadLabel(failed.profile_id)} — download failed</strong>
+            <span>{failed.detail}</span>
           </div>
-          <button className="btn-secondary" onClick={retry}>Retry</button>
+          <div className="setup-strip-actions">
+            <button className="btn-secondary" onClick={retry}>Retry</button>
+          </div>
         </>
       ) : (
         <>
           <div className="setup-strip-text">
-            <strong>Downloading in the background — Adversaria stays usable.</strong>
-            <span>{total > 0 ? `${formatGb(done)} / ${formatGb(total)}` : "Preparing…"}</span>
+            <strong>{names.join(" and ")} downloading — Adversaria stays usable.</strong>
+            <span>{bytesLine}</span>
           </div>
           {total > 0 ? <progress value={done} max={total} /> : <progress />}
         </>

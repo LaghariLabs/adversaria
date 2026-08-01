@@ -31,10 +31,17 @@ export interface TemplateInfo {
   description: string;
 }
 
+/** On-device transcription engine state, reported by `/health` (SPEC V3). */
+export type TranscriberState = "loading" | "ready" | "missing" | "error";
+
 export interface HealthResponse {
   status: string;
   whisper_model: string;
   ollama_available: boolean;
+  /** Absent on builds older than the V3 service — treat as "unknown". */
+  transcriber_state?: TranscriberState;
+  /** Human sentence explaining a non-ready `transcriber_state`. */
+  transcriber_detail?: string | null;
 }
 
 // ---- Meeting (stored in SQLite, exposed via IPC) ----
@@ -98,6 +105,13 @@ export interface ActionItem {
   assignee: string;
   due: string; // 'YYYY-MM-DD' or ''
   done: boolean;
+  /** "todo" | "in_progress" | "ai_done" | "done" — ai_done awaits your accept. */
+  status: string;
+  /** "" | "you" | "agent:<name>" */
+  completed_by: string;
+  completed_at: string;
+  /** What the agent did — without this, "done by AI" is uncheckable. */
+  evidence: string;
 }
 
 export interface GraphData {
