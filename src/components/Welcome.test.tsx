@@ -18,7 +18,9 @@ const registration = (status: RegistrationState["status"] = "unregistered"): Reg
   app_version: "0.3.41",
   platform: "macos",
   attempt_count: status === "pending" ? 1 : 0,
-  next_retry_at: null,
+  // A scheduled retry is what makes "pending" show the queued banner — a
+  // pending state WITHOUT one (endpoint-less builds) stays silent.
+  next_retry_at: status === "pending" ? "2026-07-14T10:05:00Z" : null,
   last_error: status === "pending" ? "Registration is queued." : null,
 });
 
@@ -54,25 +56,29 @@ const setup = (installed = false, platform = "macos"): SetupStatus => ({
   }],
 });
 
-const downloadStatus = (id: string) => ({
-  profile_id: id,
-  state: "ready",
-  downloaded_bytes: 1,
-  total_bytes: 1,
-  detail: "",
-  error_code: null,
-  verified: true,
-  can_retry: true,
+/** Curated transcription models as the picker reports them. */
+const whisperModels = (downloaded: boolean) => [
+  { key: "large-v3-turbo", label: "Large v3 turbo", size: "1.6 GB", downloaded },
+];
+
+const health = (transcriber_state?: string) => ({
+  status: "ok",
+  whisper_model: "large-v3-turbo",
+  ollama_available: true,
+  transcriber_state,
+  transcriber_detail: null,
 });
 
 describe("Welcome", () => {
   it("requires explicit consent, then lands on permissions after registering", async () => {
     let submitted = false;
-    const llmDownloadsStarted: string[] = [];
+    const downloadsStarted: string[] = [];
     mockIPC((command, payload) => {
       if (command === "get_config") return appConfig();
       if (command === "get_registration_state") return registration();
       if (command === "get_setup_status") return setup();
+      if (command === "list_whisper_models") return whisperModels(false);
+      if (command === "check_service_health") return health("missing");
       if (command === "get_onboarding_state") {
         return onboarding(submitted ? ["registration"] : []);
       }
@@ -80,10 +86,10 @@ describe("Welcome", () => {
         submitted = true;
         return registration("pending");
       }
-      if (command === "start_model_download" || command === "get_model_download_status") {
+      if (command === "start_model_download") {
         const args = payload as { profileId?: string };
-        if (command === "start_model_download") llmDownloadsStarted.push(args.profileId ?? "");
-        return downloadStatus(args.profileId ?? "whisper-main");
+        downloadsStarted.push(args.profileId ?? "");
+        return null;
       }
       return null;
     });
@@ -103,8 +109,8 @@ describe("Welcome", () => {
     expect(await screen.findByText("Recording permissions")).toBeInTheDocument();
     expect(screen.getByText("Registration queued")).toBeInTheDocument();
     expect(screen.getByText(/Local setup can continue offline/)).toBeInTheDocument();
-    // SPEC v2: only Whisper may download during setup — never an LLM profile.
-    expect(llmDownloadsStarted.every((id) => id.startsWith("whisper-"))).toBe(true);
+    // SPEC V3: the wizard downloads NOTHING — not even the transcription model.
+    expect(downloadsStarted).toEqual([]);
   });
 
   it("finishes from the final screen with NO model chosen and persists the reminder toggle", async () => {
@@ -114,6 +120,8 @@ describe("Welcome", () => {
       if (command === "get_config") return appConfig();
       if (command === "get_registration_state") return registration("submitted");
       if (command === "get_setup_status") return setup(true);
+      if (command === "list_whisper_models") return whisperModels(true);
+      if (command === "check_service_health") return health("ready");
       if (command === "get_onboarding_state") return current;
       if (command === "update_config") {
         const args = payload as { config?: { meeting_reminder_enabled?: boolean } };
@@ -133,10 +141,6 @@ describe("Welcome", () => {
         };
         return current;
       }
-      if (command === "start_model_download" || command === "get_model_download_status") {
-        const args = payload as { profileId?: string };
-        return downloadStatus(args.profileId ?? "whisper-main");
-      }
       return null;
     });
 
@@ -149,16 +153,71 @@ describe("Welcome", () => {
     expect(savedReminder).toBe(true);
   });
 
-  it("skips the permissions screen on Windows", async () => {
+  it("says transcription is ready when the model is already on the machine", async () => {
+    mockIPC((command) => {
+      if (command === "get_config") return appConfig();
+      if (command === "get_registration_state") return registration("submitted");
+      if (command === "get_setup_status") return setup(true);
+      if (command === "get_onboarding_state") return onboarding(["registration", "permissions"]);
+      if (command === "list_whisper_models") return whisperModels(true);
+      if (command === "check_service_health") return health("ready");
+      return null;
+    });
+
+    render(<Welcome />);
+    expect(await screen.findByText(/Transcription ready ✓/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Choose & download it in Settings/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("guides (never fetches) when no transcription model is on the machine", async () => {
+    const downloadsStarted: string[] = [];
+    let current: OnboardingState = onboarding(["registration", "permissions"]);
+    let openedModelSettings = false;
     mockIPC((command, payload) => {
+      if (command === "get_config") return appConfig();
+      if (command === "get_registration_state") return registration("submitted");
+      if (command === "get_setup_status") return setup(false);
+      if (command === "get_onboarding_state") return current;
+      if (command === "list_whisper_models") return whisperModels(false);
+      if (command === "check_service_health") return health("missing");
+      if (command === "start_model_download") {
+        downloadsStarted.push((payload as { profileId?: string }).profileId ?? "");
+        return null;
+      }
+      if (command === "complete_onboarding_step") {
+        current = { ...current, setup_complete: true };
+        return current;
+      }
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(<Welcome onOpenModelSettings={() => { openedModelSettings = true; }} />);
+
+    expect(
+      await screen.findByText(/needs a transcription model to turn recordings into text/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Nothing downloads without your say-so/)).toBeInTheDocument();
+    // Never the old indeterminate "Checking what's already on this machine…".
+    expect(screen.queryByText(/Checking what's already on this machine/)).not.toBeInTheDocument();
+    // The primary way out stays open regardless.
+    expect(screen.getByRole("button", { name: "Start using Adversaria" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /Choose & download it in Settings/ }));
+    await waitFor(() => expect(openedModelSettings).toBe(true));
+    expect(downloadsStarted).toEqual([]);
+  });
+
+  it("skips the permissions screen on Windows", async () => {
+    mockIPC((command) => {
       if (command === "get_config") return appConfig();
       if (command === "get_registration_state") return registration("submitted");
       if (command === "get_setup_status") return setup(false, "windows");
       if (command === "get_onboarding_state") return onboarding(["registration"]);
-      if (command === "start_model_download" || command === "get_model_download_status") {
-        const args = payload as { profileId?: string };
-        return downloadStatus(args.profileId ?? "whisper-main");
-      }
+      if (command === "list_whisper_models") return whisperModels(false);
+      if (command === "check_service_health") return health("missing");
       return null;
     });
 

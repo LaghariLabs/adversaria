@@ -11,10 +11,13 @@ interface GeneralTabProps {
   active: boolean;
   config: AppConfig;
   update: (patch: Partial<AppConfig>) => void;
+  /** Re-arm the guided tour and leave Settings so it can start (Phase B —
+   *  skipping the tour used to be forever). */
+  onReplayTour?: () => void;
 }
 
 /** General — who you are, plus the app-wide preferences (language, dates, list style). */
-export function GeneralTab({ active, config, update }: GeneralTabProps) {
+export function GeneralTab({ active, config, update, onReplayTour }: GeneralTabProps) {
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`}>
       <h3 className="settings-card-title">General</h3>
@@ -139,13 +142,27 @@ export function GeneralTab({ active, config, update }: GeneralTabProps) {
           onChange={(e) => update({ sidebar_view: e.target.value })}
           className="settings-select"
         >
-          <option value="compact">Compact rows (default)</option>
-          <option value="full">Full cards</option>
+          <option value="full">Full cards (default)</option>
+          <option value="compact">Compact rows</option>
         </select>
         <p className="settings-help">
           Compact shows one line per meeting with details on hover; Full shows the classic cards. Applies when you save and go back to your meetings.
         </p>
       </div>
+
+      {/* Guided tour replay */}
+      {onReplayTour && (
+        <div className="settings-form-group">
+          <label className="settings-label">App tour</label>
+          <button type="button" className="btn-secondary" onClick={onReplayTour}>
+            Replay the tour
+          </button>
+          <p className="settings-help">
+            A one-minute walkthrough: recording, your meetings, to-dos, and where
+            your models live.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

@@ -18,6 +18,7 @@ pub mod audio;
 pub mod calendar;
 pub mod commands;
 pub mod config;
+pub mod demo;
 pub mod detection;
 pub mod diagnostics;
 pub mod embeddings;
@@ -106,6 +107,14 @@ pub fn run() {
             if let Err(error) = registration::migrate_legacy_config() {
                 eprintln!("[onboarding] legacy state migration failed: {error}");
             }
+            // A brand-new library is never empty: seed one finished sample
+            // meeting so the first thing a user sees is the end product. Fresh
+            // installs only, exactly once — and never a reason not to start.
+            match demo::seed_demo_meeting() {
+                Ok(true) => eprintln!("[demo] seeded the sample meeting for this fresh install"),
+                Ok(false) => {}
+                Err(error) => eprintln!("[demo] sample meeting not seeded: {error}"),
+            }
             tauri::async_runtime::spawn(async {
                 if let Err(error) = registration::retry(false).await {
                     eprintln!("[registration] queued retry could not run: {error}");
@@ -137,6 +146,12 @@ pub fn run() {
             // Packaged builds only: start the bundled Python ML service sidecar.
             // No-op in dev (the bundled binary isn't present; use manual uvicorn).
             commands::spawn_sidecar(app.handle());
+
+            // Nothing downloads during setup (SPEC V3), so a recording can be
+            // made before the transcription model exists. This poller finishes
+            // those the moment the model is ready — in dev too, where the
+            // service is started by hand.
+            commands::spawn_transcription_drain(app.handle().clone());
 
             // Existing local-first users should never have to relaunch Rapid-
             // MLX themselves after an app restart. Warm the selected managed
@@ -258,6 +273,7 @@ pub fn run() {
             commands::complete_onboarding_step,
             commands::get_setup_status,
             commands::engine_configured,
+            commands::accept_agent_work,
             commands::get_engine_install_plan,
             commands::install_local_engine,
             commands::start_model_download,

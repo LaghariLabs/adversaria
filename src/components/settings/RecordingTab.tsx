@@ -1,193 +1,34 @@
-import { useCallback, useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-shell";
-import { TriangleAlert } from "lucide-react";
-
-import type { AppConfig, WhisperModelInfo } from "../../types";
-import { downloadWhisperModel, listWhisperModels } from "../../lib/tauri";
+import type { AppConfig } from "../../types";
 
 interface RecordingTabProps {
   active: boolean;
   config: AppConfig;
   update: (patch: Partial<AppConfig>) => void;
+  /** Jump to AI Model, where the transcription engine and models live. */
+  onOpenModelTab: () => void;
 }
 
-/** Recording — how speech is transcribed, when recording starts/stops, and what you see while it runs. */
-export function RecordingTab({ active, config, update }: RecordingTabProps) {
-  // On-device Whisper model picker.
-  const [whisperModels, setWhisperModels] = useState<WhisperModelInfo[]>([]);
-  const [whisperDownloading, setWhisperDownloading] = useState<string | null>(null);
-
-  const loadWhisperModels = useCallback(async () => {
-    try {
-      setWhisperModels(await listWhisperModels());
-    } catch (e) {
-      console.error("Failed to load whisper models:", e);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadWhisperModels();
-  }, [loadWhisperModels]);
-
-  const handleWhisperDownload = async (key: string) => {
-    setWhisperDownloading(key);
-    try {
-      await downloadWhisperModel(key);
-      await loadWhisperModels(); // refresh → "Ready ✓"
-    } catch (e) {
-      console.error("Whisper model download failed:", e);
-    } finally {
-      setWhisperDownloading(null);
-    }
-  };
-
+/** Recording — how a recording behaves: start/stop, detection, and what you
+ *  see while it runs. Which engine and model transcribe lives in AI Model —
+ *  one home for every model choice, so nothing is stated in two places. */
+export function RecordingTab({ active, config, update, onOpenModelTab }: RecordingTabProps) {
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`}>
       <h3 className="settings-card-title">Recording</h3>
       <p className="settings-card-desc">
-        How speech is turned into text, when a recording starts and stops, and
-        what the app shows while it runs.
+        When a recording starts and stops, and what the app shows while it runs.{" "}
+        Which engine and model turn speech into text lives in{" "}
+        <button className="btn-link" type="button" onClick={onOpenModelTab}>
+          AI Model →
+        </button>
       </p>
 
-      {/* ---- Transcription ---- */}
+      {/* ---- Transcription behavior ---- */}
       <h3 className="settings-card-title" style={{ marginTop: 18 }}>Voice Transcription</h3>
       <p className="settings-card-desc">
-        Choose how speech is transcribed, and personalize it — custom vocabulary
-        helps spell names right. (Your name lives in General.)
+        Personalize how speech is transcribed — custom vocabulary helps spell
+        names right. (Your name lives in General.)
       </p>
-
-      {/* Transcription engine */}
-      <div className="settings-form-group">
-        <label className="settings-label" htmlFor="settings-transcription-engine">Engine</label>
-        <select
-          id="settings-transcription-engine"
-          value={config.transcription_base_url.trim() ? "cloud" : "local"}
-          onChange={(e) => {
-            if (e.target.value === "cloud") {
-              update({
-                transcription_base_url: "https://api.groq.com/openai/v1",
-                transcription_model: config.transcription_model?.trim() || "whisper-large-v3",
-              });
-            } else {
-              update({ transcription_base_url: "" });
-            }
-          }}
-          className="settings-select"
-        >
-          <option value="local">On-device — Whisper (sovereign, recommended)</option>
-          <option value="cloud">Cloud — Groq (bring your own key)</option>
-        </select>
-      </div>
-
-      {config.transcription_base_url.trim() ? (
-        <>
-          <div className="settings-form-group">
-            <div className="settings-note warn">
-              <TriangleAlert size={14} aria-hidden="true" /> Cloud transcription uploads your meeting audio to{" "}
-              {(() => {
-                try { return new URL(config.transcription_base_url).host; }
-                catch { return "the provider"; }
-              })()}{" "}
-              — this is <strong>not sovereign</strong> (audio leaves your device), and{" "}
-              <strong>speaker diarization is unavailable</strong> in cloud mode (remote
-              audio is labeled "Them", not "Speaker 1/2"). For private, diarized
-              transcripts, use On-device Whisper.
-            </div>
-          </div>
-          <div className="settings-form-group">
-            <label className="settings-label" htmlFor="settings-transcription-base">Transcription Base URL</label>
-            <input
-              id="settings-transcription-base"
-              type="text"
-              value={config.transcription_base_url}
-              onChange={(e) => update({ transcription_base_url: e.target.value })}
-              className="settings-input-text"
-              placeholder="https://api.groq.com/openai/v1"
-            />
-          </div>
-          <div className="settings-form-group">
-            <label className="settings-label" htmlFor="settings-transcription-model">Model</label>
-            <input
-              id="settings-transcription-model"
-              type="text"
-              value={config.transcription_model}
-              onChange={(e) => update({ transcription_model: e.target.value })}
-              className="settings-input-text"
-              placeholder="whisper-large-v3"
-            />
-          </div>
-          <div className="settings-form-group">
-            <label className="settings-label" htmlFor="settings-transcription-key">API Key</label>
-            <input
-              id="settings-transcription-key"
-              type="password"
-              value={config.transcription_api_key}
-              onChange={(e) => update({ transcription_api_key: e.target.value })}
-              className="settings-input-text"
-              placeholder="gsk_..."
-            />
-            <p className="settings-help">
-              Free key at{" "}
-              <button className="btn-link" onClick={() => open("https://console.groq.com/keys")}>
-                console.groq.com/keys
-              </button>
-              . Whisper large-v3 covers 99 languages (including Arabic).
-            </p>
-          </div>
-        </>
-      ) : (
-        <div className="settings-form-group">
-          <label className="settings-label" htmlFor="settings-whisper-model">On-device model</label>
-          <select
-            id="settings-whisper-model"
-            value={config.whisper_model}
-            onChange={(e) => update({ whisper_model: e.target.value })}
-            className="settings-select"
-          >
-            {whisperModels.length === 0 && (
-              <option value={config.whisper_model}>{config.whisper_model}</option>
-            )}
-            {whisperModels.map((m) => (
-              <option key={m.key} value={m.key}>
-                {m.label}
-                {m.downloaded ? "  ✓ downloaded" : `  ·  ${m.size}`}
-              </option>
-            ))}
-          </select>
-
-          {(() => {
-            const sel = whisperModels.find((m) => m.key === config.whisper_model);
-            if (!sel) return null;
-            if (sel.downloaded) {
-              return <p className="settings-msg ok">Ready ✓ — on this device.</p>;
-            }
-            if (whisperDownloading === sel.key) {
-              return <p className="settings-msg">Downloading… ({sel.size}) — this can take a few minutes.</p>;
-            }
-            return (
-              <div className="settings-row" style={{ marginTop: 10 }}>
-                <span className="settings-msg" style={{ margin: 0 }}>
-                  Not downloaded yet ({sel.size}).
-                </span>
-                <button
-                  className="btn-ghost"
-                  onClick={() => handleWhisperDownload(sel.key)}
-                  disabled={whisperDownloading !== null}
-                >
-                  Download now
-                </button>
-              </div>
-            );
-          })()}
-
-          <p className="settings-help">
-            Fully private, on-device, with speaker diarization. Models are cached after
-            the first download; if you pick one that isn't downloaded, it fetches on first
-            use (or hit "Download now" to fetch it ahead of time). <strong>Large v3</strong>{" "}
-            is recommended — best accuracy and 99 languages, including Arabic.
-          </p>
-        </div>
-      )}
 
       {/* Custom vocabulary */}
       <div className="settings-form-group">

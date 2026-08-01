@@ -73,9 +73,15 @@ def test_whisper_pins_match_the_active_transcription_backend() -> None:
     `MODEL_PINS` is built at import, so probe the backend the same way rather
     than monkeypatching the env after the fact.
     """
-    expected = "mlx-community/whisper-" if backend_is_mlx() else "Systran/faster-whisper-"
     for profile_id in ("whisper-main", "whisper-live"):
-        assert model_setup.MODEL_PINS[profile_id].repo_id.startswith(expected)
+        repo_id = model_setup.MODEL_PINS[profile_id].repo_id
+        if backend_is_mlx():
+            assert repo_id.startswith("mlx-community/whisper-")
+        else:
+            # CT2 conversions live under several accounts (Systran, deepdml —
+            # the V3 turbo default) but always carry the faster-whisper name.
+            assert "faster-whisper" in repo_id
+            assert not repo_id.startswith("mlx-community/")
 
 
 def test_ct2_live_pin_reuses_the_main_model() -> None:
@@ -278,3 +284,79 @@ def test_filtered_download_passes_allow_patterns() -> None:
     ):
         model_setup._run_download("qwen-4b-light")
     assert download.call_args.kwargs["allow_patterns"] == ["Qwen3.5-4B-Q4_K_M.gguf"]
+
+
+def test_manifest_accepts_ct2_model_bin() -> None:
+    """CT2 whisper repos ship `model.bin`, not safetensors/GGUF.
+
+    The weight-file guard rejected them ("no weight files"), so every CT2
+    whisper pin failed at manifest load before a single byte moved — one of
+    the silent legs of the 2026-07-31 fresh-Windows failure.
+    """
+    pin = model_setup.ModelPin(
+        profile_id="whisper-main",
+        repo_id="deepdml/faster-whisper-large-v3-turbo-ct2",
+        revision="4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
+    )
+    info = SimpleNamespace(
+        sha=pin.revision,
+        siblings=[
+            SimpleNamespace(rfilename="config.json", size=2, lfs=None),
+            SimpleNamespace(
+                rfilename="model.bin",
+                size=5,
+                lfs=SimpleNamespace(sha256="b" * 64),
+            ),
+        ],
+    )
+    with patch.object(model_setup.HfApi, "model_info", return_value=info):
+        files = model_setup._load_manifest(pin)
+    assert [file.name for file in files] == ["config.json", "model.bin"]
+
+
+def test_whisper_model_profile_pins_per_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every curated Settings model gets a `whisper-model:<key>` pin, so the
+    picker downloads through the byte-progress pipeline, not fire-and-pray."""
+    monkeypatch.setenv("WHISPER_BACKEND", "faster-whisper")
+    ct2 = model_setup._whisper_model_pins()
+    assert set(ct2) == {"whisper-model:large-v3", "whisper-model:large-v3-turbo"}
+    assert ct2["whisper-model:large-v3"].repo_id == "Systran/faster-whisper-large-v3"
+    assert (
+        ct2["whisper-model:large-v3-turbo"].repo_id
+        == "deepdml/faster-whisper-large-v3-turbo-ct2"
+    )
+
+    monkeypatch.setenv("WHISPER_BACKEND", "mlx")
+    mlx = model_setup._whisper_model_pins()
+    assert set(mlx) == {
+        "whisper-model:large-v3",
+        "whisper-model:large-v3-turbo",
+        "whisper-model:large-v3-turbo-q4",
+    }
+    assert all(pin.repo_id.startswith("mlx-community/") for pin in mlx.values())
+    for pins in (ct2, mlx):
+        for pin in pins.values():
+            assert len(pin.revision) == 40
+
+
+def test_ready_callback_fires_after_verified_download() -> None:
+    """A verified download must announce itself — the server's transcriber
+    re-init hangs off this, which is what makes 'download from Settings, then
+    it just works' true without an app restart."""
+    calls: list[str] = []
+    model_setup.on_download_ready(calls.append)
+    model_setup.on_download_ready(calls.append)  # idempotent: registered once
+    try:
+        files = (model_setup.ExpectedFile(name="model.bin", size=1, sha256=None),)
+        with (
+            patch.object(model_setup, "_load_manifest", return_value=files),
+            patch.object(model_setup, "snapshot_download"),
+            patch.object(model_setup, "_verify_snapshot"),
+        ):
+            model_setup._run_download("whisper-main")
+        assert calls == ["whisper-main"]
+        assert model_setup.model_download_status("whisper-main")["state"] == "ready"
+    finally:
+        model_setup._READY_CALLBACKS.remove(calls.append)

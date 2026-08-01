@@ -5,6 +5,7 @@ import {
   exportSummary,
   getActionItems,
   getConfig,
+  getMeeting,
   getMeetingStats,
   listTemplates,
   mergeMeetingSpeakers,
@@ -22,6 +23,7 @@ import {
   updateMeetingTags,
 } from "../lib/tauri";
 import type { ActionItem, Meeting, MeetingStats, SummaryLanguage, Tag } from "../types";
+import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { MeetingChat } from "./MeetingChat";
 import { SummaryView } from "./SummaryView";
 import {
@@ -60,6 +62,12 @@ interface NoteViewerProps {
   isQueued?: boolean;
   /** The meeting was auto-deleted because its recording contained no speech. */
   onDiscarded?: () => void;
+  /** Live on-device transcription state, so a pending meeting can say WHY it
+   *  hasn't been transcribed instead of implying the user forgot. */
+  transcriptionSetup?: TranscriptionSetup;
+  /** Open Settings › AI Model. Without it the "go to Settings" advice is text
+   *  the user has to act on themselves. */
+  onOpenModelSettings?: () => void;
 }
 
 type Tab = "transcript" | "summary" | "chat" | "notes" | "insights";
@@ -108,6 +116,8 @@ export function NoteViewer({
   isTranscribing,
   isQueued,
   onDiscarded,
+  transcriptionSetup,
+  onOpenModelSettings,
 }: NoteViewerProps) {
   const [templateNames, setTemplateNames] = useState<string[]>([
     "general",
@@ -135,6 +145,17 @@ export function NoteViewer({
   // service down at stop time): the audio is kept on disk and there's no
   // transcript yet. It can be transcribed later with the button below.
   const isPending = !!meeting.audio_file_path && !meeting.transcript;
+  // The recording isn't stuck — the model it needs isn't here yet. The backend
+  // drains pending recordings the moment it lands, so this is a promise the
+  // app actually keeps.
+  const waitingForModel =
+    transcriptionSetup?.state === "missing" ||
+    transcriptionSetup?.state === "loading" ||
+    transcriptionSetup?.state === "downloading";
+  const transcriptionUnready =
+    transcriptionSetup !== undefined &&
+    transcriptionSetup.state !== "ready" &&
+    transcriptionSetup.state !== "unknown";
   const isCleanupPending = !!meeting.audio_file_path && !!meeting.transcript;
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState<string | null>(null);
@@ -190,6 +211,23 @@ export function NoteViewer({
       setActiveTab("summary");
     } catch (e) {
       setTranscribeError(String(e));
+      // A rejection no longer means "nothing happened": the backend persists
+      // the transcript and deletes the audio BEFORE summarizing, so this call
+      // can fail with the transcript already saved. Re-read the row, or this
+      // pane keeps offering "Transcribe now" for a recording that is gone
+      // (which then answers "This meeting has no saved audio to transcribe.").
+      try {
+        const refreshed = await getMeeting(meeting.id);
+        if (
+          refreshed.transcript !== meeting.transcript ||
+          refreshed.audio_file_path !== meeting.audio_file_path
+        ) {
+          onMeetingUpdated(refreshed);
+        }
+      } catch {
+        // Non-fatal: the error above already tells the user what happened, and
+        // the meeting list's background refresh will catch up regardless.
+      }
     } finally {
       setTranscribing(false);
     }
@@ -969,7 +1007,9 @@ export function NoteViewer({
                 ? "Transcribing…"
                 : isQueued
                   ? "Waiting to be transcribed"
-                  : "Not transcribed yet"}
+                  : waitingForModel
+                    ? "Waiting for the transcription model"
+                    : "Not transcribed yet"}
             </h3>
             <p style={{ margin: "0 0 12px", fontSize: 13, color: "var(--text-secondary)" }}>
               {isTranscribing || transcribing ? (
@@ -982,6 +1022,16 @@ export function NoteViewer({
                 <>
                   Your audio is safe on this device. Transcription runs one
                   recording at a time and this one is next in line.
+                </>
+              ) : waitingForModel ? (
+                <>
+                  Your audio is safe on this device. This meeting will transcribe
+                  automatically once the transcription model is ready
+                  {transcriptionSetup?.state === "downloading"
+                    ? transcriptionSetup.percent === null
+                      ? " — it's downloading now."
+                      : ` — downloading, ${transcriptionSetup.percent}%.`
+                    : "."}
                 </>
               ) : (
                 <>
@@ -1002,13 +1052,37 @@ export function NoteViewer({
                   ? "Queued…"
                   : "Transcribe now"}
             </button>
-            {transcribeError && (
-              <p style={{ marginTop: 10, fontSize: 12, color: "var(--accent-red)" }}>
-                {transcribeError}
-              </p>
-            )}
           </div>
         ) : null}
+
+        {/* Outside the pending panel on purpose: a failed transcribe can leave
+            the meeting NO LONGER pending (transcript saved, summarizing failed),
+            and the reason it failed must not vanish with the panel. */}
+        {transcribeError && (
+          <div
+            style={{
+              border: "1px solid var(--accent-red)",
+              background: "color-mix(in srgb, var(--accent-red) 10%, transparent)",
+              borderRadius: 10,
+              padding: 12,
+              marginBottom: 16,
+            }}
+            role="alert"
+          >
+            <p style={{ margin: 0, fontSize: 13 }}>{transcribeError}</p>
+            {/* Only offer the model manager when we KNOW transcription isn't
+                ready — otherwise this sends people chasing a correct setting. */}
+            {onOpenModelSettings && transcriptionUnready && (
+              <button
+                className="btn-secondary"
+                style={{ marginTop: 8 }}
+                onClick={onOpenModelSettings}
+              >
+                Open Settings
+              </button>
+            )}
+          </div>
+        )}
 
         {/* TAB: Summary Content */}
         {activeTab === "summary" && (
@@ -1156,16 +1230,25 @@ export function NoteViewer({
                 <strong>Transcript saved — notes haven't been written yet.</strong>
                 <p>
                   {hasEngine === false
-                    ? "Choose how notes get written in Settings → AI Model (download a local model or connect your own provider), then come back and generate."
-                    : "Your engine is configured — generate the notes whenever you're ready."}
+                    ? "Adversaria doesn't have a model to write them with yet. Choose one — download a local model, or connect your own provider with an API key — and these notes get written automatically."
+                    : hasEngine === true
+                      ? "Your notes model is set up — generate the notes whenever you're ready."
+                      : "Checking which model will write them…"}
                 </p>
-                <button
-                  className="btn-primary"
-                  onClick={handleResummarize}
-                  disabled={resummarizing}
-                >
-                  {resummarizing ? "Writing notes…" : "Generate notes"}
-                </button>
+                {hasEngine === false && onOpenModelSettings ? (
+                  <button className="btn-primary" onClick={onOpenModelSettings}>
+                    Choose a notes model
+                  </button>
+                ) : (
+                  <button
+                    className="btn-primary"
+                    onClick={handleResummarize}
+                    // Pressing this with no engine only ever produced a failure.
+                    disabled={resummarizing || hasEngine === false}
+                  >
+                    {resummarizing ? "Writing notes…" : "Generate notes"}
+                  </button>
+                )}
               </div>
             ) : (
               <SummaryView

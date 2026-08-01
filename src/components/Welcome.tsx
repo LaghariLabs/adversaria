@@ -3,20 +3,19 @@ import type { FormEvent } from "react";
 
 import type {
   AppConfig,
-  ModelDownloadStatus,
   OnboardingState,
   RegistrationState,
   SetupStatus,
 } from "../types";
 import {
+  checkServiceHealth,
   completeOnboardingStep,
   getConfig,
-  getModelDownloadStatus,
   getOnboardingState,
   getRegistrationState,
   getSetupStatus,
+  listWhisperModels,
   retryRegistration,
-  startModelDownload,
   submitRegistration,
   updateConfig,
   checkCapturePermissions,
@@ -28,13 +27,8 @@ import {
 import type { CapturePermissions } from "../lib/tauri";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-export const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main"] as const;
 const STEP_ORDER = ["registration", "permissions", "ready"] as const;
 type SetupStep = (typeof STEP_ORDER)[number];
-
-function formatGb(bytes: number): string {
-  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
-}
 
 function emptyRegistration(): RegistrationState {
   return {
@@ -66,16 +60,19 @@ export function resolveScreen(completedSteps: string[], platform: string): Setup
   return "ready";
 }
 
-/** Restart-safe first-run setup, three minimal screens (SPEC v2 addendum).
+interface WelcomeProps {
+  /** Finish setup and land on Settings › AI Model (the model manager). */
+  onOpenModelSettings?: () => void;
+}
+
+/** Restart-safe first-run setup, three minimal screens (SPEC V3 addendum).
  *
- * NOTHING model-related happens here: no LLM ever downloads during setup, no
- * model is picked — the one-time guided tour lands the user on Settings › AI
- * Model afterwards, where installed models are listed and downloads start
- * only on an explicit click. The single exception is Whisper: transcription
- * is always on-device with no API substitute, so its weights quietly cache in
- * the background — skipped entirely when already on this machine — and that
- * is disclosed on the final screen. */
-export function Welcome() {
+ * NOTHING downloads here — not the notes model, and (since V3) not the
+ * transcription model either. The wizard READS what is already on the machine
+ * and says so: transcription ready, or a card that names what is missing, how
+ * big it is, and offers the one click that goes and gets it. Everything else
+ * is deferred to the guided tour, which ends on Settings › AI Model. */
+export function Welcome({ onOpenModelSettings }: WelcomeProps) {
   const [registration, setRegistration] = useState<RegistrationState>(emptyRegistration);
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
   const [setup, setSetup] = useState<SetupStatus | null>(null);
@@ -83,6 +80,8 @@ export function Welcome() {
   const [perms, setPerms] = useState<CapturePermissions | null>(null);
   const [permBusy, setPermBusy] = useState<"" | "microphone" | "screen">("");
   const [loadingError, setLoadingError] = useState("");
+  // Bumped by the error screen's Retry button to restart the load attempts.
+  const [loadNonce, setLoadNonce] = useState(0);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -92,70 +91,100 @@ export function Welcome() {
   // Asked once, here, because nobody discovers a notification toggle inside
   // Settings. Defaults on; persisted only when setup finishes.
   const [notifyBeforeMeetings, setNotifyBeforeMeetings] = useState(true);
-  const [whisperDownloads, setWhisperDownloads] = useState<Record<string, ModelDownloadStatus>>({});
+  // What the Ready screen found on this machine: null until the one-shot probe
+  // settles, then true/false. Nothing here starts a download.
+  const [transcriptionReady, setTranscriptionReady] = useState<boolean | null>(null);
+  // e.g. "1.6 GB" — this machine's default model, read from the catalogue.
+  const [modelSizeHint, setModelSizeHint] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([
-      getRegistrationState(),
-      getOnboardingState(),
-      getSetupStatus(),
-      getConfig(),
-    ])
-      .then(([nextRegistration, nextOnboarding, nextSetup, nextConfig]) => {
-        setRegistration(nextRegistration);
-        // The backend also migrates this legacy flag into the versioned row,
-        // but a very fast webview can read both while startup migration is
-        // still committing. The legacy completion flag remains authoritative
-        // for existing users, so never strand them in first-run setup for the
-        // lifetime of this frontend session.
-        setOnboarding(
-          nextConfig.beta_onboarded && !nextOnboarding.setup_complete
-            ? { ...nextOnboarding, setup_complete: true }
-            : nextOnboarding,
-        );
-        setSetup(nextSetup);
-        setConfig(nextConfig);
-        setName(nextRegistration.name || nextConfig.user_name || "");
-        setEmail(nextRegistration.email || nextConfig.user_email || "");
-      })
-      .catch(() => {
-        setLoadingError("Setup state could not be loaded. Restart Adversaria and try again.");
-      });
-  }, []);
-
-  // Whisper is the ONLY thing that may download during setup (SPEC v2): it is
-  // needed for every provider, transcription is always on-device, and a cached
-  // copy makes this a no-op. Start it early so it overlaps the wizard screens;
-  // failures are silent here (the service may still be booting) and surface
-  // on the final screen's status line instead.
-  useEffect(() => {
-    if (!onboarding || onboarding.setup_complete) return;
-    ENGINE_WHISPER_IDS.forEach((id) => {
-      startModelDownload(id).catch(() => {});
-    });
-  }, [onboarding?.setup_complete]);
+    let alive = true;
+    let attempts = 0;
+    let timer: number | undefined;
+    const load = () => {
+      Promise.all([
+        getRegistrationState(),
+        getOnboardingState(),
+        getSetupStatus(),
+        getConfig(),
+      ])
+        .then(([nextRegistration, nextOnboarding, nextSetup, nextConfig]) => {
+          if (!alive) return;
+          setLoadingError("");
+          setRegistration(nextRegistration);
+          // The backend also migrates this legacy flag into the versioned row,
+          // but a very fast webview can read both while startup migration is
+          // still committing. The legacy completion flag remains authoritative
+          // for existing users, so never strand them in first-run setup for the
+          // lifetime of this frontend session.
+          setOnboarding(
+            nextConfig.beta_onboarded && !nextOnboarding.setup_complete
+              ? { ...nextOnboarding, setup_complete: true }
+              : nextOnboarding,
+          );
+          setSetup(nextSetup);
+          setConfig(nextConfig);
+          setName(nextRegistration.name || nextConfig.user_name || "");
+          setEmail(nextRegistration.email || nextConfig.user_email || "");
+        })
+        .catch(() => {
+          if (!alive) return;
+          // The very first launch is the slowest backend start there is —
+          // schema creation, migrations, the demo seed — and the webview can
+          // mount before it finishes. That is a wait, not a failure: keep
+          // retrying quietly before showing anything scary.
+          attempts += 1;
+          if (attempts < 10) {
+            timer = window.setTimeout(load, 1000);
+          } else {
+            setLoadingError(
+              "Setup state could not be loaded. Restart Adversaria and try again.",
+            );
+          }
+        });
+    };
+    load();
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [loadNonce]);
 
   const step = useMemo<SetupStep | null>(() => {
     if (!onboarding || onboarding.setup_complete || !setup) return null;
     return resolveScreen(onboarding.completed_steps, setup.platform);
   }, [onboarding, setup]);
 
-  // Whisper caching status for the final screen's disclosure line.
+  // One read of reality for the final screen — no polling, no fetching. The
+  // service is authoritative when it answers; the model list is the fallback
+  // for a service that hasn't reported a state yet. Neither answering means
+  // nothing is cached, which on a fresh install is exactly the truth.
   useEffect(() => {
     if (step !== "ready") return;
-    const poll = () => {
-      ENGINE_WHISPER_IDS.forEach((id) => {
-        getModelDownloadStatus(id)
-          .then((status) => {
-            setWhisperDownloads((current) => ({ ...current, [id]: status }));
-          })
-          .catch(() => {});
-      });
+    let alive = true;
+    Promise.allSettled([checkServiceHealth(), listWhisperModels()]).then(
+      ([health, models]) => {
+        if (!alive) return;
+        const state =
+          health.status === "fulfilled" ? health.value.transcriber_state : undefined;
+        const anyDownloaded =
+          models.status === "fulfilled" && models.value.some((model) => model.downloaded);
+        setTranscriptionReady(state === "ready" || anyDownloaded);
+        // The size the guide card promises must be the size of THIS machine's
+        // default model (~3 GB large-v3 on Apple Silicon, ~1.6 GB turbo on
+        // Windows) — a hardcoded number lied on one platform or the other.
+        if (models.status === "fulfilled" && models.value.length > 0) {
+          const entry =
+            models.value.find((model) => model.key === config?.whisper_model) ??
+            models.value[0];
+          setModelSizeHint(entry.size.replace("~", "").trim() || null);
+        }
+      },
+    );
+    return () => {
+      alive = false;
     };
-    poll();
-    const timer = window.setInterval(poll, 1000);
-    return () => window.clearInterval(timer);
-  }, [step]);
+  }, [step, config?.whisper_model]);
 
   // Live permission state for the permissions step. Re-checked on focus because
   // a user who grants in System Settings and tabs back gets no callback.
@@ -183,6 +212,15 @@ export function Welcome() {
         <div className="welcome-card" role="alert">
           <h2 className="welcome-title">Setup needs attention</h2>
           <p className="welcome-error">{loadingError}</p>
+          <button
+            className="btn-primary"
+            onClick={() => {
+              setLoadingError("");
+              setLoadNonce((n) => n + 1);
+            }}
+          >
+            Try again
+          </button>
         </div>
       </div>
     );
@@ -267,17 +305,23 @@ export function Welcome() {
   // Setup ends with NO model chosen and NO engine configured — that is a legal
   // state (SPEC v2). The guided tour takes over from here and ends on
   // Settings › AI Model, where the actual choice (download vs API) happens.
-  const finishSetup = async () => {
+  const finishSetup = async (thenOpenModelSettings = false) => {
     if (busy) return;
     setBusy(true);
     setMessage("");
     try {
       if (config.meeting_reminder_enabled !== notifyBeforeMeetings) {
-        const nextConfig = { ...config, meeting_reminder_enabled: notifyBeforeMeetings };
+        // Fresh read-modify-write: the mount-time `config` snapshot predates
+        // the registration step, which persisted user_name/user_email into
+        // config — writing the stale copy here silently erased the name the
+        // user just typed (it never appeared in Settings › General).
+        const fresh = await getConfig();
+        const nextConfig = { ...fresh, meeting_reminder_enabled: notifyBeforeMeetings };
         await updateConfig(nextConfig);
         setConfig(nextConfig);
       }
       await finishStep("ready", null, true);
+      if (thenOpenModelSettings) onOpenModelSettings?.();
     } catch (error) {
       setMessage(String(error));
     } finally {
@@ -295,28 +339,12 @@ export function Welcome() {
     (value) => value !== "permissions" || setup.platform === "macos",
   );
   const progressIndex = Math.max(0, visibleSteps.indexOf(step ?? "ready"));
-  const pendingRegistration = registration.status === "pending";
-
-  const whisperStatuses = ENGINE_WHISPER_IDS
-    .map((id) => whisperDownloads[id])
-    .filter((status): status is ModelDownloadStatus => Boolean(status));
-  const whisperTotal = whisperStatuses.reduce((sum, status) => sum + status.total_bytes, 0);
-  const whisperDone = whisperStatuses.reduce(
-    (sum, status) => sum + Math.min(status.downloaded_bytes, status.total_bytes),
-    0,
-  );
-  const whisperFailed = whisperStatuses.find((status) => status.state === "error");
-  const whisperReady =
-    whisperStatuses.length === ENGINE_WHISPER_IDS.length &&
-    whisperStatuses.every((status) => status.state === "ready");
-
-  const retryWhisper = () => {
-    ENGINE_WHISPER_IDS.forEach((id) => {
-      if (whisperDownloads[id]?.state === "error") {
-        startModelDownload(id).catch(() => {});
-      }
-    });
-  };
+  // A banner (and a Retry button) only when a retry is actually scheduled.
+  // Builds without a registration endpoint (every dev build) queue silently
+  // with next_retry_at null — retrying there can never succeed, and the old
+  // always-on amber banner read as a permanent bug.
+  const pendingRegistration =
+    registration.status === "pending" && registration.next_retry_at != null;
 
   return (
     <div className="welcome-overlay">
@@ -333,7 +361,7 @@ export function Welcome() {
           <div className="welcome-notice" role="status">
             <div>
               <strong>Registration queued</strong>
-              <p>Your details are stored locally and will retry when the service is reachable.</p>
+              <p>Your details are saved on this {deviceLabel} and will send automatically once you're back online.</p>
             </div>
             <button className="btn-secondary" onClick={retryPendingRegistration} disabled={busy}>
               Retry now
@@ -450,39 +478,36 @@ export function Welcome() {
           <section>
             <h2 className="welcome-title" id="setup-title">You're all set</h2>
             <p className="welcome-sub">
-              Adversaria records and transcribes on this {deviceLabel} out of the
-              box. A short tour inside the app shows you around — including how
-              your meeting notes get written.
+              Recording works on this {deviceLabel} right away, and everything
+              stays here. A short tour inside the app shows you around —
+              including how your meeting notes get written.
             </p>
 
-            <div className="welcome-download downloading" role="status">
-              <div>
-                <strong>
-                  {whisperFailed
-                    ? whisperFailed.detail
-                    : whisperReady
-                      ? "Transcription is ready on this machine."
-                      : "Caching the transcription engine in the background…"}
-                </strong>
-                <span>
-                  {whisperReady
-                    ? "Nothing else downloads without your say-so."
-                    : whisperTotal > 0
-                      ? `${formatGb(whisperDone)} / ${formatGb(whisperTotal)} — skipped when already on this machine`
-                      : "Checking what's already on this machine…"}
-                </span>
-              </div>
-              {!whisperReady && (whisperTotal > 0 ? (
-                <progress value={whisperDone} max={whisperTotal} />
-              ) : (
-                <progress />
-              ))}
-            </div>
-            {whisperFailed && (
-              <div className="welcome-actions">
-                <button className="btn-secondary" onClick={retryWhisper} disabled={busy}>
-                  Retry
-                </button>
+            {transcriptionReady === true && (
+              <p className="welcome-ready-line" role="status">
+                Transcription ready ✓ — the model is already on this {deviceLabel}.
+              </p>
+            )}
+            {transcriptionReady === false && (
+              <div className="welcome-download" role="status">
+                <div>
+                  <strong>Adversaria needs a transcription model to turn recordings into text.</strong>
+                </div>
+                <p className="welcome-guide-copy">
+                  {modelSizeHint
+                    ? `It's about ${modelSizeHint} and lives on this ${deviceLabel} for good.`
+                    : `It's a one-time download that lives on this ${deviceLabel} for good.`}{" "}
+                  Nothing downloads without your say-so.
+                </p>
+                <div className="welcome-actions">
+                  <button
+                    className="btn-secondary"
+                    onClick={() => finishSetup(true)}
+                    disabled={busy}
+                  >
+                    Choose &amp; download it in Settings
+                  </button>
+                </div>
               </div>
             )}
 
@@ -500,13 +525,14 @@ export function Welcome() {
             </label>
 
             <div className="welcome-actions">
-              <button className="btn-primary" onClick={finishSetup} disabled={busy}>
+              <button className="btn-primary" onClick={() => finishSetup()} disabled={busy}>
                 {busy ? "Finishing…" : "Start using Adversaria"}
               </button>
             </div>
             <p className="welcome-footnote">
-              Anything still caching keeps going inside Adversaria — you don't
-              have to wait for it.
+              You can go in without a transcription model — recording always
+              works, and a meeting recorded now transcribes itself as soon as
+              the model lands.
             </p>
           </section>
         )}

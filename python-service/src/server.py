@@ -34,18 +34,25 @@ from .models import (
     WhisperDownloadRequest,
     WhisperModelInfo,
 )
-from .model_setup import model_download_status, start_model_download
+from .model_setup import (
+    model_download_status,
+    on_download_ready,
+    start_model_download,
+)
 from .summarizer import OllamaSummarizer, default_llm_backend
 from .transcriber import (
     MlxWhisperTranscriber,
     WhisperTranscriber,
+    active_whisper_models,
     create_transcriber,
     decode_import_file,
+    default_whisper_key,
     download_whisper_model,
     list_whisper_models,
     relabel_me,
     relabel_turns,
     transcribe_cloud,
+    whisper_model_is_cached,
     whisper_repo_for,
 )
 from .config import save_prompt, delete_prompt
@@ -59,6 +66,13 @@ _transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
 _live_transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
 _summarizer: OllamaSummarizer | None = None
 _embedder: OllamaEmbedder | None = None
+
+# Why `_transcriber` is None right now — the UI renders this state, so a fresh
+# machine reads "no model downloaded yet" instead of a dead service. Values:
+# loading | ready | missing | error. Irrelevant once `_transcriber` is set.
+_TRANSCRIBER_STATE = "loading"
+_TRANSCRIBER_DETAIL: str | None = None
+_INIT_LOCK = threading.Lock()
 
 # Live captions use a small, fast Whisper (turbo-q4): ~0.2 s/utterance and a
 # quick load, so the preview feels live. The accurate large-v3 model stays for
@@ -100,6 +114,15 @@ def _build_live_transcriber(
     the main transcriber (previous behavior)."""
     try:
         if isinstance(main, MlxWhisperTranscriber):
+            # V3: never download uninvited — mlx-whisper fetches its repo on
+            # first use, so only build the dedicated live model when its
+            # weights are already on disk. Otherwise live reuses the main
+            # model for this session (correct, just slower).
+            if not whisper_model_is_cached(_LIVE_WHISPER_REPO):
+                logger.info(
+                    "Live-caption model not downloaded; live captions use the main model."
+                )
+                return main
             # drop_no_speech: live-only — drop segments Whisper itself flags
             # as probable non-speech (hallucinated fillers on breath/noise).
             live = MlxWhisperTranscriber(
@@ -113,30 +136,109 @@ def _build_live_transcriber(
     return main
 
 
+def _set_transcriber_state(state: str, detail: str | None = None) -> None:
+    global _TRANSCRIBER_STATE, _TRANSCRIBER_DETAIL
+    _TRANSCRIBER_STATE = state
+    _TRANSCRIBER_DETAIL = detail
+
+
+def _warm_live_model(main: WhisperTranscriber | MlxWhisperTranscriber) -> None:
+    global _live_transcriber
+    with _WHISPER_LOCK:
+        live = _build_live_transcriber(main)
+    _live_transcriber = live
+
+
+def _init_transcriber(wait: bool = False) -> None:
+    """Load the transcription model if — and only if — it is already on disk.
+
+    Never downloads: model bytes arrive exclusively through the `model_setup`
+    pipeline on an explicit user action (SETUP_REDESIGN_SPEC V3). Before V3
+    this load ran synchronously inside the lifespan and faster-whisper fetched
+    ~3 GB there on a fresh machine — the port stayed unbound for the whole
+    download and a failed fetch killed the process ("Transcriber not
+    initialized" was all a user ever saw of it). Runs on a background thread
+    at startup, again when a whisper download completes, and again on demand
+    from `_require_transcriber`, so the service is reachable within seconds
+    and comes alive without a restart once a model lands.
+
+    `wait=True` blocks for the lock instead of bailing — the download-ready
+    callback must not have its signal dropped just because an (older, doomed)
+    init attempt was mid-flight when the download finished; it waits its turn
+    and re-runs against the now-complete cache.
+    """
+    global _transcriber, _live_transcriber
+    if wait:
+        _INIT_LOCK.acquire()
+    elif not _INIT_LOCK.acquire(blocking=False):
+        return  # an init is already running; it will publish its outcome
+    try:
+        if _transcriber is not None:
+            return
+        _set_transcriber_state("loading")
+        # WHISPER_MODEL / MLX_WHISPER_MODEL are the dev escape hatch: honour
+        # them verbatim (the constructors resolve them) and skip cache checks.
+        env_override = os.environ.get("WHISPER_MODEL") or os.environ.get(
+            "MLX_WHISPER_MODEL"
+        )
+        model_key: str | None = None
+        if not env_override:
+            models = active_whisper_models()
+            cached = [
+                key
+                for key, entry in models.items()
+                if whisper_model_is_cached(entry["repo"])
+            ]
+            if not cached:
+                _set_transcriber_state(
+                    "missing", "No transcription model is downloaded yet."
+                )
+                return
+            default = default_whisper_key()
+            model_key = default if default in cached else cached[0]
+        try:
+            transcriber = create_transcriber(model_key)
+        except Exception:
+            logger.exception("Transcriber init failed")
+            _set_transcriber_state(
+                "error",
+                "The transcription model on this machine could not be loaded. "
+                "Re-download it from Settings.",
+            )
+            return
+        _transcriber = transcriber
+        _live_transcriber = transcriber
+        _set_transcriber_state("ready")
+        logger.info("Transcriber ready (%s).", transcriber.model_size)
+        threading.Thread(
+            target=_warm_live_model,
+            args=(transcriber,),
+            name="live-model-warmup",
+            daemon=True,
+        ).start()
+    finally:
+        _INIT_LOCK.release()
+
+
+def _on_model_download_ready(profile_id: str) -> None:
+    """model_setup callback: a verified download landed — try to come alive."""
+    if profile_id.startswith("whisper") and _transcriber is None:
+        _init_transcriber(wait=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize and teardown the ML service singletons."""
+    """Initialize and teardown the ML service singletons.
+
+    The transcriber loads on a background thread so uvicorn binds its port
+    within seconds no matter what — a missing model is a reportable state
+    (`transcriber_state`), never a hang or a dead process.
+    """
     global _transcriber, _live_transcriber, _summarizer, _embedder
     logger.info("Starting ML service lifespan...")
-    _transcriber = create_transcriber()
-    # Live captions fall back to the main model until the dedicated fast model
-    # is built in the background. On a fresh machine _build_live_transcriber
-    # downloads its model from Hugging Face; doing that synchronously here kept
-    # uvicorn from serving ANY request for minutes, so first-run setup saw
-    # "service is not ready" until the download finished.
-    _live_transcriber = _transcriber
-
-    def _warm_live_model(main: WhisperTranscriber | MlxWhisperTranscriber) -> None:
-        global _live_transcriber
-        with _WHISPER_LOCK:
-            live = _build_live_transcriber(main)
-        _live_transcriber = live
-
+    on_download_ready(_on_model_download_ready)
     threading.Thread(
-        target=_warm_live_model,
-        args=(_transcriber,),
-        name="live-model-warmup",
-        daemon=True,
+        target=_init_transcriber, name="transcriber-init", daemon=True
     ).start()
     # Backend is platform-resolved: Rapid-MLX (openai) on Apple Silicon, Ollama
     # elsewhere — unless LLM_BACKEND is set explicitly.
@@ -190,6 +292,8 @@ def health() -> HealthResponse:
         status=status,
         whisper_model=whisper_model,
         ollama_available=ollama_available,
+        transcriber_state="ready" if _transcriber is not None else _TRANSCRIBER_STATE,
+        transcriber_detail=None if _transcriber is not None else _TRANSCRIBER_DETAIL,
     )
 
 
@@ -337,6 +441,32 @@ def embed(request: EmbedRequest) -> EmbedResponse:
 # ---------------------------------------------------------------------------
 
 
+def _require_transcriber() -> WhisperTranscriber | MlxWhisperTranscriber:
+    """The loaded transcriber, or a structured 503 saying why there is none.
+
+    Retries init synchronously first — the model may have arrived since the
+    last attempt (downloaded from Settings moments ago), so a waiting meeting
+    heals on its next try without restarting anything. The detail is a
+    machine-readable code + human message; Rust translates the code and never
+    shows a raw body (the friend of 2026-07-31 got the old bare string pasted
+    verbatim into the UI).
+    """
+    if _transcriber is None and _TRANSCRIBER_STATE in {"missing", "error"}:
+        _init_transcriber()
+    t = _transcriber
+    if t is not None:
+        return t
+    code = {
+        "loading": "transcriber_loading",
+        "missing": "transcriber_missing",
+    }.get(_TRANSCRIBER_STATE, "transcriber_error")
+    message = _TRANSCRIBER_DETAIL or {
+        "transcriber_loading": "The transcription engine is still starting up.",
+        "transcriber_missing": "No transcription model is downloaded yet.",
+    }.get(code, "The transcription engine failed to load.")
+    raise HTTPException(status_code=503, detail={"code": code, "message": message})
+
+
 @app.post("/transcribe", response_model=TranscribeResponse)
 def transcribe(request: TranscribeRequest) -> TranscribeResponse:
     """Transcribe an audio file on disk using faster-whisper.
@@ -347,20 +477,18 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
     state (initial_prompt, model_repo) and one GPU can't run two Whisper
     jobs anyway.
     """
-    if _transcriber is None:
-        raise HTTPException(status_code=503, detail="Transcriber not initialized")
-
     if not request.audio_path.strip():
         raise HTTPException(status_code=400, detail="audio_path is required")
 
     # Single-file import path: decode in-process, then transcribe as plain
     # single-track (no mic, no dual merge).
     if request.single_file:
+        t = _require_transcriber()
         try:
             tmp_wav = decode_import_file(request.audio_path)
             try:
                 with _WHISPER_LOCK:
-                    result = _transcriber.transcribe(str(tmp_wav))
+                    result = t.transcribe(str(tmp_wav))
                 return result
             finally:
                 tmp_wav.unlink(missing_ok=True)
@@ -374,7 +502,9 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
 
     # Cloud transcription (Bring-Your-Own-Key, e.g. Groq): upload audio to an
     # OpenAI-compatible endpoint instead of running local Whisper. No on-device
-    # diarization in this mode, and the audio leaves the device.
+    # diarization in this mode, and the audio leaves the device. Checked BEFORE
+    # the local-transcriber guard: cloud needs no local model, and until V3 a
+    # missing local model wrongly 503'd BYOK users too.
     cloud_url = (request.transcription_base_url or "").strip()
     if cloud_url:
         try:
@@ -397,33 +527,44 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
                 status_code=502, detail=f"Cloud transcription failed: {exc}"
             ) from exc
 
+    t = _require_transcriber()
+
     # The per-request mutation of the shared transcriber (vocabulary prompt,
     # model repo) is only safe while no other request runs — hold the lock for
     # the whole mutate → transcribe → restore span.
     with _WHISPER_LOCK:
         vocab = (request.vocabulary or "").strip()
-        _transcriber.initial_prompt = f"Glossary: {vocab}" if vocab else None
+        t.initial_prompt = f"Glossary: {vocab}" if vocab else None
         # On-device model selection. The two backends need different handling:
         # MLX loads per call, so we swap the repo for this request and restore it
         # after; faster-whisper holds one loaded model for the process lifetime,
         # so it reloads and *keeps* the new choice (see `ensure_model_repo`).
         # Before this split the picker was a silent no-op on Windows — the
         # assignment below landed on an attribute faster-whisper never reads.
-        original_repo = getattr(_transcriber, "model_repo", None)
+        original_repo = getattr(t, "model_repo", None)
         if request.whisper_model:
             repo = whisper_repo_for(request.whisper_model)
-            if isinstance(_transcriber, MlxWhisperTranscriber):
-                _transcriber.model_repo = repo
+            if isinstance(t, MlxWhisperTranscriber):
+                # mlx-whisper downloads its repo at call time — never let a
+                # picked-but-not-downloaded model start a hidden fetch (V3).
+                if whisper_model_is_cached(repo):
+                    t.model_repo = repo
+                else:
+                    logger.warning(
+                        "Whisper model %s is not downloaded; using %s instead.",
+                        request.whisper_model,
+                        t.model_repo,
+                    )
             else:
-                _transcriber.ensure_model_repo(repo)
+                t.ensure_model_repo(repo)
         try:
             logger.info("Transcribing audio file: %s", request.audio_path)
             if request.mic_audio_path:
-                result = _transcriber.transcribe_dual(
+                result = t.transcribe_dual(
                     request.audio_path, request.mic_audio_path, diarize=request.diarize
                 )
             else:
-                result = _transcriber.transcribe(request.audio_path)
+                result = t.transcribe(request.audio_path)
             result.text = relabel_me(result.text, request.me_label)
             result.turns = relabel_turns(result.turns, request.me_label)
             return result
@@ -433,9 +574,9 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
             logger.exception("Transcription failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         finally:
-            _transcriber.initial_prompt = None
+            t.initial_prompt = None
             if original_repo is not None:
-                _transcriber.model_repo = original_repo
+                t.model_repo = original_repo
 
 
 @app.get("/whisper_models", response_model=list[WhisperModelInfo])

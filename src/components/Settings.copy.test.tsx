@@ -17,6 +17,7 @@ const JARGON = [
   { term: "Rapid", pattern: /\brapid/i },
   { term: "GGUF", pattern: /\bgguf\b/i },
   { term: "CTranslate2", pattern: /ctranslate/i },
+  { term: "Ollama", pattern: /\bollama\b/i },
   { term: "pull (download jargon)", pattern: /\bpull(s|ed|ing)?\b/i },
 ];
 
@@ -78,12 +79,36 @@ const SETUP_STATUS = {
 };
 
 function mockSettingsIpc(config: ReturnType<typeof appConfig>) {
-  mockIPC((command) => {
+  mockIPC((command, payload) => {
     if (command === "get_config") return config;
-    if (command === "check_service_health") return { status: "ok" };
+    if (command === "check_service_health") {
+      return {
+        status: "ok",
+        whisper_model: config.whisper_model,
+        ollama_available: true,
+        // The V3 transcription section renders its state chip from this.
+        transcriber_state: "ready",
+        transcriber_detail: null,
+      };
+    }
     if (command === "list_templates") return [{ name: "general", description: "" }];
     if (command === "list_whisper_models") {
-      return [{ key: "large-v3", label: "Large v3", size: "3 GB", downloaded: true }];
+      return [
+        { key: "large-v3", label: "Large v3", size: "3 GB", downloaded: true },
+        { key: "large-v3-turbo", label: "Large v3 turbo", size: "1.6 GB", downloaded: false },
+      ];
+    }
+    if (command === "get_model_download_status") {
+      return {
+        profile_id: (payload as { profileId?: string }).profileId ?? "",
+        state: "idle",
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        detail: "",
+        error_code: null,
+        verified: false,
+        can_retry: true,
+      };
     }
     if (command === "get_setup_status") return SETUP_STATUS;
     if (command === "calendar_status") return config.calendar;
@@ -125,6 +150,9 @@ describe("Settings copy", () => {
     await screen.findByRole("button", { name: "General settings" });
     // The engine picker must say what "local" means in plain language.
     expect(screen.getByRole("option", { name: "Local — on this computer" })).toBeTruthy();
+    // The V3 transcription dashboard has to be on screen, or this guard is vacuous.
+    expect(await screen.findByRole("heading", { name: "Transcription" })).toBeTruthy();
+    expect(await screen.findByText("Large v3 turbo")).toBeTruthy();
 
     for (const label of TAB_LABELS) {
       await user.click(screen.getByRole("button", { name: `${label} settings` }));

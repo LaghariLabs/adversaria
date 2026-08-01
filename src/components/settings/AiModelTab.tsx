@@ -1,18 +1,33 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-shell";
 import { TriangleAlert } from "lucide-react";
 
-import type { AppConfig, ModelDownloadStatus, SetupStatus } from "../../types";
+import type {
+  AppConfig,
+  HealthResponse,
+  ModelDownloadStatus,
+  SetupStatus,
+  WhisperModelInfo,
+} from "../../types";
 import { EngineInstallCard } from "../EngineInstallCard";
 import {
   checkServiceHealth,
   getConfig,
   getModelDownloadStatus,
   getSetupStatus,
+  listWhisperModels,
   setLocalModelProfile,
   startModelDownload,
   testLlmConnection,
+  updateConfig,
 } from "../../lib/tauri";
+import {
+  WHISPER_MODEL_PREFIX,
+  aggregatePercent,
+  formatGb,
+  isInFlight,
+  whisperModelId,
+} from "../../lib/modelDownloads";
 
 // Per-provider hints so the simplified engine picker can stay tidy.
 const MODEL_PLACEHOLDER: Record<string, string> = {
@@ -60,23 +75,41 @@ interface AiModelTabProps {
 }
 
 /**
- * AI Model — the model that writes your notes (SPEC v2: Meetily-shaped).
+ * AI Model — the model dashboard: transcription first, then the notes model
+ * (SPEC V3 addendum).
  *
- * Provider dropdown first; when Local is selected, a dropdown lists the models
- * already on this machine, with the hardware-recommended one labeled when it
- * isn't downloaded yet. Downloads start ONLY from the explicit button — and on
- * platforms whose managed engine isn't installed, that click first surfaces
- * the transparent install-plan consent card. API providers are first-class:
- * their key/model fields render inline, not behind a disclosure.
+ * Both families download through the same pinned pipeline, and the pipeline's
+ * state lives in the backend — so this tab RE-ATTACHES to whatever is running
+ * when it mounts instead of owning the progress itself. Leaving Settings
+ * mid-download and coming back now shows the same bar, and a download that
+ * finishes while you're away still ends up in use.
+ *
+ * Downloads start ONLY from an explicit button — and on platforms whose managed
+ * engine isn't installed, that click first surfaces the transparent
+ * install-plan consent card. API providers are first-class: their key/model
+ * fields render inline, not behind a disclosure.
  */
 export function AiModelTab({ active, config, update, replaceConfig }: AiModelTabProps) {
   const [setup, setSetup] = useState<SetupStatus | null>(null);
   const [modelSwitching, setModelSwitching] = useState(false);
   const [modelMsg, setModelMsg] = useState("");
-  const [profileDownload, setProfileDownload] = useState<ModelDownloadStatus | null>(null);
+  // Backend-owned download state for every watched profile, transcription and
+  // notes alike, keyed by profile id.
+  const [downloads, setDownloads] = useState<Record<string, ModelDownloadStatus>>({});
+  const [whisperModels, setWhisperModels] = useState<WhisperModelInfo[]>([]);
+  const [whisperMsg, setWhisperMsg] = useState("");
+  const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthStatus, setHealthStatus] = useState<
     "checking" | "ok" | "degraded" | "unreachable"
   >("checking");
+  // Profiles seen mid-download during THIS mount. Only those may auto-activate
+  // on completion — a profile that was already finished when the tab mounted
+  // must never hijack the model the user is actually using.
+  const activatingRef = useRef<Set<string>>(new Set());
+  // Read inside stable callbacks so a keystroke in another tab doesn't restart
+  // the download poll.
+  const configRef = useRef(config);
+  configRef.current = config;
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // Which profile the dropdown is showing (not necessarily in use yet).
   const [chosenId, setChosenId] = useState<string | null>(null);
@@ -101,17 +134,31 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
 
   const checkHealth = useCallback(async () => {
     try {
-      const health = await checkServiceHealth();
-      setHealthStatus(health.status === "ok" ? "ok" : "degraded");
+      const next = await checkServiceHealth();
+      setHealth(next);
+      setHealthStatus(next.status === "ok" ? "ok" : "degraded");
     } catch {
+      setHealth(null);
       setHealthStatus("unreachable");
+    }
+  }, []);
+
+  const loadWhisperModels = useCallback(async (): Promise<WhisperModelInfo[]> => {
+    try {
+      const models = await listWhisperModels();
+      setWhisperModels(models);
+      return models;
+    } catch (e) {
+      setWhisperMsg(String(e));
+      return [];
     }
   }, []);
 
   useEffect(() => {
     getSetupStatus().then(setSetup).catch(() => {});
+    loadWhisperModels();
     checkHealth();
-  }, [checkHealth]);
+  }, [checkHealth, loadWhisperModels]);
 
   const switchLocalModel = useCallback(
     async (profileId: string) => {
@@ -132,26 +179,103 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
     [replaceConfig],
   );
 
-  // While a profile downloads, poll until it verifies — then make it the
-  // active model: the user explicitly asked for THIS model, so finishing the
-  // download and not using it would be a dead end.
+  /** Make a freshly downloaded transcription model the one in use. Written
+   *  straight to disk (like the notes-model switch) — the user pressed
+   *  Download; needing a second Save press to actually use it is a dead end. */
+  const activateWhisperModel = useCallback(
+    async (key: string) => {
+      try {
+        const cfg = await getConfig();
+        const next = { ...cfg, whisper_model: key };
+        await updateConfig(next);
+        replaceConfig(next);
+      } catch (e) {
+        setWhisperMsg(String(e));
+      }
+    },
+    [replaceConfig],
+  );
+
+  const handleDownloadFinished = useCallback(
+    async (profileId: string) => {
+      if (profileId.startsWith(WHISPER_MODEL_PREFIX)) {
+        const key = profileId.slice(WHISPER_MODEL_PREFIX.length);
+        const models = await loadWhisperModels();
+        await checkHealth();
+        // Only take over when the configured model isn't actually here —
+        // otherwise a user topping up a second model loses the one in use.
+        const configured = models.find((m) => m.key === configRef.current.whisper_model);
+        if (!configured?.downloaded) await activateWhisperModel(key);
+        return;
+      }
+      setSetup(await getSetupStatus());
+      await switchLocalModel(profileId);
+    },
+    [activateWhisperModel, checkHealth, loadWhisperModels, switchLocalModel],
+  );
+
+  // Every profile whose download this tab can show: one per curated
+  // transcription model, plus the pinned notes tiers (Ollama models are on disk
+  // already and are never fetched through this pipeline).
+  const watchedIds = useMemo(
+    () => [
+      ...whisperModels.map((model) => whisperModelId(model.key)),
+      ...(setup?.profiles ?? [])
+        .map((profile) => profile.id)
+        .filter((id) => !id.startsWith("ollama:")),
+    ],
+    [whisperModels, setup],
+  );
+
+  const anyRunning = watchedIds.some((id) => {
+    const status = downloads[id];
+    return status ? isInFlight(status) : false;
+  });
+
+  // Re-attach on mount, then follow anything that is running. Progress is NOT
+  // component state: it is asked for fresh, so navigating away mid-download and
+  // coming back picks the same download up where it actually is.
   useEffect(() => {
-    if (!profileDownload || !["preparing", "downloading", "verifying"].includes(profileDownload.state)) {
-      return;
+    if (watchedIds.length === 0) return;
+    let alive = true;
+    const poll = () => {
+      watchedIds.forEach((id) => {
+        getModelDownloadStatus(id)
+          .then((status) => {
+            if (!alive) return;
+            setDownloads((current) => ({ ...current, [id]: status }));
+            if (isInFlight(status)) {
+              activatingRef.current.add(id);
+            } else if (status.state === "ready" && activatingRef.current.has(id)) {
+              activatingRef.current.delete(id);
+              void handleDownloadFinished(id);
+            }
+          })
+          .catch(() => {});
+      });
+    };
+    poll();
+    if (!anyRunning) {
+      return () => {
+        alive = false;
+      };
     }
-    const timer = window.setInterval(() => {
-      getModelDownloadStatus(profileDownload.profile_id)
-        .then(async (status) => {
-          setProfileDownload(status);
-          if (status.state === "ready") {
-            setSetup(await getSetupStatus());
-            await switchLocalModel(status.profile_id);
-          }
-        })
-        .catch(() => {});
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [profileDownload?.profile_id, profileDownload?.state, switchLocalModel]);
+    const timer = window.setInterval(poll, 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [watchedIds, anyRunning, handleDownloadFinished]);
+
+  const beginDownload = async (profileId: string, onError: (msg: string) => void) => {
+    try {
+      const status = await startModelDownload(profileId);
+      activatingRef.current.add(profileId);
+      setDownloads((current) => ({ ...current, [profileId]: status }));
+    } catch (e) {
+      onError(String(e));
+    }
+  };
 
   const downloadLocalModel = async (profileId: string) => {
     setModelMsg("");
@@ -166,11 +290,12 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
       setEngineConsentFor(profileId);
       return;
     }
-    try {
-      setProfileDownload(await startModelDownload(profileId));
-    } catch (e) {
-      setModelMsg(String(e));
-    }
+    await beginDownload(profileId, setModelMsg);
+  };
+
+  const downloadWhisper = async (key: string) => {
+    setWhisperMsg("");
+    await beginDownload(whisperModelId(key), setWhisperMsg);
   };
 
   const isCloud = config.llm_provider !== "local";
@@ -181,14 +306,204 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
   const recommended = profiles.find((p) => p.recommended);
   const chosen =
     profiles.find((p) => p.id === chosenId) ?? inUse ?? recommended ?? profiles[0];
-  const chosenDownloading =
-    chosen &&
-    profileDownload?.profile_id === chosen.id &&
-    ["preparing", "downloading", "verifying"].includes(profileDownload.state);
+  const profileDownload = chosen ? downloads[chosen.id] ?? null : null;
+  const chosenDownloading = Boolean(profileDownload && isInFlight(profileDownload));
+
+  // Transcription: what's on this machine, what state the engine is in.
+  const usesCloudTranscription = config.transcription_base_url.trim() !== "";
+  const transcriberState = health?.transcriber_state;
+  const transcriptionChip =
+    transcriberState === "ready"
+      ? { text: "Ready ✓", tone: "ok" }
+      : transcriberState === "loading"
+        ? { text: "Starting up…", tone: "" }
+        : transcriberState === "error"
+          ? { text: health?.transcriber_detail || "Needs attention", tone: "err" }
+          : transcriberState === "missing"
+            ? { text: "No model downloaded yet", tone: "warn" }
+            : null;
 
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`} data-tour="ai-model">
       <h3 className="settings-card-title">AI Model</h3>
+      <p className="settings-card-desc">
+        The two models Adversaria uses: one turns speech into text, the other
+        turns that text into notes. Nothing is fetched until you press Download.
+      </p>
+
+      <h3 className="settings-card-title" style={{ marginTop: 18 }}>Transcription</h3>
+      <p className="settings-card-desc">
+        The model that turns your recordings into text.
+      </p>
+
+      {/* Engine choice lives HERE, with the models — Recording only holds
+          recording behavior. Two places showing engine state read as a
+          duplicate (Hamza, 2026-08-01). */}
+      <div className="settings-form-group">
+        <label className="settings-label" htmlFor="settings-transcription-engine">Engine</label>
+        <select
+          id="settings-transcription-engine"
+          value={usesCloudTranscription ? "cloud" : "local"}
+          onChange={(e) => {
+            if (e.target.value === "cloud") {
+              update({
+                transcription_base_url: "https://api.groq.com/openai/v1",
+                transcription_model: config.transcription_model?.trim() || "whisper-large-v3",
+              });
+            } else {
+              update({ transcription_base_url: "" });
+            }
+          }}
+          className="settings-select"
+        >
+          <option value="local">On-device — private, runs on this computer (recommended)</option>
+          <option value="cloud">Online service — bring your own key</option>
+        </select>
+      </div>
+
+      {usesCloudTranscription ? (
+        <>
+          <div className="settings-form-group">
+            <div className="settings-note warn">
+              <TriangleAlert size={14} aria-hidden="true" /> Online transcription uploads your meeting audio to{" "}
+              {(() => {
+                try { return new URL(config.transcription_base_url).host; }
+                catch { return "the provider"; }
+              })()}{" "}
+              — this is <strong>not sovereign</strong> (audio leaves your device), and{" "}
+              <strong>speaker labeling is unavailable</strong> in this mode (remote
+              audio is labeled "Them", not "Speaker 1/2"). For private, labeled
+              transcripts, use the on-device engine.
+            </div>
+          </div>
+          <div className="settings-form-group">
+            <label className="settings-label" htmlFor="settings-transcription-base">Transcription Base URL</label>
+            <input
+              id="settings-transcription-base"
+              type="text"
+              value={config.transcription_base_url}
+              onChange={(e) => update({ transcription_base_url: e.target.value })}
+              className="settings-input-text"
+              placeholder="https://api.groq.com/openai/v1"
+            />
+          </div>
+          <div className="settings-form-group">
+            <label className="settings-label" htmlFor="settings-transcription-model">Model</label>
+            <input
+              id="settings-transcription-model"
+              type="text"
+              value={config.transcription_model}
+              onChange={(e) => update({ transcription_model: e.target.value })}
+              className="settings-input-text"
+              placeholder="whisper-large-v3"
+            />
+          </div>
+          <div className="settings-form-group">
+            <label className="settings-label" htmlFor="settings-transcription-key">API Key</label>
+            <input
+              id="settings-transcription-key"
+              type="password"
+              value={config.transcription_api_key}
+              onChange={(e) => update({ transcription_api_key: e.target.value })}
+              className="settings-input-text"
+              placeholder="gsk_..."
+            />
+            <p className="settings-help">
+              Free key at{" "}
+              <button className="btn-link" onClick={() => open("https://console.groq.com/keys")}>
+                console.groq.com/keys
+              </button>
+              . Large v3 covers 99 languages (including Arabic).
+            </p>
+          </div>
+        </>
+      ) : (
+        <div className="settings-form-group">
+          {transcriptionChip && (
+            <p className={`settings-msg ${transcriptionChip.tone}`}>{transcriptionChip.text}</p>
+          )}
+          {whisperModels.length === 0 ? (
+            <div className="settings-note info">
+              The list of transcription models isn't available yet — it appears once
+              the on-device service is running.
+            </div>
+          ) : (
+            <div className="settings-model-list">
+              {whisperModels.map((model) => {
+                const id = whisperModelId(model.key);
+                const status = downloads[id];
+                const running = status ? isInFlight(status) : false;
+                const percent = status ? aggregatePercent([status]) : null;
+                const isActive = model.key === config.whisper_model;
+                return (
+                  <div
+                    key={model.key}
+                    className={`settings-model-row${isActive ? " active" : ""}`}
+                  >
+                    <div className="settings-model-info">
+                      <span>{model.label}</span>
+                      <small>
+                        {model.downloaded ? "On this computer" : `${model.size} download`}
+                        {isActive ? " · in use" : ""}
+                      </small>
+                      {running && status && (
+                        <>
+                          <small>
+                            {status.total_bytes > 0
+                              ? `${formatGb(status.downloaded_bytes)} of ${formatGb(status.total_bytes)}`
+                              : "Preparing…"}
+                          </small>
+                          {status.total_bytes > 0 ? (
+                            <progress
+                              value={status.downloaded_bytes}
+                              max={status.total_bytes}
+                            />
+                          ) : (
+                            <progress />
+                          )}
+                        </>
+                      )}
+                      {status?.state === "error" && <small>{status.detail}</small>}
+                    </div>
+                    <div className="settings-model-action">
+                      {running && status ? (
+                        <span className="settings-model-dl">
+                          {percent === null ? "Downloading…" : `Downloading ${percent}%`}
+                        </span>
+                      ) : !model.downloaded ? (
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => downloadWhisper(model.key)}
+                        >
+                          {status?.state === "error" ? "Retry" : "Download"}
+                        </button>
+                      ) : isActive ? (
+                        <span className="settings-model-inuse">In use</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => activateWhisperModel(model.key)}
+                        >
+                          Use this one
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {whisperMsg && <p className="settings-msg err">{whisperMsg}</p>}
+          <p className="settings-help">
+            Recordings made before a model is here aren't lost — they transcribe
+            themselves as soon as one lands.
+          </p>
+        </div>
+      )}
+
+      <h3 className="settings-card-title" style={{ marginTop: 22 }}>Meeting notes</h3>
       <p className="settings-card-desc">
         The model that turns transcripts into notes. <strong>Local</strong> runs on
         this computer and is started and stopped by Adversaria — nothing leaves the
@@ -273,7 +588,7 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
             ) : chosenDownloading ? (
               <span className="settings-model-dl">
                 {profileDownload && profileDownload.total_bytes > 0
-                  ? `${(profileDownload.downloaded_bytes / 1e9).toFixed(1)} / ${(profileDownload.total_bytes / 1e9).toFixed(1)} GB`
+                  ? `${formatGb(profileDownload.downloaded_bytes)} of ${formatGb(profileDownload.total_bytes)}`
                   : "Preparing…"}
               </span>
             ) : chosen.installed ? (
@@ -292,7 +607,7 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
                 disabled={modelSwitching}
                 onClick={() => downloadLocalModel(chosen.id)}
               >
-                {profileDownload?.profile_id === chosen.id && profileDownload.state === "error"
+                {profileDownload?.state === "error"
                   ? "Retry download"
                   : `Download (${chosen.required_disk_gb} GB)`}
               </button>
@@ -316,11 +631,7 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
             setEngineConsentFor(null);
             getSetupStatus().then(setSetup).catch(() => {});
             // The consent card named this model too — continue into its download.
-            if (profileId) {
-              startModelDownload(profileId)
-                .then(setProfileDownload)
-                .catch((e) => setModelMsg(String(e)));
-            }
+            if (profileId) void beginDownload(profileId, setModelMsg);
           }}
           onDismiss={() => setEngineConsentFor(null)}
         />
@@ -330,9 +641,11 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
       {config.llm_provider === "local" && profiles.length === 0 && setup && (
         <div className="settings-form-group">
           <div className="settings-note info">
-            No local notes engine was found on this computer yet. Pick an online
-            engine above, or type the model your own local server exposes under
-            Advanced.
+            <strong>No notes model on this computer yet.</strong> Your meetings
+            still record and transcribe — only the written summary is waiting.
+            The quickest route is the free online option in the Engine list
+            above (an API key, no download); if you'd rather keep everything on
+            this {deviceLabel}, this list fills in once a model is installed.
           </div>
         </div>
       )}

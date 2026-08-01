@@ -758,7 +758,7 @@ export function GraphView({ meetings, onSelectMeeting }: GraphViewProps) {
   }
 
   return (
-    <div className="graph-layout">
+    <div className="graph-layout" data-tour="graph-view">
       <div className="graph-toolbar">
         <div className="graph-legend">
           {LEGEND.map((l) => {

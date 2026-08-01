@@ -160,7 +160,7 @@ export function AskAllView({ onOpenMeeting }: AskAllViewProps) {
   const empty = messages.length === 0 && !pending;
 
   return (
-    <div className="ask-layout">
+    <div className="ask-layout" data-tour="ask-view">
       <div className="ask-header">
         <h1 className="ask-title">Ask Across Meetings</h1>
         <p className="ask-subtitle">

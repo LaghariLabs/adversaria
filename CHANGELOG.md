@@ -5,6 +5,45 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.70] - 2026-08-01
+
+### Added
+- **A welcome meeting from the founder.** Fresh installs open to a finished
+  sample meeting — real notes, a transcript, and a four-step getting-started
+  checklist on the To-dos board — so you see the end product before your first
+  recording.
+- **A guided setup that never downloads without you.** The app tells you
+  exactly which model it needs and how big it is, and a chip in the header
+  shows download progress from anywhere. Nothing is fetched until you press
+  Download.
+- **A tour that shows the whole app** — recording, meetings, to-dos, Weekly,
+  Ask, Graph, and where your models live — replayable any time from
+  Settings → General.
+
+### Fixed
+- **Recording before your model finishes downloading no longer fails.** The
+  meeting waits, says so plainly, and transcribes itself the moment the model
+  is ready. Notes fill in the same way once a notes engine is configured.
+- **A failed first-run download can't kill the app's brain anymore.** The
+  on-device service now starts instantly, reports honestly, retries, and
+  restarts itself if it crashes — and error messages are written for humans.
+- **A transcript is never thrown away again** when notes can't be written yet.
+- The name you enter during setup now appears in Settings, Settings fills the
+  window, meetings auto-detect by default, and model settings live in one
+  place instead of two.
+
+## [0.3.69] - 2026-07-31
+
+### Added
+- **Your AI can work on your to-dos, and show you what it did.** Connect
+  Adversaria to Claude (or any MCP client) and ask it to handle the follow-ups
+  from a meeting. Tasks it picks up move into a new **With AI** lane on your
+  to-do board: you can see what it is working on right now, and what it says it
+  has finished — each with a line explaining exactly what it did and where.
+- **Nothing is marked done without you.** An agent can report a task finished,
+  but only you can accept it. Until you do, the work sits in the lane with its
+  evidence, and the to-do stays open.
+
 ## [0.3.68] - 2026-07-29
 
 ### Fixed

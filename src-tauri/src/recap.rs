@@ -217,6 +217,10 @@ mod tests {
             assignee: String::new(),
             due: String::new(),
             done,
+            status: "todo".to_string(),
+            completed_by: String::new(),
+            completed_at: String::new(),
+            evidence: String::new(),
         }
     }
 

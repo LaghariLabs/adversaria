@@ -35,11 +35,17 @@ const TABS: { id: SettingsTab; label: string; icon: JSX.Element }[] = [
  * `update` (saved on Save) or `persist` (written immediately).
  */
 interface SettingsProps {
-  /** Tab to open on (used by the guided tour to land on AI Model). */
+  /** Tab to open on (used by the tour, the wizard and the transcription chip
+   *  to land on AI Model). */
   initialTab?: string;
+  /** Bumped by the caller on every navigation request, so a Settings view that
+   *  is already open still switches tabs when the target is unchanged. */
+  tabNonce?: number;
+  /** Clears `tour_completed` and navigates away so the tour can restart. */
+  onReplayTour?: () => void;
 }
 
-export function Settings({ initialTab }: SettingsProps) {
+export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) {
   // App version (so the user can always tell which build is running).
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
@@ -54,6 +60,10 @@ export function Settings({ initialTab }: SettingsProps) {
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>(
     (initialTab as SettingsTab) || "general",
   );
+
+  useEffect(() => {
+    if (initialTab) setActiveSettingsTab(initialTab as SettingsTab);
+  }, [initialTab, tabNonce]);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -131,7 +141,9 @@ export function Settings({ initialTab }: SettingsProps) {
             Adversaria v{appVersion}
           </div>
         )}
-        {registrationState?.status === "pending" && (
+        {/* Only when a retry is actually scheduled: endpoint-less builds
+            (every dev build) queue silently — retrying there can never work. */}
+        {registrationState?.status === "pending" && registrationState.next_retry_at != null && (
           <div className="settings-registration-pending" role="status">
             <strong>Registration queued</strong>
             <span>It will retry automatically when online.</span>
@@ -161,6 +173,7 @@ export function Settings({ initialTab }: SettingsProps) {
           active={activeSettingsTab === "general"}
           config={config}
           update={update}
+          onReplayTour={onReplayTour}
         />
         <AiModelTab
           active={activeSettingsTab === "model"}
@@ -172,6 +185,7 @@ export function Settings({ initialTab }: SettingsProps) {
           active={activeSettingsTab === "recording"}
           config={config}
           update={update}
+          onOpenModelTab={() => setActiveSettingsTab("model")}
         />
         <TemplatesCalendarTab
           active={activeSettingsTab === "templates"}

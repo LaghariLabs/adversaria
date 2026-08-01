@@ -102,10 +102,21 @@ async fn attempt_pending(
         return Ok(state);
     }
     let Some(endpoint) = formspree_endpoint() else {
-        return persist_failure(
-            state,
+        // No endpoint compiled into this build (every dev build, and 0.3.66):
+        // retrying can never succeed, so schedule NOTHING. The wizard shows
+        // its "Registration queued … Retry now" banner only when a retry is
+        // actually pending — this state queues silently and delivers on the
+        // first endpoint-carrying build, which the user can't influence.
+        crate::diagnostics::record(
+            "registration.retry_queued",
             "Registration is queued; this build has no Formspree endpoint configured.",
         );
+        state.next_retry_at = None;
+        state.last_error =
+            Some("This build has no registration endpoint; details stay on-device.".to_string());
+        crate::storage::save_registration_state(&state)
+            .map_err(|e| format!("Could not save registration state: {e}"))?;
+        return Ok(state);
     };
     let Some(consent_timestamp) = state.consent_timestamp.as_deref() else {
         return persist_failure(state, "Registration consent metadata is missing.");

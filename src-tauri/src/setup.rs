@@ -83,6 +83,16 @@ pub fn downloadable_profile(profile_id: &str) -> bool {
     if profile_id.starts_with("ollama:") {
         return false;
     }
+    // `whisper-model:<key>` is the per-model family behind the Settings
+    // Transcription picker (SPEC V3). The service owns the curated key set —
+    // it rejects unknown ids — so this gate only bounds the shape.
+    if let Some(key) = profile_id.strip_prefix("whisper-model:") {
+        return !key.is_empty()
+            && key.len() <= 64
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    }
     profile_alias(profile_id).is_some() || matches!(profile_id, "whisper-main" | "whisper-live")
 }
 
@@ -806,6 +816,18 @@ mod tests {
         assert!(downloadable_profile("whisper-live"));
         assert!(downloadable_profile("qwen-9b-balanced"));
         assert!(!downloadable_profile("unknown"));
+    }
+
+    /// The Settings Transcription picker downloads through per-model ids; the
+    /// service owns the curated key set, this gate only bounds the shape.
+    #[test]
+    fn whisper_model_family_is_downloadable() {
+        assert!(downloadable_profile("whisper-model:large-v3"));
+        assert!(downloadable_profile("whisper-model:large-v3-turbo"));
+        assert!(downloadable_profile("whisper-model:large-v3-turbo-q4"));
+        assert!(!downloadable_profile("whisper-model:"));
+        assert!(!downloadable_profile("whisper-model:has spaces"));
+        assert!(!downloadable_profile("whisper-model:path/../traversal"));
     }
 
     /// Ollama models are already on disk. `profile_alias` accepts them now, so

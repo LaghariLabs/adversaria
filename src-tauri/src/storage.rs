@@ -389,7 +389,15 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
             text        TEXT    NOT NULL,
             assignee    TEXT    NOT NULL DEFAULT '',
             due         TEXT    NOT NULL DEFAULT '',
-            done        INTEGER NOT NULL DEFAULT 0
+            done        INTEGER NOT NULL DEFAULT 0,
+            -- Agent workflow. done stays the boolean every existing query
+            -- uses; status is the richer state an agent moves through, and
+            -- ai_done is deliberately NOT done: work an agent claims to have
+            -- finished waits for the user to accept it.
+            status       TEXT    NOT NULL DEFAULT 'todo',
+            completed_by TEXT    NOT NULL DEFAULT '',
+            completed_at TEXT    NOT NULL DEFAULT '',
+            evidence     TEXT    NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_action_items_meeting ON action_items(meeting_id);
         CREATE TABLE IF NOT EXISTS ask_messages (
@@ -462,6 +470,7 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
             completed_steps TEXT NOT NULL DEFAULT '[]',
             selected_model_profile TEXT NOT NULL DEFAULT '',
             setup_complete INTEGER NOT NULL DEFAULT 0,
+            demo_meeting_seeded INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );",
     )?;
@@ -471,6 +480,43 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
     if !column_exists(&conn, "ask_messages", "intent")? {
         conn.execute(
             "ALTER TABLE ask_messages ADD COLUMN intent TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    // Migration: the one-shot demo-meeting flag on onboarding_state tables
+    // created before it existed. Existing installs start at 0 and are then
+    // resolved to 1 by the first seed check — which skips them, because their
+    // meetings table is not empty.
+    if !column_exists(&conn, "onboarding_state", "demo_meeting_seeded")? {
+        conn.execute(
+            "ALTER TABLE onboarding_state ADD COLUMN demo_meeting_seeded INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Migration: agent workflow columns on action_items. Existing rows keep
+    // their boolean `done`; status is derived from it once so a long-standing
+    // board doesn't reset to "todo" on upgrade.
+    if !column_exists(&conn, "action_items", "status")? {
+        conn.execute(
+            "ALTER TABLE action_items ADD COLUMN status TEXT NOT NULL DEFAULT 'todo'",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE action_items ADD COLUMN completed_by TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE action_items ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE action_items ADD COLUMN evidence TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE action_items SET status = 'done', completed_by = 'you' WHERE done = 1",
             [],
         )?;
     }
@@ -833,6 +879,12 @@ pub fn connect_for_sync() -> Result<Connection, rusqlite::Error> {
 /// Returns the newly assigned row id.
 pub fn insert_meeting(meeting: &Meeting) -> anyhow::Result<i64> {
     let conn = connect()?;
+    insert_meeting_on(&conn, meeting)
+}
+
+/// [`insert_meeting`] on a caller-supplied connection, for writers that need
+/// several statements on one connection (e.g. the demo seeder).
+pub fn insert_meeting_on(conn: &Connection, meeting: &Meeting) -> anyhow::Result<i64> {
     conn.execute(
         "INSERT INTO meetings (title, recorded_at, duration_seconds, transcript, summary, template_used, audio_file_path, attendees, user_notes, link, tags, transcript_turns)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -1209,6 +1261,36 @@ pub fn pending_audio_paths() -> anyhow::Result<Vec<(i64, String)>> {
         .map_err(Into::into)
 }
 
+/// Meetings whose recording is still on disk because transcription never
+/// succeeded — the retroactive-transcription queue. Oldest first, so a backlog
+/// drains in the order it was recorded.
+pub fn meetings_awaiting_transcription() -> anyhow::Result<Vec<i64>> {
+    let conn = connect()?;
+    let mut statement = conn.prepare(
+        "SELECT id FROM meetings
+         WHERE audio_file_path IS NOT NULL AND audio_file_path != ''
+           AND TRIM(COALESCE(transcript, '')) = ''
+         ORDER BY recorded_at ASC",
+    )?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Meetings that have a transcript but no notes — recorded before an LLM engine
+/// was configured (or while it was down). Oldest first.
+pub fn meetings_missing_summary() -> anyhow::Result<Vec<i64>> {
+    let conn = connect()?;
+    let mut statement = conn.prepare(
+        "SELECT id FROM meetings
+         WHERE TRIM(COALESCE(transcript, '')) != '' AND TRIM(COALESCE(summary, '')) = ''
+         ORDER BY recorded_at ASC",
+    )?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 pub fn get_registration_state() -> anyhow::Result<RegistrationState> {
     let conn = connect()?;
     let mut statement = conn.prepare(
@@ -1321,6 +1403,45 @@ pub fn save_onboarding_state(state: &OnboardingState) -> anyhow::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Whether the one-time "should this install get a sample meeting?" question
+/// has already been answered. Lives on `onboarding_state` — the same singleton
+/// row that holds `setup_complete` — rather than in config.json, because
+/// `update_config` saves whatever the frontend sends and would reset a flag the
+/// TypeScript `AppConfig` doesn't know about.
+pub fn demo_meeting_seeded(conn: &Connection) -> anyhow::Result<bool> {
+    // COALESCE covers the fresh install where the singleton row doesn't exist yet.
+    let seeded: bool = conn.query_row(
+        "SELECT COALESCE(
+            (SELECT demo_meeting_seeded FROM onboarding_state WHERE singleton = 1), 0)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(seeded)
+}
+
+/// Record that the sample-meeting question is answered — whether the sample was
+/// actually seeded or deliberately skipped. Leaves every other onboarding field
+/// alone (and `save_onboarding_state` in turn leaves this one alone).
+pub fn mark_demo_meeting_seeded(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO onboarding_state
+            (singleton, schema_version, demo_meeting_seeded, updated_at)
+         VALUES (1, ?1, 1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET demo_meeting_seeded = 1",
+        params![
+            OnboardingState::default().schema_version,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// True when the library holds no meetings at all (fresh install).
+pub fn meetings_are_empty(conn: &Connection) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row("SELECT count(*) FROM meetings", [], |row| row.get(0))?;
+    Ok(count == 0)
 }
 
 /// Return all meetings ordered by most recent first.
@@ -1711,11 +1832,13 @@ pub fn get_action_items(meeting_id: Option<i64>) -> anyhow::Result<Vec<ActionIte
     let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match meeting_id {
         Some(_) => (
             "SELECT id, meeting_id, ord, text, assignee, due, done
+             , status, completed_by, completed_at, evidence
              FROM action_items WHERE meeting_id = ?1 ORDER BY ord",
             vec![Box::new(meeting_id) as Box<dyn rusqlite::types::ToSql>],
         ),
         None => (
             "SELECT id, meeting_id, ord, text, assignee, due, done
+             , status, completed_by, completed_at, evidence
              FROM action_items ORDER BY meeting_id, ord",
             vec![],
         ),
@@ -1732,6 +1855,10 @@ pub fn get_action_items(meeting_id: Option<i64>) -> anyhow::Result<Vec<ActionIte
             assignee: row.get(4)?,
             due: row.get(5)?,
             done: row.get::<_, i32>(6)? != 0,
+            status: row.get(7)?,
+            completed_by: row.get(8)?,
+            completed_at: row.get(9)?,
+            evidence: row.get(10)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1744,11 +1871,37 @@ pub fn get_action_items(meeting_id: Option<i64>) -> anyhow::Result<Vec<ActionIte
 /// Toggle the done flag on a single action item.
 pub fn set_action_item_done(id: i64, done: bool) -> anyhow::Result<()> {
     let conn = connect()?;
+    // Keep `status` in lockstep with the boolean so the board and every older
+    // query agree. A user ticking the box owns the completion outright — it
+    // clears any agent claim, including one that was awaiting review.
+    let (status, by) = if done { ("done", "you") } else { ("todo", "") };
     let updated = conn.execute(
-        "UPDATE action_items SET done = ?1 WHERE id = ?2",
-        params![done as i32, id],
+        "UPDATE action_items
+            SET done = ?1,
+                status = ?2,
+                completed_by = ?3,
+                completed_at = CASE WHEN ?1 = 1 THEN ?4 ELSE '' END,
+                evidence = CASE WHEN ?1 = 1 THEN evidence ELSE '' END
+          WHERE id = ?5",
+        params![done as i32, status, by, chrono::Utc::now().to_rfc3339(), id],
     )?;
     anyhow::ensure!(updated == 1, "Action item not found: {id}");
+    Ok(())
+}
+
+/// Accept work an agent reported: `ai_done` becomes a real `done`, keeping the
+/// evidence and the credit. This is the human gate — an agent can never move an
+/// item into `done` itself.
+pub fn accept_agent_work(id: i64) -> anyhow::Result<()> {
+    let conn = connect()?;
+    let updated = conn.execute(
+        "UPDATE action_items SET done = 1, status = 'done' WHERE id = ?1 AND status = 'ai_done'",
+        params![id],
+    )?;
+    anyhow::ensure!(
+        updated == 1,
+        "No agent-completed action item to accept: {id}"
+    );
     Ok(())
 }
 
