@@ -171,6 +171,12 @@ function BulletItem({ text, actionable, item, onToggle }: BulletItemProps) {
     <span>
       {label && <b>{label}: </b>}
       {rest}
+      {/* The deadline is stripped out of the bullet text by parseSummary so the
+          sentence reads cleanly — but it was then rendered NOWHERE, so a spoken
+          deadline vanished from the note entirely (2026-08-03 review). Show it
+          from the stored column, which is authoritative: the user can edit it
+          in the To-dos tab, and that edit should win here too. */}
+      {item?.due && <span className="badge-due">{item.due}</span>}
     </span>
   );
 

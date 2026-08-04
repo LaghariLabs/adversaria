@@ -450,11 +450,20 @@ pub struct AppConfig {
     /// API key for the cloud LLM provider (only used when llm_base_url is non-empty).
     #[serde(default)]
     pub llm_api_key: String,
-    /// Cloud transcription (Bring-Your-Own-Key). When non-empty, the Python
+    /// Which transcription engine the user chose: "local" (on-device Whisper),
+    /// "self_hosted" (their own Whisper API — audio stays on their network), or
+    /// "cloud" (a provider's API — audio leaves the device). Only labels the
+    /// remote endpoint below; the request path is the same for both remote
+    /// modes. Blank on configs written before this field existed —
+    /// `config::load_config` classifies those from `transcription_base_url`.
+    #[serde(default)]
+    pub transcription_provider: String,
+    /// Remote transcription (Bring-Your-Own-Key). When non-empty, the Python
     /// service uploads audio to this OpenAI-compatible /audio/transcriptions
-    /// endpoint (e.g. Groq) instead of running local Whisper — for users without
-    /// the hardware to transcribe on-device. Empty = on-device Whisper (default).
-    /// Cloud mode has no on-device diarization and is not sovereign.
+    /// endpoint (a self-hosted Whisper box, or a provider like Groq) instead of
+    /// running local Whisper — for users without the hardware to transcribe
+    /// on-device. Empty = on-device Whisper (default). Neither remote mode has
+    /// on-device diarization.
     #[serde(default)]
     pub transcription_base_url: String,
     /// API key for the cloud transcription provider (used when the base URL is set).

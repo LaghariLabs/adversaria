@@ -2,10 +2,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import type { OnboardingState } from "../types";
+import { beginModelDownload } from "../lib/modelDownloads";
 import { SetupStatusStrip } from "./SetupStatusStrip";
 
 const onboarding = (overrides: Partial<OnboardingState> = {}): OnboardingState => ({
@@ -98,17 +99,20 @@ describe("SetupStatusStrip", () => {
     await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
 
-  it("keeps watching after an idle round — no session latch", async () => {
-    // The old strip latched itself off the first time everything was idle, so a
-    // download started later in Settings was invisible for the rest of the
-    // session. Two things have to hold: it keeps polling on its own timer with
-    // no dependency change to prod it, and it renders what that poll finds.
+  it("wakes instantly when a download starts anywhere in the app", async () => {
+    // The strip no longer discovers work by fast-polling: every UI path starts
+    // downloads through beginModelDownload, whose bus event makes the strip
+    // poll NOW — no timer has to fire, and no session latch can blind it.
     const polled: string[] = [];
     let downloading = false;
     mockIPC((command, payload) => {
       if (command === "get_onboarding_state") return onboarding();
       if (command === "list_whisper_models") return WHISPER_MODELS;
       if (command === "get_setup_status") return SETUP;
+      if (command === "start_model_download") {
+        downloading = true;
+        return status("whisper-model:large-v3-turbo", "downloading");
+      }
       if (command === "get_model_download_status") {
         const id = (payload as { profileId?: string }).profileId ?? "";
         polled.push(id);
@@ -125,17 +129,59 @@ describe("SetupStatusStrip", () => {
     await waitFor(() => expect(polled).toContain("whisper-model:large-v3-turbo"));
     await waitFor(() => expect(container).toBeEmptyDOMElement());
 
-    // Nothing changes except time — no re-render, no new watched id. Only the
-    // strip's own timer can find this download.
-    downloading = true;
+    // Settings starts a download through the shared entry point — the strip
+    // notices well inside findByText's 1 s default, not on a poll cadence.
+    await beginModelDownload("whisper-model:large-v3-turbo");
     expect(
-      await screen.findByText(
-        "Transcription model downloading — Adversaria stays usable.",
-        undefined,
-        { timeout: 8000 },
-      ),
+      await screen.findByText("Transcription model downloading — Adversaria stays usable."),
     ).toBeInTheDocument();
-  }, 20000);
+  });
+
+  it("the slow idle heartbeat still catches a download nothing announced", async () => {
+    // Safety net for downloads no UI action started (e.g. resumed by the
+    // backend): the strip must find them on its own — just slowly, because the
+    // 4 s idle cadence was 96% of the sidecar log on every installed copy.
+    vi.useFakeTimers();
+    try {
+      let downloading = false;
+      mockIPC((command, payload) => {
+        if (command === "get_onboarding_state") return onboarding();
+        if (command === "list_whisper_models") return WHISPER_MODELS;
+        if (command === "get_setup_status") return SETUP;
+        if (command === "get_model_download_status") {
+          const id = (payload as { profileId?: string }).profileId ?? "";
+          if (downloading && id === "whisper-model:large-v3-turbo") {
+            return status(id, "downloading", 500_000_000, 1_600_000_000);
+          }
+          return status(id, "idle");
+        }
+        return null;
+      });
+
+      render(<SetupStatusStrip />);
+      // Flush the mount chain (onboarding → catalogue → first poll) without
+      // moving the clock.
+      for (let i = 0; i < 8; i++) await act(async () => {});
+
+      downloading = true;
+      // Just short of the heartbeat: the strip is still idle-blind…
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(59_000);
+      });
+      expect(
+        screen.queryByText("Transcription model downloading — Adversaria stays usable."),
+      ).not.toBeInTheDocument();
+      // …and the 60 s tick finds it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(
+        screen.getByText("Transcription model downloading — Adversaria stays usable."),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("surfaces a failed download with the human reason and a retry", async () => {
     const retried: string[] = [];
@@ -157,7 +203,9 @@ describe("SetupStatusStrip", () => {
     render(<SetupStatusStrip />);
     expect(await screen.findByText("The model download was interrupted.")).toBeInTheDocument();
     expect(screen.getByText("Transcription model — download failed")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    // Retry goes through the shared beginModelDownload entry point → backend.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(retried).toEqual(["whisper-main"]));
   });
 
   it("never runs sample verification or touches onboarding (SPEC v2)", async () => {

@@ -348,6 +348,44 @@ class TestSummarize:
         system_prompt = summarizer.client.chat.call_args[1]["messages"][0]["content"]
         assert "OUTPUT LANGUAGE" not in system_prompt
 
+    def test_summarize_adds_date_context_when_given(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        """meeting_date puts a single DATE CONTEXT line in the system prompt."""
+        mock_message = MagicMock()
+        mock_message.__getitem__ = MagicMock(return_value={"content": "{}"})
+        summarizer.client.chat.return_value = mock_message
+
+        summarizer.summarize(
+            transcript="Me: hello.",
+            template_name="general",
+            meeting_date="2026-08-07",
+        )
+        system_prompt = summarizer.client.chat.call_args[1]["messages"][0]["content"]
+        assert "DATE CONTEXT: Today is 2026-08-07 (Friday)" in system_prompt
+        assert system_prompt.count("Today is") == 1
+
+    @pytest.mark.parametrize(
+        "meeting_date", [None, "", "not-a-date", "07/08/2026", "2026-13-45"]
+    )
+    def test_summarize_omits_date_context_when_absent_or_malformed(
+        self, summarizer: OllamaSummarizer, meeting_date: str | None
+    ) -> None:
+        """No date, or a date we can't trust, leaves the prompt exactly as before."""
+        mock_message = MagicMock()
+        mock_message.__getitem__ = MagicMock(return_value={"content": "{}"})
+        summarizer.client.chat.return_value = mock_message
+
+        summarizer.summarize(
+            transcript="Me: hello.",
+            template_name="general",
+            meeting_date=meeting_date,
+        )
+        system_prompt = summarizer.client.chat.call_args[1]["messages"][0]["content"]
+        # The template mentions DATE CONTEXT as a condition; the injected line is
+        # the only thing that ever states a date.
+        assert "Today is" not in system_prompt
+
     def test_summarize_uses_model_override(
         self, summarizer: OllamaSummarizer
     ) -> None:
@@ -1225,3 +1263,135 @@ class TestSummarizeViewerLabel:
         user_message = s._chat.call_args[1]["messages"][1]["content"]
         assert "Viewer mic (not the presenter):" in user_message
         assert "Hamza:" not in user_message
+
+
+class TestNumCtxGuard:
+    """EVERY Ollama completion call must pass num_ctx (TODO 2026-08-02: a call
+    without it loads the model at its model-default context — 262,144 for
+    qwen3.5:9b = 16 GB resident observed live, vs ~7 GB at 16,384)."""
+
+    @staticmethod
+    def _assert_all_calls_have_num_ctx(summarizer: OllamaSummarizer) -> None:
+        from src.summarizer import DEFAULT_NUM_CTX
+
+        calls = summarizer.client.chat.call_args_list
+        assert calls, "expected at least one ollama chat call"
+        for call in calls:
+            options = call.kwargs["options"]
+            assert options["num_ctx"] == DEFAULT_NUM_CTX
+
+    def test_chat_passes_num_ctx(self, summarizer: OllamaSummarizer) -> None:
+        """The grounded-chat completion carries num_ctx."""
+        summarizer.client.chat.reset_mock()
+        mock_message = MagicMock()
+        mock_message.__getitem__ = MagicMock(return_value={"content": "Answer."})
+        summarizer.client.chat.return_value = mock_message
+
+        summarizer.chat(transcript="Me: hi. Them: hi.", question="What was said?")
+
+        self._assert_all_calls_have_num_ctx(summarizer)
+
+    def test_chat_stream_passes_num_ctx(self, summarizer: OllamaSummarizer) -> None:
+        """The streaming-chat completion carries num_ctx."""
+        summarizer.client.chat.reset_mock()
+        summarizer.client.chat.return_value = iter([])
+
+        list(summarizer.chat_stream(transcript="Me: hi.", question="What was said?"))
+
+        self._assert_all_calls_have_num_ctx(summarizer)
+
+    def test_classify_and_summarize_completions_pass_num_ctx(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        """auto_template fires the extra one-word classification completion —
+        both it and the summarize completion must carry num_ctx."""
+        summarizer.client.chat.reset_mock()
+        mock_message = MagicMock()
+        mock_message.__getitem__ = MagicMock(return_value={"content": "Summary."})
+        summarizer.client.chat.return_value = mock_message
+
+        summarizer.summarize(
+            transcript="Me: hello there. Them: hi, let's plan the launch.",
+            template_name="general",
+            auto_template=True,
+        )
+
+        assert len(summarizer.client.chat.call_args_list) == 2
+        self._assert_all_calls_have_num_ctx(summarizer)
+
+
+class TestLocalOllamaBaseUrlReroute:
+    """Rust routes local Ollama tags through http://127.0.0.1:11434/v1 (its
+    OpenAI-compatible surface, commands.rs OLLAMA_OPENAI_BASE_URL) — but that
+    API cannot carry num_ctx, which is exactly how the 262k-context / 16 GB
+    runner happened live (2026-08-02). A local-Ollama base_url must be served
+    by the native Ollama client so _ollama_options() applies."""
+
+    OLLAMA_V1 = "http://127.0.0.1:11434/v1"
+
+    def test_is_local_ollama_url(self) -> None:
+        from src.summarizer import _is_local_ollama_url
+
+        assert _is_local_ollama_url("http://127.0.0.1:11434/v1")
+        assert _is_local_ollama_url("http://localhost:11434/v1")
+        assert _is_local_ollama_url("http://localhost:11434")
+        assert not _is_local_ollama_url("https://api.groq.com/openai/v1")
+        assert not _is_local_ollama_url("http://127.0.0.1:8765/v1")  # Rapid-MLX
+        assert not _is_local_ollama_url(None)
+        assert not _is_local_ollama_url("")
+
+    def test_chat_with_local_ollama_base_url_uses_native_client(self) -> None:
+        from src.summarizer import DEFAULT_NUM_CTX
+
+        s = OllamaSummarizer(model="qwen3.5:9b", backend="openai")
+        assert s.client is None  # the openai backend skips client construction
+        s._ollama_client()  # lazy creation (returns the module-level fake)
+        s.client.chat.reset_mock()
+        mock_message = MagicMock()
+        mock_message.__getitem__ = MagicMock(return_value={"content": "ok"})
+        s.client.chat.return_value = mock_message
+
+        out = s._chat(
+            [{"role": "user", "content": "hi"}],
+            "qwen3.5:9b",
+            None,
+            base_url=self.OLLAMA_V1,
+        )
+
+        assert out == "ok"
+        call = s.client.chat.call_args
+        assert call.kwargs["options"]["num_ctx"] == DEFAULT_NUM_CTX
+
+    def test_chat_stream_with_local_ollama_base_url_uses_native_client(self) -> None:
+        from src.summarizer import DEFAULT_NUM_CTX
+
+        s = OllamaSummarizer(model="qwen3.5:9b", backend="openai")
+        s._ollama_client()
+        s.client.chat.reset_mock()
+        s.client.chat.return_value = iter([])
+
+        list(
+            s.chat_stream(
+                transcript="Me: hi.", question="What?", base_url=self.OLLAMA_V1
+            )
+        )
+
+        call = s.client.chat.call_args
+        assert call.kwargs["stream"] is True
+        assert call.kwargs["options"]["num_ctx"] == DEFAULT_NUM_CTX
+
+    def test_cloud_base_url_still_routes_openai(self) -> None:
+        s = OllamaSummarizer(model="llama-3.3-70b", backend="openai")
+        s._chat_openai = MagicMock(return_value="cloud")
+
+        out = s._chat(
+            [{"role": "user", "content": "hi"}],
+            "llama-3.3-70b",
+            None,
+            base_url="https://api.groq.com/openai/v1",
+            api_key="k",
+        )
+
+        assert out == "cloud"
+        s._chat_openai.assert_called_once()
+        assert s.client is None  # the native client was never touched

@@ -43,7 +43,8 @@ export function RecordingTab({ active, config, update, onOpenModelTab }: Recordi
         />
         <p className="settings-help">
           Helps transcription spell names and terms it would otherwise get wrong.
-          Leave blank to disable.
+          Use the exact spelling and casing you want to appear in transcripts
+          (e.g. Adversaria, iPhone). Leave blank to disable.
         </p>
       </div>
 

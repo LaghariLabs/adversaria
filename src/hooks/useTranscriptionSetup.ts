@@ -5,12 +5,13 @@ import {
   checkServiceHealth,
   getModelDownloadStatus,
   listWhisperModels,
-  startModelDownload,
 } from "../lib/tauri";
 import {
   ENGINE_WHISPER_IDS,
   aggregatePercent,
+  beginModelDownload,
   isInFlight,
+  onModelDownloadStarted,
   whisperModelId,
 } from "../lib/modelDownloads";
 
@@ -45,7 +46,11 @@ export interface TranscriptionSetup {
  *  user is waiting on it (that is when the guide chip has something to say). */
 const HEALTH_MS_READY = 20_000;
 const HEALTH_MS_WAITING = 4_000;
-const DOWNLOAD_MS = 1_000;
+/** Byte-progress cadence: brisk only while a download is actually moving.
+ *  While nothing is in flight this is a slow safety net — the
+ *  `onModelDownloadStarted` bus wakes the loop instantly when one begins. */
+const DOWNLOAD_MS_ACTIVE = 1_000;
+const DOWNLOAD_MS_IDLE = 5_000;
 
 /**
  * Single source of truth for "can this machine transcribe yet?" (SPEC V3).
@@ -121,6 +126,12 @@ export function useTranscriptionSetup(): TranscriptionSetup {
   // a settled machine polls nothing at all.
   const watchDownloads = transcriberState !== undefined && transcriberState !== "ready";
 
+  // Only a live download earns the fast cadence.
+  const anyInFlight = whisperIds.some((id) => {
+    const status = downloads[id];
+    return status ? isInFlight(status) : false;
+  });
+
   useEffect(() => {
     if (!watchDownloads) return;
     let alive = true;
@@ -134,12 +145,19 @@ export function useTranscriptionSetup(): TranscriptionSetup {
       });
     };
     poll();
-    const timer = window.setInterval(poll, DOWNLOAD_MS);
+    const timer = window.setInterval(
+      poll,
+      anyInFlight ? DOWNLOAD_MS_ACTIVE : DOWNLOAD_MS_IDLE,
+    );
+    // A download started anywhere wakes this loop instantly; the poll it
+    // triggers flips anyInFlight, which re-arms the interval at the fast cadence.
+    const unsubscribe = onModelDownloadStarted(() => poll());
     return () => {
       alive = false;
       window.clearInterval(timer);
+      unsubscribe();
     };
-  }, [watchDownloads, whisperIds, tick]);
+  }, [watchDownloads, anyInFlight, whisperIds, tick]);
 
   const statuses = whisperIds
     .map((id) => downloads[id])
@@ -161,7 +179,7 @@ export function useTranscriptionSetup(): TranscriptionSetup {
   const retry = useCallback(() => {
     whisperIds.forEach((id) => {
       if (downloads[id]?.state === "error") {
-        startModelDownload(id).catch(() => {});
+        beginModelDownload(id).catch(() => {});
       }
     });
   }, [whisperIds, downloads]);

@@ -18,6 +18,7 @@ export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     llm_provider: "local",
     llm_base_url: "",
     llm_api_key: "",
+    transcription_provider: "local",
     transcription_base_url: "",
     transcription_api_key: "",
     transcription_model: "whisper-large-v3",
