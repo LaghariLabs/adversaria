@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -44,6 +45,7 @@ def _fake_summarize(
     category_hint: str | None = None,
     auto_template: bool = False,
     viewer_label: str | None = None,
+    meeting_date: str | None = None,
 ) -> MagicMock:
     """Mock summarize that validates input like the real one."""
     if not transcript.strip():
@@ -249,6 +251,31 @@ class TestSummarizeEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["template_used"] is not None
+
+    def test_summarize_forwards_meeting_date(self) -> None:
+        """The recording's date reaches the summarizer so deadlines can resolve."""
+        response = client.post(
+            "/summarize",
+            json={
+                "transcript": "Alice: Send the draft by Friday.",
+                "template_name": "general",
+                "meeting_date": "2026-08-07",
+            },
+        )
+        assert response.status_code == 200
+        assert (
+            _fake_summarizer_instance.summarize.call_args[1]["meeting_date"]
+            == "2026-08-07"
+        )
+
+    def test_summarize_without_meeting_date_still_works(self) -> None:
+        """An older Rust that never sends meeting_date keeps working (None)."""
+        response = client.post(
+            "/summarize",
+            json={"transcript": "Alice: Hello.", "template_name": "general"},
+        )
+        assert response.status_code == 200
+        assert _fake_summarizer_instance.summarize.call_args[1]["meeting_date"] is None
 
     def test_summarize_accepts_user_notes(self) -> None:
         resp = client.post(
@@ -753,3 +780,79 @@ class TestLiveFeedSources:
         )
         assert resp.status_code == 200
         assert list(_server_mod._live_sessions) == ["them"]
+
+
+class TestAccessLogPollFilter:
+    """The uvicorn.access filter drops ONLY successful /setup/model_download
+    GET polls (TODO 2026-08-02: 96% of sidecar-log lines, 3.3 MB/13 h).
+
+    Synthetic records mirror uvicorn 0.49.0's access call exactly
+    (h11_impl.py:481 / httptools_impl.py:484):
+    ``args = (client_addr, method, path_with_query, http_version, status)``.
+    """
+
+    @staticmethod
+    def _record(method: str, path: str, status: int) -> logging.LogRecord:
+        return logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=0,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=("127.0.0.1:52000", method, path, "1.1", status),
+            exc_info=None,
+        )
+
+    def test_successful_poll_is_dropped(self) -> None:
+        record = self._record("GET", "/setup/model_download/whisper-large-v3", 200)
+        assert _server_mod._ACCESS_LOG_POLL_FILTER.filter(record) is False
+
+    def test_error_poll_is_kept(self) -> None:
+        record = self._record("GET", "/setup/model_download/whisper-large-v3", 503)
+        assert _server_mod._ACCESS_LOG_POLL_FILTER.filter(record) is True
+
+    def test_unrelated_success_is_kept(self) -> None:
+        record = self._record("GET", "/health", 200)
+        assert _server_mod._ACCESS_LOG_POLL_FILTER.filter(record) is True
+
+    def test_non_get_on_poll_path_is_kept(self) -> None:
+        record = self._record("POST", "/setup/model_download/whisper-large-v3", 200)
+        assert _server_mod._ACCESS_LOG_POLL_FILTER.filter(record) is True
+
+    def test_non_access_record_shape_passes_through(self) -> None:
+        record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=0,
+            msg="plain message, no access args",
+            args=(),
+            exc_info=None,
+        )
+        assert _server_mod._ACCESS_LOG_POLL_FILTER.filter(record) is True
+
+
+class TestParentGuard:
+    """Decision logic for the parent-death watchdog (ADVERSARIA_PARENT_GUARD).
+
+    Only the guard-on/guard-off decision is tested; the thread body blocks on
+    stdin and hard-exits, so Thread is mocked (never started under pytest).
+    """
+
+    def test_guard_off_without_env(self, monkeypatch) -> None:
+        """Dev runs (env var unset) must NOT start the watchdog thread."""
+        monkeypatch.delenv("ADVERSARIA_PARENT_GUARD", raising=False)
+        with patch.object(_server_mod.threading, "Thread") as thread_cls:
+            assert _server_mod.install_parent_guard() is False
+        thread_cls.assert_not_called()
+
+    def test_guard_on_with_env(self, monkeypatch) -> None:
+        """ADVERSARIA_PARENT_GUARD=1 starts the daemon watchdog on stdin."""
+        monkeypatch.setenv("ADVERSARIA_PARENT_GUARD", "1")
+        with patch.object(_server_mod.threading, "Thread") as thread_cls:
+            assert _server_mod.install_parent_guard() is True
+        thread_cls.assert_called_once()
+        kwargs = thread_cls.call_args.kwargs
+        assert kwargs["daemon"] is True
+        assert kwargs["target"] is _server_mod._watch_parent_stdin
+        thread_cls.return_value.start.assert_called_once()

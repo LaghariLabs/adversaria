@@ -35,6 +35,7 @@ import {
 } from "../lib/summary";
 import { buildSlideHtml, exportFileBase } from "../lib/exportDocument";
 import { formatDateTime } from "../lib/dateFormat";
+import { templateDisplayName } from "../lib/templateNames";
 import {
   Download,
   FileJson,
@@ -604,7 +605,9 @@ export function NoteViewer({
           <span style={{ color: "var(--text-muted)" }} aria-hidden="true">
             •
           </span>
-          <span className="badge-tag blue">{meeting.template_used}</span>
+          <span className="badge-tag blue">
+            {templateDisplayName(meeting.template_used)}
+          </span>
         </div>
 
         <div className="viewer-title-row">
@@ -904,7 +907,7 @@ export function NoteViewer({
           >
             {templateNames.map((name) => (
               <option key={name} value={name}>
-                {name}
+                {templateDisplayName(name)}
               </option>
             ))}
           </select>

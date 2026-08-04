@@ -7,8 +7,10 @@ import type {
   HealthResponse,
   ModelDownloadStatus,
   SetupStatus,
+  TranscriptionProvider,
   WhisperModelInfo,
 } from "../../types";
+import { classifyTranscriptionProvider } from "../../types";
 import { EngineInstallCard } from "../EngineInstallCard";
 import {
   checkServiceHealth,
@@ -17,13 +19,13 @@ import {
   getSetupStatus,
   listWhisperModels,
   setLocalModelProfile,
-  startModelDownload,
   testLlmConnection,
   updateConfig,
 } from "../../lib/tauri";
 import {
   WHISPER_MODEL_PREFIX,
   aggregatePercent,
+  beginModelDownload,
   formatGb,
   isInFlight,
   whisperModelId,
@@ -167,7 +169,15 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
       try {
         await setLocalModelProfile(profileId);
         const [cfg, next] = await Promise.all([getConfig(), getSetupStatus()]);
-        replaceConfig(cfg);
+        // Merge back ONLY what that command rewrote (registration.rs
+        // `set_selected_model_profile` writes these two). Handing Settings the
+        // whole disk copy replaced its state and threw away every unsaved edit
+        // in every tab — including an engine the user had just picked.
+        replaceConfig({
+          ...configRef.current,
+          ollama_model: cfg.ollama_model,
+          llm_provider: cfg.llm_provider,
+        });
         setSetup(next);
         setModelMsg("Model switched. It can take a minute to finish loading.");
       } catch (e) {
@@ -186,9 +196,11 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
     async (key: string) => {
       try {
         const cfg = await getConfig();
-        const next = { ...cfg, whisper_model: key };
-        await updateConfig(next);
-        replaceConfig(next);
+        await updateConfig({ ...cfg, whisper_model: key });
+        // Disk gets the fresh read-modify-write; Settings gets only the field
+        // that changed, so a download landing in the background can't wipe an
+        // unsaved engine switch or a half-typed API key.
+        replaceConfig({ ...configRef.current, whisper_model: key });
       } catch (e) {
         setWhisperMsg(String(e));
       }
@@ -269,7 +281,7 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
 
   const beginDownload = async (profileId: string, onError: (msg: string) => void) => {
     try {
-      const status = await startModelDownload(profileId);
+      const status = await beginModelDownload(profileId);
       activatingRef.current.add(profileId);
       setDownloads((current) => ({ ...current, [profileId]: status }));
     } catch (e) {
@@ -309,8 +321,25 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
   const profileDownload = chosen ? downloads[chosen.id] ?? null : null;
   const chosenDownloading = Boolean(profileDownload && isInFlight(profileDownload));
 
-  // Transcription: what's on this machine, what state the engine is in.
-  const usesCloudTranscription = config.transcription_base_url.trim() !== "";
+  // Transcription: which engine, what's on this machine, what state it's in.
+  // The picker follows the SAVED provider, not "is a URL filled in" — a
+  // self-hosted Whisper box and a cloud API both have a base URL, and only the
+  // provider tells them apart (their privacy copy is opposite).
+  const txProvider = config.transcription_provider;
+  const txRemote = txProvider !== "local";
+  const txSelfHosted = txProvider === "self_hosted";
+  const txHost = (() => {
+    try {
+      return new URL(config.transcription_base_url).host;
+    } catch {
+      return "";
+    }
+  })();
+  // The dropdown says what the user MEANT; only the host says where the audio
+  // goes. "Never leaves your network" has to follow the host — a public URL
+  // typed into the self-hosted field (or carried over from cloud) is not a
+  // server the user runs. Blank counts as fine: nothing is uploaded yet.
+  const txOwnNetwork = classifyTranscriptionProvider(config.transcription_base_url) !== "cloud";
   const transcriberState = health?.transcriber_state;
   const transcriptionChip =
     transcriberState === "ready"
@@ -343,38 +372,74 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
         <label className="settings-label" htmlFor="settings-transcription-engine">Engine</label>
         <select
           id="settings-transcription-engine"
-          value={usesCloudTranscription ? "cloud" : "local"}
+          value={txProvider}
           onChange={(e) => {
-            if (e.target.value === "cloud") {
-              update({
-                transcription_base_url: "https://api.groq.com/openai/v1",
-                transcription_model: config.transcription_model?.trim() || "whisper-large-v3",
-              });
+            const provider = e.target.value as TranscriptionProvider;
+            const patch: Partial<AppConfig> = { transcription_provider: provider };
+            // A key is issued FOR a host, and changing the engine changes the
+            // host — carrying it over Bearer-sends one org's credential to the
+            // new endpoint (python-service/src/transcriber.py `transcribe_cloud`).
+            patch.transcription_api_key = "";
+            if (provider === "local") {
+              // A blank base URL is what routes transcription on-device
+              // (src-tauri/src/commands.rs `configured_transcription_base_url`).
+              patch.transcription_base_url = "";
             } else {
-              update({ transcription_base_url: "" });
+              // A cloud provider's address is not "a server you run": keeping
+              // it would go on uploading there while the panel below promised
+              // the audio never left the network.
+              if (provider === "self_hosted" && txProvider === "cloud") {
+                patch.transcription_base_url = "";
+              }
+              // Only a provider we can name gets a preset, and only into an
+              // empty field — never clobber an address the user typed. A
+              // self-hosted box has no address we could guess.
+              if (provider === "cloud" && !config.transcription_base_url.trim()) {
+                patch.transcription_base_url = "https://api.groq.com/openai/v1";
+              }
+              patch.transcription_model =
+                config.transcription_model?.trim() || "whisper-large-v3";
             }
+            update(patch);
           }}
           className="settings-select"
         >
           <option value="local">On-device — private, runs on this computer (recommended)</option>
-          <option value="cloud">Online service — bring your own key</option>
+          <option value="self_hosted">Self-hosted server — your own Whisper API</option>
+          <option value="cloud">Cloud service — a provider's API</option>
         </select>
       </div>
 
-      {usesCloudTranscription ? (
+      {txRemote ? (
         <>
           <div className="settings-form-group">
-            <div className="settings-note warn">
-              <TriangleAlert size={14} aria-hidden="true" /> Online transcription uploads your meeting audio to{" "}
-              {(() => {
-                try { return new URL(config.transcription_base_url).host; }
-                catch { return "the provider"; }
-              })()}{" "}
-              — this is <strong>not sovereign</strong> (audio leaves your device), and{" "}
-              <strong>speaker labeling is unavailable</strong> in this mode (remote
-              audio is labeled "Them", not "Speaker 1/2"). For private, labeled
-              transcripts, use the on-device engine.
-            </div>
+            {txSelfHosted && txOwnNetwork ? (
+              <div className="settings-note info">
+                Your audio goes to the Whisper server <strong>you run</strong>
+                {txHost ? ` (${txHost})` : ""} and never to a third party — it
+                stays on your network. <strong>Speaker labeling is
+                unavailable</strong> on a remote server (its audio is labeled
+                "Them", not "Speaker 1/2").
+              </div>
+            ) : txSelfHosted ? (
+              <div className="settings-note warn">
+                <TriangleAlert size={14} aria-hidden="true" /> {txHost || "That address"} isn't
+                an address on your network — audio sent there leaves this device.
+                Point this at your own server, or switch the engine to{" "}
+                <strong>Cloud service</strong> so the warning matches what happens.{" "}
+                <strong>Speaker labeling is unavailable</strong> on a remote server
+                either way (its audio is labeled "Them", not "Speaker 1/2").
+              </div>
+            ) : (
+              <div className="settings-note warn">
+                <TriangleAlert size={14} aria-hidden="true" /> Cloud transcription uploads your meeting audio to{" "}
+                {txHost || "the provider"}{" "}
+                — this is <strong>not sovereign</strong> (audio leaves your device), and{" "}
+                <strong>speaker labeling is unavailable</strong> in this mode (remote
+                audio is labeled "Them", not "Speaker 1/2"). For private, labeled
+                transcripts, use the on-device engine.
+              </div>
+            )}
           </div>
           <div className="settings-form-group">
             <label className="settings-label" htmlFor="settings-transcription-base">Transcription Base URL</label>
@@ -384,8 +449,17 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
               value={config.transcription_base_url}
               onChange={(e) => update({ transcription_base_url: e.target.value })}
               className="settings-input-text"
-              placeholder="https://api.groq.com/openai/v1"
+              placeholder={
+                txSelfHosted
+                  ? "http://dgx.office.local:8000/v1"
+                  : "https://api.groq.com/openai/v1"
+              }
             />
+            {!config.transcription_base_url.trim() && (
+              <p className="settings-help">
+                Until this address is set, transcription runs on this computer.
+              </p>
+            )}
           </div>
           <div className="settings-form-group">
             <label className="settings-label" htmlFor="settings-transcription-model">Model</label>
@@ -399,22 +473,31 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
             />
           </div>
           <div className="settings-form-group">
-            <label className="settings-label" htmlFor="settings-transcription-key">API Key</label>
+            <label className="settings-label" htmlFor="settings-transcription-key">
+              {txSelfHosted ? "API Key (optional)" : "API Key"}
+            </label>
             <input
               id="settings-transcription-key"
               type="password"
               value={config.transcription_api_key}
               onChange={(e) => update({ transcription_api_key: e.target.value })}
               className="settings-input-text"
-              placeholder="gsk_..."
+              placeholder={txSelfHosted ? "Leave blank if not required" : "gsk_..."}
             />
-            <p className="settings-help">
-              Free key at{" "}
-              <button className="btn-link" onClick={() => open("https://console.groq.com/keys")}>
-                console.groq.com/keys
-              </button>
-              . Large v3 covers 99 languages (including Arabic).
-            </p>
+            {txSelfHosted ? (
+              <p className="settings-help">
+                Leave this blank if your server doesn't ask for one — nothing is
+                sent with the request unless a key is here.
+              </p>
+            ) : (
+              <p className="settings-help">
+                Free key at{" "}
+                <button className="btn-link" onClick={() => open("https://console.groq.com/keys")}>
+                  console.groq.com/keys
+                </button>
+                . Large v3 covers 99 languages (including Arabic).
+              </p>
+            )}
           </div>
         </>
       ) : (

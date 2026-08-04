@@ -6,23 +6,26 @@ import {
   getOnboardingState,
   getSetupStatus,
   listWhisperModels,
-  startModelDownload,
 } from "../lib/tauri";
 import {
   ENGINE_WHISPER_IDS,
+  beginModelDownload,
   downloadLabel,
   formatGb,
   isInFlight,
   isTranscriptionProfile,
+  onModelDownloadStarted,
   whisperModelId,
 } from "../lib/modelDownloads";
 
-/** Brisk while something is running, a slow heartbeat otherwise — the strip has
- *  to notice a download the user started in Settings without hammering the
- *  service for the rest of the session (which the old session-latch "fixed" by
- *  going permanently blind instead). */
+/** Brisk while something is running, a slow SAFETY heartbeat otherwise. The
+ *  `onModelDownloadStarted` bus is the primary wake signal now — every UI path
+ *  that starts a download announces it, and the strip polls the instant it
+ *  hears one. The idle heartbeat only exists to catch a download no UI action
+ *  started (e.g. resumed by the backend). It used to be 4 s, which was 96% of
+ *  the sidecar log on every idle install (35,400 lines in 13 h). */
 const POLL_ACTIVE_MS = 1_000;
-const POLL_IDLE_MS = 4_000;
+const POLL_IDLE_MS = 60_000;
 /** How long "✓ Transcription ready" stays up before the strip hides again. */
 const DONE_MS = 5_000;
 
@@ -147,9 +150,13 @@ export function SetupStatusStrip() {
     };
     poll();
     const timer = window.setInterval(poll, anyRunning ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    // A download started anywhere in the app wakes the strip NOW: the immediate
+    // poll sees it in flight, which flips anyRunning and re-arms the 1 s cadence.
+    const unsubscribe = onModelDownloadStarted(() => poll());
     return () => {
       alive = false;
       window.clearInterval(timer);
+      unsubscribe();
     };
   }, [active, watchedIds, anyRunning]);
 
@@ -191,7 +198,7 @@ export function SetupStatusStrip() {
 
   const retry = () => {
     statuses.forEach((status) => {
-      if (status.state === "error") startModelDownload(status.profile_id).catch(() => {});
+      if (status.state === "error") beginModelDownload(status.profile_id).catch(() => {});
     });
   };
 

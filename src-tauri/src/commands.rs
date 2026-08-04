@@ -96,7 +96,7 @@ const SIDECAR_HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_se
 /// Consecutive fast deaths before the watchdog stops trying. Past this the
 /// service is broken in a way restarting won't fix; the log file says why.
 const SIDECAR_MAX_FAST_DEATHS: u32 = 5;
-/// Rotate (truncate) the sidecar log once it passes this size.
+/// Rotate the sidecar log to `.old` once it passes this size.
 const SIDECAR_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Where the bundled sidecar's stdout/stderr are captured. The frozen service
@@ -104,17 +104,13 @@ const SIDECAR_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// why the 2026-07-31 Windows failure left nothing to read — a real file handle
 /// from here makes uvicorn's log flow to disk.
 fn sidecar_log_stdio() -> Option<(std::process::Stdio, std::process::Stdio)> {
-    let dir = crate::config::app_data_dir().join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("adversaria-service.log");
+    let path = sidecar_log_path()?;
     // Append across respawns — a crash loop's first death is the interesting
-    // one — but start clean once the file gets big.
-    let oversized = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > SIDECAR_LOG_MAX_BYTES);
+    // one — but once the file gets big, roll it aside and start clean.
+    rotate_oversized_sidecar_log(&path);
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .append(!oversized)
-        .truncate(oversized)
+        .append(true)
         .open(&path)
         .ok()?;
     let errors = file.try_clone().ok()?;
@@ -124,11 +120,39 @@ fn sidecar_log_stdio() -> Option<(std::process::Stdio, std::process::Stdio)> {
     ))
 }
 
+/// `logs/adversaria-service.log` under app data, creating the directory.
+fn sidecar_log_path() -> Option<std::path::PathBuf> {
+    let dir = crate::config::app_data_dir().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("adversaria-service.log"))
+}
+
+/// Cap the sidecar log: past `SIDECAR_LOG_MAX_BYTES` the current file becomes
+/// `adversaria-service.log.old` (replacing any previous `.old`). Rename, not
+/// truncate, so the previous session's tail stays readable while a launch
+/// failure is being diagnosed.
+fn rotate_oversized_sidecar_log(path: &std::path::Path) {
+    let oversized = std::fs::metadata(path).is_ok_and(|meta| meta.len() > SIDECAR_LOG_MAX_BYTES);
+    if !oversized {
+        return;
+    }
+    let old = path.with_extension("log.old");
+    // Windows can't rename onto an existing file — drop the previous `.old`.
+    let _ = std::fs::remove_file(&old);
+    if let Err(error) = std::fs::rename(path, &old) {
+        eprintln!("[sidecar] log rotation failed: {error}");
+    }
+}
+
 /// Spawn the bundled Python ML service sidecar — **packaged builds only** — and
 /// watch it for the rest of the session. In dev the bundled binary isn't
 /// present, so this is a no-op and the manually-started uvicorn service (per the
 /// dev runbook) is used instead.
 pub fn spawn_sidecar(app: &AppHandle) {
+    // A force-quit/crashed app never runs `shutdown_sidecar`, so clear any
+    // orphaned service from a previous session before starting this one's.
+    // Runs in dev too — dev orphans were the live 2026-08-02 evidence.
+    reap_stale_sidecars();
     if launch_sidecar(app).is_some() {
         spawn_sidecar_watchdog(app.clone());
     }
@@ -169,7 +193,16 @@ fn launch_sidecar(app: &AppHandle) -> Option<u16> {
         // Every platform: the hf_xet transfer backend stalls model downloads at
         // 0 bytes (LESSONS_LEARNED.md, 2026-06). The pairing that does it ships
         // on Windows too, which is where the first real user hit it.
-        .env("HF_HUB_DISABLE_XET", "1");
+        .env("HF_HUB_DISABLE_XET", "1")
+        // Parent-death guard (belt to `reap_stale_sidecars`' suspenders): with
+        // this env var set, the service watches its stdin and exits on EOF
+        // (`run_service.py`). The pipe's write end lives inside the `Child` we
+        // stash in `AppState.sidecar`, so ANY app death — crash, force-quit,
+        // SIGKILL — closes it and the child shuts itself down instead of
+        // lingering with ~1.6 GB of models loaded. Dev terminal runs don't set
+        // the var and are unaffected.
+        .env("ADVERSARIA_PARENT_GUARD", "1")
+        .stdin(std::process::Stdio::piped());
 
     // Ensure ffmpeg (mlx-whisper shells out to it) resolves. macOS-only: the
     // Windows sidecar has no ffmpeg dependency (faster-whisper decodes via the
@@ -298,6 +331,76 @@ pub fn shutdown_sidecar(state: &AppState) {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// Kill orphaned `adversaria-service` processes left behind by an app that
+/// never got to run `shutdown_sidecar` (force-quit, crash, SIGKILL) — or by a
+/// dev run of the frozen binary. Verified live 2026-08-02: four orphans
+/// (PPID 1) had each held ~1.6 GB for 22 h. Only a sidecar whose spawning
+/// parent is gone is touched; one with a living parent belongs to another
+/// running app instance.
+fn reap_stale_sidecars() {
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+    // Name and parent come with the base process listing; no per-process
+    // extras (cpu/memory/exe/cmd) are needed for the staleness decision.
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    for (pid, process) in system.processes() {
+        let name = process.name().to_string_lossy();
+        let parent = process.parent();
+        let parent_alive = parent.is_some_and(|ppid| system.process(ppid).is_some());
+        if !is_stale_sidecar(&name, parent.map(|ppid| ppid.as_u32()), parent_alive) {
+            continue;
+        }
+        if process.kill() {
+            let line = format!(
+                "{} [reaper] killed stale adversaria-service (pid {pid}, parent dead)",
+                chrono::Utc::now().to_rfc3339()
+            );
+            eprintln!("{line}");
+            append_to_sidecar_log(&line);
+        } else {
+            eprintln!("[reaper] could not kill stale adversaria-service pid {pid}");
+        }
+    }
+}
+
+/// Pure decision for `reap_stale_sidecars`: is this process a sidecar nobody
+/// owns? `parent` is the process's recorded parent PID; `parent_alive` is
+/// whether that PID is still in the process table.
+fn is_stale_sidecar(name: &str, parent: Option<u32>, parent_alive: bool) -> bool {
+    if name != "adversaria-service" && name != "adversaria-service.exe" {
+        return false;
+    }
+    match parent {
+        // Unix reparents orphans to init/launchd: PID 1 being the (alive)
+        // parent MEANS the process that spawned it is gone — nothing of ours
+        // is ever launched by PID 1 directly.
+        Some(1) => true,
+        // No parent recorded at all — nothing owns it.
+        None => true,
+        // Windows keeps the original (possibly dead) parent PID. A parent
+        // that's still alive means this is another instance's child — never
+        // touch it.
+        Some(_) => !parent_alive,
+    }
+}
+
+/// Best-effort append of one line to the sidecar log, so a reaped orphan is
+/// explained in the same file its own output went to.
+fn append_to_sidecar_log(line: &str) {
+    use std::io::Write;
+    let Some(path) = sidecar_log_path() else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -868,6 +971,7 @@ pub async fn transcribe_and_summarize(
                 category_hint: transcribe_resp.category_hint.clone(),
                 auto_template: template == "general",
                 viewer_label: configured_viewer_label(),
+                meeting_date: meeting_date_local(&meeting.recorded_at),
             })
             .await
         {
@@ -1420,6 +1524,7 @@ pub async fn transcribe_meeting(
             category_hint: transcribe_resp.category_hint.clone(),
             auto_template: meeting.template_used == "general",
             viewer_label: configured_viewer_label(),
+            meeting_date: meeting_date_local(&meeting.recorded_at),
         })
         .await
     {
@@ -1521,6 +1626,7 @@ async fn write_missing_notes(client: &HttpClient, id: i64) -> Result<(), String>
             category_hint: None,  // the stored transcript is post-bleed-strip
             auto_template: false, // keep the template the meeting was recorded with
             viewer_label: configured_viewer_label(),
+            meeting_date: meeting_date_local(&meeting.recorded_at),
         })
         .await?;
     let title = meeting_title(&summarize_resp);
@@ -1718,6 +1824,9 @@ pub async fn import_audio(
                 category_hint: transcribe_resp.category_hint.clone(),
                 auto_template: template == "general",
                 viewer_label: configured_viewer_label(),
+                // The row is written below with `recorded_at: now`, so today's
+                // date is this import's date.
+                meeting_date: Some(today_local()),
             })
             .await?;
 
@@ -1951,6 +2060,22 @@ fn meeting_title(resp: &SummarizeResponse) -> String {
     } else {
         title.to_string()
     }
+}
+
+/// A meeting's calendar date as a local `YYYY-MM-DD` string, for the
+/// summarizer's DATE CONTEXT line — without it a spoken "by Friday" cannot
+/// become a due date. Local (not UTC) so it matches the To-dos tab, which
+/// compares `due` against the local today. `None` when `recorded_at` isn't a
+/// parseable timestamp: the service then gets no date line and invents nothing.
+fn meeting_date_local(recorded_at: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(recorded_at)
+        .ok()
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string()
+        })
 }
 
 /// Derive a display title from the first meaningful line of a summary,
@@ -3006,6 +3131,7 @@ pub async fn resummarize_meeting(
             category_hint: None,  // stored transcript is already post-bleed-strip
             auto_template: false, // explicit user choice — never route
             viewer_label: configured_viewer_label(),
+            meeting_date: meeting_date_local(&meeting.recorded_at),
         })
         .await?;
     let title = meeting_title(&summarize_resp);
@@ -3082,6 +3208,7 @@ pub async fn structure_note(
             category_hint: None,
             auto_template: false, // notes are explicitly routed to brainstorm
             viewer_label: configured_viewer_label(),
+            meeting_date: meeting_date_local(&note.recorded_at),
         })
         .await?;
 
@@ -4431,6 +4558,7 @@ pub async fn test_local_setup(state: State<'_, AppState>) -> Result<String, Stri
             category_hint: Some("meeting".to_string()),
             auto_template: false,
             viewer_label: None,
+            meeting_date: None, // a connectivity smoke test — no date context needed
         })
         .await?;
     if response.summary.trim().is_empty() || response.title.trim().is_empty() {
@@ -4469,6 +4597,7 @@ pub async fn test_cloud_setup(
             category_hint: Some("meeting".to_string()),
             auto_template: false,
             viewer_label: None,
+            meeting_date: None, // a connectivity smoke test — no date context needed
         })
         .await?;
     if response.summary.trim().is_empty() || response.title.trim().is_empty() {
@@ -5106,6 +5235,73 @@ mod tests {
     fn mic_path_for_rejects_non_wav() {
         assert_eq!(mic_path_for("/data/recordings/meeting_123"), None);
         assert_eq!(mic_path_for("notes.txt"), None);
+    }
+
+    #[test]
+    fn stale_sidecar_needs_a_name_match_and_a_dead_parent() {
+        // The live 2026-08-02 case: orphans reparented to launchd (PPID 1).
+        assert!(is_stale_sidecar("adversaria-service", Some(1), true));
+        // Windows spelling, original parent PID gone from the process table.
+        assert!(is_stale_sidecar(
+            "adversaria-service.exe",
+            Some(4242),
+            false
+        ));
+        // No parent recorded at all — nothing owns it.
+        assert!(is_stale_sidecar("adversaria-service", None, false));
+    }
+
+    #[test]
+    fn sidecar_with_a_living_parent_is_never_reaped() {
+        // Another running app instance's child, or a dev terminal's.
+        assert!(!is_stale_sidecar("adversaria-service", Some(4242), true));
+        assert!(!is_stale_sidecar(
+            "adversaria-service.exe",
+            Some(4242),
+            true
+        ));
+    }
+
+    #[test]
+    fn non_sidecar_names_are_never_reaped_however_dead_the_parent() {
+        assert!(!is_stale_sidecar("uvicorn", Some(1), true));
+        assert!(!is_stale_sidecar("adversaria-serv", None, false));
+        assert!(!is_stale_sidecar("meeting-note-taker", Some(1), true));
+        assert!(!is_stale_sidecar("", None, false));
+    }
+
+    #[test]
+    fn oversized_sidecar_log_rotates_to_old_replacing_the_previous_old() {
+        let dir = std::env::temp_dir().join(format!("adversaria-log-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adversaria-service.log");
+        let old_path = dir.join("adversaria-service.log.old");
+        std::fs::write(&path, vec![b'x'; (SIDECAR_LOG_MAX_BYTES + 1) as usize]).unwrap();
+        std::fs::write(&old_path, b"previous rotation").unwrap();
+
+        rotate_oversized_sidecar_log(&path);
+
+        assert!(!path.exists(), "oversized log must be moved aside");
+        assert_eq!(
+            std::fs::metadata(&old_path).unwrap().len(),
+            SIDECAR_LOG_MAX_BYTES + 1,
+            ".old must now be the rotated file, not the previous .old"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn small_sidecar_log_is_left_in_place() {
+        let dir = std::env::temp_dir().join(format!("adversaria-log-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adversaria-service.log");
+        std::fs::write(&path, b"short").unwrap();
+
+        rotate_oversized_sidecar_log(&path);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        assert!(!dir.join("adversaria-service.log.old").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

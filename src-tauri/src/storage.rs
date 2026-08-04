@@ -1625,9 +1625,10 @@ struct ActionItemRaw {
 
 /// Extract action items the way the UI's `parseSummary` (lib/summary.ts) does:
 /// bullets under a `**Heading**` whose title matches action/next-step/deliverable.
-/// A bullet may lead with an assignee label, e.g. `- Hamza: do the thing`.
-/// The local LLM emits neither checkboxes nor due dates, so `due` is empty and
-/// `done` starts false (it is toggled later via the action_items table).
+/// A bullet may lead with an assignee label, e.g. `- Hamza: do the thing`, and
+/// may end with a due marker, e.g. `- Ship it — due 2026-08-07` (see
+/// `split_due`). `done` starts false (it is toggled later via the
+/// action_items table).
 fn extract_action_items(summary: &str) -> Vec<ActionItemRaw> {
     let re_heading = regex::Regex::new(r"^\*\*(.+?)\*\*:?$").unwrap();
     let re_bullet = regex::Regex::new(r"^[-*•]\s+(.*)$").unwrap();
@@ -1656,7 +1657,13 @@ fn extract_action_items(summary: &str) -> Vec<ActionItemRaw> {
             continue;
         }
         if let Some(c) = re_bullet.captures(trimmed) {
-            let (assignee, text) = split_label(c[1].trim());
+            // Due marker FIRST: `split_label` grabs any `word: ` prefix within
+            // 48 chars, so on an owner-less bullet ("Ship the installer due:
+            // 2026-08-07") it would claim "Ship the installer due" as the
+            // assignee and leave the bare date as the task. Stripping the due
+            // marker first leaves `split_label` only a real owner to find.
+            let (body, due) = split_due(c[1].trim());
+            let (assignee, text) = split_label(&body);
             // Skip placeholder bullets ("None mentioned." / "None" / "لا يوجد") and empties.
             let norm = text.trim_end_matches('.').trim().to_lowercase();
             if text.is_empty() || norm == "none mentioned" || norm == "none" || norm == "لا يوجد"
@@ -1667,7 +1674,7 @@ fn extract_action_items(summary: &str) -> Vec<ActionItemRaw> {
                 ord: items.len() as i64,
                 text,
                 assignee,
-                due: String::new(),
+                due,
                 done: false,
             });
         }
@@ -1696,9 +1703,42 @@ fn split_label(text: &str) -> (String, String) {
     (String::new(), text.trim().to_string())
 }
 
+/// Split a trailing due marker off an action bullet, returning the bullet text
+/// without it plus the ISO date. The general template emits `… — due
+/// 2026-08-07`; models drift, so an en dash / plain hyphen, a `due:` colon, and
+/// a parenthesized `(due 2026-08-07)` are all accepted. Only a REAL calendar
+/// date in `YYYY-MM-DD` is taken — the To-dos tab string-compares `due` against
+/// today, so a bogus value is worse than none and stays part of the text.
+/// Mirrors `splitDue` in src/lib/summary.ts — keep the two in sync.
+fn split_due(text: &str) -> (String, String) {
+    // The separator before "due" is OPTIONAL. The template emits the em-dash
+    // form, but a local LLM drifts to "due: 2026-08-07" with no dash — and that
+    // form used to fall through to `split_label`, which claimed everything up
+    // to the colon as the assignee and left the bare date as the task text
+    // (2026-08-03 review). `\bdue\b` keeps "overdue"/"subdued" out.
+    let re_due = regex::Regex::new(
+        r"(?i)\s*(?:[-–—]\s*)?\(?\s*\bdue\b\s*:?\s*(\d{4}-\d{2}-\d{2})\s*\)?\s*\.?$",
+    )
+    .unwrap();
+    let unchanged = || (text.trim().to_string(), String::new());
+    let Some(c) = re_due.captures(text) else {
+        return unchanged();
+    };
+    let (Some(whole), Some(date)) = (c.get(0), c.get(1)) else {
+        return unchanged();
+    };
+    if chrono::NaiveDate::parse_from_str(date.as_str(), "%Y-%m-%d").is_err() {
+        return unchanged();
+    }
+    (
+        text[..whole.start()].trim().to_string(),
+        date.as_str().to_string(),
+    )
+}
+
 #[cfg(test)]
 mod action_item_tests {
-    use super::extract_action_items;
+    use super::{extract_action_items, merge_due};
 
     #[test]
     fn extracts_real_summary_format() {
@@ -1741,6 +1781,130 @@ mod action_item_tests {
             assert_eq!(items[0].text, "Build the thing.");
         }
     }
+
+    #[test]
+    fn bullet_without_a_due_marker_is_untouched() {
+        let s = "**Action Items**\n- Hamza: Export the notes.";
+        let items = extract_action_items(s);
+        assert_eq!(items[0].text, "Export the notes.");
+        assert_eq!(items[0].due, "");
+    }
+
+    #[test]
+    fn parses_every_accepted_due_spelling() {
+        // The template emits the em-dash form; models drift to the rest.
+        for marker in [
+            "— due 2026-08-07",
+            "– due 2026-08-07",
+            "- due 2026-08-07",
+            "- due: 2026-08-07",
+            "(due 2026-08-07)",
+            "(due: 2026-08-07)",
+            "— Due 2026-08-07",
+            "— due 2026-08-07.",
+        ] {
+            let s = format!("**Action Items**\n- Hamza: Export the notes {marker}");
+            let items = extract_action_items(&s);
+            assert_eq!(items.len(), 1, "marker {marker:?}");
+            assert_eq!(items[0].due, "2026-08-07", "marker {marker:?}");
+            assert_eq!(items[0].text, "Export the notes", "marker {marker:?}");
+            assert_eq!(items[0].assignee, "Hamza", "marker {marker:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_due_dates_stay_in_the_text() {
+        // Never store a value the To-dos tab would string-compare as a date.
+        for marker in [
+            "— due 2026-13-45",     // shaped right, not a real calendar date
+            "— due Friday",         // unresolved relative date
+            "— due 08/07/2026",     // wrong format
+            "— due 2026-8-7",       // unpadded
+            "— duedate 2026-08-07", // not the marker word
+        ] {
+            let s = format!("**Action Items**\n- Ship the build {marker}");
+            let items = extract_action_items(&s);
+            assert_eq!(items.len(), 1, "marker {marker:?}");
+            assert_eq!(
+                items[0].due, "",
+                "marker {marker:?} must not become a due date"
+            );
+            assert_eq!(
+                items[0].text,
+                format!("Ship the build {marker}"),
+                "marker {marker:?} stays part of the text"
+            );
+        }
+    }
+
+    #[test]
+    fn due_marker_in_a_non_actionable_section_is_ignored() {
+        let s = "**Decisions Made**\n- We ship the beta — due 2026-08-07.\n**Action Items**\n- Ship the beta — due 2026-08-09";
+        let items = extract_action_items(s);
+        assert_eq!(items.len(), 1, "only the actionable section yields items");
+        assert_eq!(items[0].text, "Ship the beta");
+        assert_eq!(items[0].due, "2026-08-09");
+    }
+
+    #[test]
+    fn resync_never_overrides_the_stored_due() {
+        assert_eq!(
+            merge_due("2026-09-01"),
+            "2026-09-01",
+            "a user-set due is never overwritten"
+        );
+        // Regression (2026-08-03 review): a deadline the user CLEARED in the
+        // To-dos tab must stay cleared. Refilling it from the summary silently
+        // undid an explicit user action on every re-summarize.
+        assert_eq!(
+            merge_due(""),
+            "",
+            "a deliberately cleared due stays cleared"
+        );
+        assert_eq!(merge_due("  "), "  ", "whitespace is the user's value too");
+    }
+
+    #[test]
+    fn a_due_marker_survives_a_bullet_with_no_owner() {
+        // Regression (2026-08-03 review): `split_label` ran first and claimed
+        // "Ship the installer due" as the assignee, leaving the bare date as
+        // the task text.
+        let s = "**Action Items**\n- Ship the installer due: 2026-08-07";
+        let items = extract_action_items(s);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].assignee, "", "no owner was written on that bullet");
+        assert_eq!(items[0].text, "Ship the installer");
+        assert_eq!(items[0].due, "2026-08-07");
+    }
+
+    #[test]
+    fn an_owner_and_a_due_marker_coexist() {
+        let s = "**Action Items**\n- Hamza: Ship the installer — due 2026-08-07";
+        let items = extract_action_items(s);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].assignee, "Hamza");
+        assert_eq!(items[0].text, "Ship the installer");
+        assert_eq!(items[0].due, "2026-08-07");
+    }
+}
+
+/// The due date to keep when re-syncing an action item whose text is unchanged.
+/// A stored value always wins — it may be a user edit — but an EMPTY one is
+/// nothing to protect, so a date freshly parsed out of the summary comes
+/// through. Without this, meetings summarized before the template emitted due
+/// dates would keep their blank `due` forever, even after a re-summarize.
+/// The due date to keep for an action item that ALREADY EXISTED and whose text
+/// still matches — i.e. one the user has had the chance to edit.
+///
+/// The stored value always wins, **including an empty one**. Treating empty as
+/// "nothing to protect" meant a deadline the user deliberately cleared in the
+/// To-dos tab came back on the next re-summarize (2026-08-03 review, reproduced
+/// end-to-end). Known consequence, accepted: an item extracted before this
+/// feature existed keeps its blank date through a re-summarize — visible and
+/// harmless, unlike silently overriding an explicit user action. A genuinely
+/// new item is not routed here at all; it takes the date the summary produced.
+fn merge_due(old_due: &str) -> String {
+    old_due.to_string()
 }
 
 /// Sync action_items for a meeting from its current summary. Deletes existing
@@ -1783,7 +1947,7 @@ pub fn sync_action_items(conn: &Connection, meeting_id: i64, summary: &str) -> a
             .get(&item.ord)
             .filter(|(_, old_text, _, _)| old_text == &item.text)
             .map(|(old_done, _, old_assignee, old_due)| {
-                (*old_done, old_assignee.clone(), old_due.clone())
+                (*old_done, old_assignee.clone(), merge_due(old_due))
             })
             .unwrap_or_else(|| (item.done, item.assignee.clone(), item.due.clone()));
         conn.execute(

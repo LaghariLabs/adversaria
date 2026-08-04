@@ -220,6 +220,12 @@ pub struct SummarizeParams {
     pub auto_template: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewer_label: Option<String>,
+    /// The recording's calendar date as `YYYY-MM-DD`, so the summarizer can
+    /// resolve a spoken "by Friday" into a real due date. Omitted from the wire
+    /// when `None` — an older service ignores the field, and a newer service
+    /// treats its absence as "no date context" (no dates are invented).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meeting_date: Option<String>,
 }
 
 /// Typed client for the Python ML service running on localhost.

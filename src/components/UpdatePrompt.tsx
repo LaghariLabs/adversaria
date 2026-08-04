@@ -4,6 +4,9 @@ import { relaunch } from "@tauri-apps/plugin-process";
 
 type Phase = "available" | "downloading" | "installing" | "error";
 
+/** An always-running app misses launch-only checks for days — re-check on a slow cadence. */
+export const RECHECK_MS = 6 * 60 * 60 * 1000;
+
 interface UpdatePromptProps {
   enabled?: boolean;
   checkForUpdate?: typeof check;
@@ -12,9 +15,10 @@ interface UpdatePromptProps {
 
 /**
  * Auto-update prompt. On launch (production builds only) it quietly checks the
- * release endpoint; if a newer signed version exists it shows a small toast with
- * the version + release notes and an Install button that downloads, installs, and
- * relaunches. Any failure to check (dev build, offline, no release yet) is silent.
+ * release endpoint, then re-checks every 6 hours until an update is found; if a
+ * newer signed version exists it shows a small toast with the version + release
+ * notes and an Install button that downloads, installs, and relaunches. Any
+ * failure to check (dev build, offline, no release yet) is silent.
  */
 export function UpdatePrompt({
   enabled = import.meta.env.PROD,
@@ -31,16 +35,30 @@ export function UpdatePrompt({
     // Only the packaged app has a signing key + endpoint; skip in `tauri dev`.
     if (!enabled) return;
     let cancelled = false;
-    (async () => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const stopRechecking = () => {
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const runCheck = async () => {
       try {
         const u = await checkForUpdate();
-        if (!cancelled && u) setUpdate(u);
+        if (!cancelled && u) {
+          setUpdate(u);
+          // The toast is up — nothing to gain from checking again.
+          stopRechecking();
+        }
       } catch {
         // No endpoint / offline / no release yet — silently ignore.
       }
-    })();
+    };
+    void runCheck();
+    timer = setInterval(() => void runCheck(), RECHECK_MS);
     return () => {
       cancelled = true;
+      stopRechecking();
     };
   }, [checkForUpdate, enabled]);
 

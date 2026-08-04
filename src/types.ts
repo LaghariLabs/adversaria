@@ -183,6 +183,72 @@ export type PromptTemplate = string;
 /** Summary output language: English, Arabic, or "match the spoken language". */
 export type SummaryLanguage = "en" | "ar" | "auto";
 
+/** Where transcription runs: on this device, on a Whisper server the user runs
+ *  (audio stays on their network), or on a provider's cloud API. */
+export type TranscriptionProvider = "local" | "self_hosted" | "cloud";
+
+/** Which engine a transcription base URL implies — the TypeScript mirror of
+ *  `classify_transcription_provider` (src-tauri/src/config.rs:86), kept rule
+ *  for rule with it.
+ *
+ *  The UI must never claim "your own server, on your network" because a
+ *  dropdown says `self_hosted`: only the host says where the audio actually
+ *  goes. Blank → `"local"`; loopback, an RFC 1918 range, a `.local`/`.internal`
+ *  suffix or a bare single-label host → `"self_hosted"`; anything else —
+ *  including a URL we can't read a host out of — → `"cloud"`, the conservative
+ *  side, since cloud is the mode whose copy warns that audio leaves the device. */
+export function classifyTranscriptionProvider(baseUrl: string): TranscriptionProvider {
+  const url = baseUrl.trim();
+  if (url === "") return "local";
+  const host = hostOf(url);
+  return host !== "" && isPrivateHost(host) ? "self_hosted" : "cloud";
+}
+
+/** Best-effort host extraction — scheme, path, userinfo and port stripped.
+ *  `""` when no plausible host can be read (malformed URL). */
+function hostOf(url: string): string {
+  const scheme = url.indexOf("://");
+  const afterScheme = scheme === -1 ? url : url.slice(scheme + 3);
+  const authority = afterScheme.split(/[/?#]/)[0];
+  const at = authority.lastIndexOf("@");
+  const hostPort = at === -1 ? authority : authority.slice(at + 1);
+  let host: string;
+  if (hostPort.startsWith("[")) {
+    const end = hostPort.indexOf("]"); // [::1]:8000
+    if (end === -1) return "";
+    host = hostPort.slice(1, end);
+  } else if ((hostPort.match(/:/g) ?? []).length > 1) {
+    host = hostPort; // bare IPv6 literal, e.g. ::1
+  } else {
+    host = hostPort.split(":")[0];
+  }
+  if (host === "" || /\s/.test(host)) return "";
+  return host.toLowerCase();
+}
+
+/** Whether a host names a machine on the user's own network. */
+function isPrivateHost(host: string): boolean {
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const octets = v4.slice(1).map(Number);
+    // Not a valid address at all — Rust's parse fails here too, and a
+    // dotted name is never private.
+    if (octets.some((octet) => octet > 255)) return false;
+    const [a, b] = octets;
+    return (
+      a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+    );
+  }
+  // Only loopback counts for IPv6, exactly as `Ipv6Addr::is_loopback` does.
+  if (host.includes(":")) return host === "::1" || /^(0+:){7}0*1$/.test(host);
+  return (
+    host === "localhost" ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    !host.includes(".")
+  );
+}
+
 export interface WhisperModelInfo {
   key: string;
   label: string;
@@ -207,6 +273,9 @@ export interface AppConfig {
   llm_provider: string;
   llm_base_url: string;
   llm_api_key: string;
+  /** Which transcription engine Settings is configured for. Older configs are
+   *  classified from `transcription_base_url` when Rust loads them. */
+  transcription_provider: TranscriptionProvider;
   transcription_base_url: string;
   transcription_api_key: string;
   transcription_model: string;

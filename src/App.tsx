@@ -632,7 +632,7 @@ function App() {
 
   return (
     <div className={`h-screen flex flex-col${companionActive ? " companion-mode" : ""}`}>
-      <Welcome onOpenModelSettings={openModelSettings} />
+      <Welcome onOpenModelSettings={openModelSettings} transcriptionSetup={transcription} />
       <SetupStatusStrip />
       <GuidedTour
         currentView={view}

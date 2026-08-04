@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 from contextlib import asynccontextmanager
 
@@ -226,6 +227,70 @@ def _on_model_download_ready(profile_id: str) -> None:
         _init_transcriber(wait=True)
 
 
+class _ModelDownloadPollFilter(logging.Filter):
+    """Drop successful GET /setup/model_download/* polls from the access log.
+
+    The setup status strip polls these endpoints for the whole session —
+    measured 2026-08-02 at 96% of sidecar-log lines (3.3 MB/13 h). Only 2xx
+    GETs are dropped; errors and non-GET requests still log. Uvicorn 0.49.0
+    access records (h11_impl.py:481 / httptools_impl.py:484) carry
+    ``args = (client_addr, method, path_with_query, http_version, status)``
+    with an int status; anything shaped differently passes through untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) != 5:
+            return True
+        _, method, path, _, status = args
+        return not (
+            method == "GET"
+            and str(path).startswith("/setup/model_download/")
+            and isinstance(status, int)
+            and 200 <= status < 300
+        )
+
+
+#: Module-level singleton: logging.Filterer.addFilter skips an already-added
+#: instance, so repeated lifespans never stack duplicate filters.
+_ACCESS_LOG_POLL_FILTER = _ModelDownloadPollFilter()
+
+
+def _parent_guard_enabled() -> bool:
+    """True when the desktop app spawned this service with the parent-death
+    guard armed (ADVERSARIA_PARENT_GUARD=1, stdin piped from the app). Dev runs
+    (`uv run uvicorn src.server:app` in a terminal) leave it unset, so the
+    guard thread never consumes an interactive stdin."""
+    return os.environ.get("ADVERSARIA_PARENT_GUARD") == "1"
+
+
+def _watch_parent_stdin() -> None:
+    """Block until stdin hits EOF — the parent app is gone — then hard-exit.
+
+    EOF on the inherited stdin pipe means the desktop app died (crash /
+    force-quit) without POSTing /shutdown. os._exit skips graceful teardown on
+    purpose: nothing here is worth flushing compared to not leaking a ~1.6 GB
+    orphaned sidecar (four found resident on 2026-08-02).
+    """
+    try:
+        sys.stdin.buffer.read()
+    except Exception:
+        pass  # a broken stdin pipe is treated the same as parent death
+    logger.info("Parent process closed stdin — exiting sidecar.")
+    os._exit(0)
+
+
+def install_parent_guard() -> bool:
+    """Start the parent-death watchdog when armed; report whether it started
+    (always False in dev, where ADVERSARIA_PARENT_GUARD is unset)."""
+    if not _parent_guard_enabled():
+        return False
+    threading.Thread(
+        target=_watch_parent_stdin, name="parent-guard", daemon=True
+    ).start()
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and teardown the ML service singletons.
@@ -236,6 +301,8 @@ async def lifespan(app: FastAPI):
     """
     global _transcriber, _live_transcriber, _summarizer, _embedder
     logger.info("Starting ML service lifespan...")
+    logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_POLL_FILTER)
+    install_parent_guard()
     on_download_ready(_on_model_download_ready)
     threading.Thread(
         target=_init_transcriber, name="transcriber-init", daemon=True
@@ -730,6 +797,7 @@ def summarize(request: SummarizeRequest) -> SummarizeResponse:
             category_hint=request.category_hint,
             auto_template=request.auto_template,
             viewer_label=request.viewer_label,
+            meeting_date=request.meeting_date,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

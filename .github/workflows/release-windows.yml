@@ -123,9 +123,19 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: adversaria-windows-${{ inputs.channel }}-${{ github.sha }}
+          # `createUpdaterArtifacts: true` (tauri.conf.json) re-uses the NSIS
+          # installer AS the update bundle, so the updater pair is
+          # `-setup.exe` + `-setup.exe.sig`. The `.nsis.zip` shape this used to
+          # collect belongs to `"v1Compatible"` and is never produced here —
+          # the .sig that scripts/publish-release.sh needs for the
+          # windows-x86_64 manifest entry was silently not being uploaded
+          # (2026-08-03). The .sig only exists when this repo holds the signing
+          # key, so `warn` — NOT `error`: keyless runs legitimately produce the
+          # exe alone, and the release machine can sign it afterwards with
+          # `npx tauri signer sign <exe>` using the same key the app pins.
+          # (The build step above already fails if no installer was produced.)
           path: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
-            src-tauri/target/release/bundle/nsis/*-setup.nsis.zip
-            src-tauri/target/release/bundle/nsis/*-setup.nsis.zip.sig
-          if-no-files-found: error
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+          if-no-files-found: warn
           retention-days: 14

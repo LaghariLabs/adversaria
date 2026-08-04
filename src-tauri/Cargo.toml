@@ -1,6 +1,6 @@
 [package]
 name = "meeting-note-taker"
-version = "0.3.70"
+version = "0.3.71"
 edition = "2021"
 
 [lib]
