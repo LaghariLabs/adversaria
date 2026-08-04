@@ -52,11 +52,78 @@ pub fn load_config() -> AppConfig {
     if path.exists() {
         std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| parse_config(&s))
             .unwrap_or_default()
     } else {
         AppConfig::default()
     }
+}
+
+/// Parse `config.json`, filling in `transcription_provider` for configs written
+/// before that field existed (absent, or blank). Nothing is rewritten to disk —
+/// the value is derived on every load until the user saves from Settings.
+fn parse_config(json: &str) -> Option<AppConfig> {
+    let mut config: AppConfig = serde_json::from_str(json).ok()?;
+    if config.transcription_provider.trim().is_empty() {
+        config.transcription_provider =
+            classify_transcription_provider(&config.transcription_base_url).to_string();
+    }
+    Some(config)
+}
+
+/// Which transcription engine a saved `transcription_base_url` implies:
+/// `"local"`, `"self_hosted"`, or `"cloud"`.
+///
+/// - empty / whitespace → `"local"` (on-device Whisper)
+/// - loopback (`127.0.0.1`, `::1`, `localhost`), an RFC 1918 private range
+///   (10.x, 172.16–31.x, 192.168.x), a `.local`/`.internal` suffix, or a bare
+///   single-label host (`dgx:8000`) → `"self_hosted"`
+/// - anything else → `"cloud"`
+///
+/// A URL we can't read a host out of also classifies as `"cloud"`: that is the
+/// conservative side, since cloud is the only mode whose copy warns that audio
+/// leaves the device.
+pub fn classify_transcription_provider(base_url: &str) -> &'static str {
+    if base_url.trim().is_empty() {
+        return "local";
+    }
+    match host_of(base_url.trim()) {
+        Some(host) if is_private_host(&host) => "self_hosted",
+        _ => "cloud",
+    }
+}
+
+/// Best-effort host extraction — scheme, path, userinfo and port stripped.
+/// `None` when no plausible host can be read (malformed URL).
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map(|(h, _)| h)? // [::1]:8000
+    } else if authority.matches(':').count() > 1 {
+        authority // bare IPv6 literal, e.g. ::1
+    } else {
+        authority.split_once(':').map_or(authority, |(h, _)| h)
+    };
+    if host.is_empty() || host.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// Whether a host names a machine on the user's own network.
+fn is_private_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+    host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || !host.contains('.')
 }
 
 /// Persist `AppConfig` to disk as pretty-printed JSON.
@@ -106,6 +173,7 @@ impl Default for AppConfig {
             llm_base_url: String::new(),
             llm_api_key: String::new(),
             calendar: CalendarConfig::default(),
+            transcription_provider: "local".to_string(),
             transcription_base_url: String::new(),
             transcription_api_key: String::new(),
             transcription_model: "whisper-large-v3".to_string(),
@@ -144,4 +212,157 @@ fn default_llm_model() -> String {
 #[cfg(not(target_os = "macos"))]
 fn default_llm_model() -> String {
     "qwen3.6:35b-a3b".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_all(urls: &[&str], expected: &str) {
+        for url in urls {
+            assert_eq!(classify_transcription_provider(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn no_endpoint_is_local() {
+        assert_all(&["", "   ", "\n\t"], "local");
+    }
+
+    #[test]
+    fn loopback_is_self_hosted() {
+        assert_all(
+            &[
+                "127.0.0.1",
+                "http://127.0.0.1:8000/v1",
+                "https://127.0.0.1/v1",
+                "http://127.1.2.3:9000",
+                "localhost",
+                "http://localhost:8000/v1",
+                "::1",
+                "http://[::1]:8000/v1",
+            ],
+            "self_hosted",
+        );
+    }
+
+    #[test]
+    fn private_ranges_are_self_hosted() {
+        assert_all(
+            &[
+                "http://10.0.0.5:8000/v1",
+                "http://192.168.1.40/v1",
+                "http://172.16.0.1:8000/v1",
+                "http://172.31.255.254:8000/v1",
+            ],
+            "self_hosted",
+        );
+    }
+
+    #[test]
+    fn addresses_outside_the_private_ranges_are_cloud() {
+        assert_all(
+            &[
+                "http://172.15.0.1:8000/v1",
+                "http://172.32.0.1:8000/v1",
+                "http://8.8.8.8:8000/v1",
+            ],
+            "cloud",
+        );
+    }
+
+    #[test]
+    fn lan_hostnames_are_self_hosted() {
+        assert_all(
+            &[
+                "http://dgx.office.local:8000/v1",
+                "https://whisper.corp.internal/v1",
+                "dgx:8000",
+                "http://dgx/v1",
+                "http://key@dgx.office.local:8000/v1",
+            ],
+            "self_hosted",
+        );
+    }
+
+    #[test]
+    fn public_providers_are_cloud() {
+        assert_all(
+            &[
+                "https://api.groq.com/openai/v1",
+                "https://api.openai.com/v1",
+                "https://api.groq.com:443/openai/v1",
+            ],
+            "cloud",
+        );
+    }
+
+    /// A URL we can't parse must not panic, and must land on the mode whose UI
+    /// copy warns that audio leaves the device.
+    #[test]
+    fn malformed_urls_fall_back_to_cloud() {
+        assert_all(
+            &[
+                "http://",
+                "://",
+                "http:///v1",
+                "http://[::1",
+                "not a url",
+                "http:// spaced.host/v1",
+                "@",
+            ],
+            "cloud",
+        );
+    }
+
+    #[test]
+    fn config_without_the_provider_field_classifies_from_its_url() {
+        // Hamza's own config: no endpoint (a leftover key doesn't make it cloud).
+        let legacy = r#"{
+            "python_service_url": "http://127.0.0.1:9876",
+            "default_prompt_template": "general",
+            "auto_detect_meetings": true,
+            "ollama_model": "qwen3.6-27b",
+            "claude_api_key": null,
+            "transcription_base_url": "",
+            "transcription_api_key": "gsk_secret"
+        }"#;
+        let config = parse_config(legacy).expect("legacy config must still parse");
+        assert_eq!(config.transcription_provider, "local");
+        assert_eq!(config.whisper_model, crate::types::default_whisper_model());
+
+        let office = legacy.replace(
+            r#""transcription_base_url": """#,
+            r#""transcription_base_url": "http://dgx.office.local:8000/v1""#,
+        );
+        assert_eq!(
+            parse_config(&office).unwrap().transcription_provider,
+            "self_hosted"
+        );
+
+        let groq = legacy.replace(
+            r#""transcription_base_url": """#,
+            r#""transcription_base_url": "https://api.groq.com/openai/v1""#,
+        );
+        assert_eq!(parse_config(&groq).unwrap().transcription_provider, "cloud");
+    }
+
+    #[test]
+    fn an_explicit_provider_survives_the_migration() {
+        let saved = r#"{
+            "python_service_url": "http://127.0.0.1:9876",
+            "default_prompt_template": "general",
+            "auto_detect_meetings": true,
+            "ollama_model": "qwen3.6-27b",
+            "claude_api_key": null,
+            "transcription_provider": "cloud",
+            "transcription_base_url": "http://dgx.office.local:8000/v1"
+        }"#;
+        assert_eq!(parse_config(saved).unwrap().transcription_provider, "cloud");
+    }
+
+    #[test]
+    fn a_fresh_config_is_local() {
+        assert_eq!(AppConfig::default().transcription_provider, "local");
+    }
 }

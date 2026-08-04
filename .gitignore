@@ -88,3 +88,10 @@ video/
 # HyperFrames render output (large binaries; source lives in marketing/*/index.html)
 marketing/product-demo/renders/
 marketing/product-demo/snapshots/
+
+# Hamza's local design working area — the deployed copies live in lagharilabs-website
+design-artifacts/
+
+# Prompt-template ownership record + seeding backups (per-install, never source)
+python-service/prompts/_user_templates.json
+python-service/prompts/*.bak-*.md

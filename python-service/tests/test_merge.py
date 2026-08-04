@@ -378,6 +378,156 @@ class TestStripGlossaryEcho:
         assert self._keep(mic, voiced) == [(5.0, 9.0, "kept line")]
 
 
+class TestApplyVocabularyCorrections:
+    """Deterministic vocabulary near-miss correction: prompt bias alone let
+    "Adversaria" transcribe as "Adverse Area" (meetings 217-219, 2026-08-02) —
+    near-misses of vocabulary terms are rewritten to the user's term in post."""
+
+    PROMPT = "Glossary: Adversaria"
+
+    def _fix(self, segments, prompt=None):
+        from src.transcriber import apply_vocabulary_corrections
+
+        return apply_vocabulary_corrections(segments, prompt)
+
+    def _one(self, text, prompt):
+        return self._fix([(0.0, 2.0, text)], prompt)[0][2]
+
+    def test_live_near_miss_corrected(self):
+        assert (
+            self._one("Welcome to Adverse Area, the most advanced note taker.", self.PROMPT)
+            == "Welcome to Adversaria, the most advanced note taker."
+        )
+
+    def test_standalone_adverse_never_matches(self):
+        assert self._one("adverse conditions ahead", self.PROMPT) == "adverse conditions ahead"
+        assert self._one("an adverse reaction", self.PROMPT) == "an adverse reaction"
+
+    def test_exact_match_casing_rewritten(self):
+        assert self._one("welcome to adversaria", self.PROMPT) == "welcome to Adversaria"
+
+    def test_no_vocabulary_passthrough(self):
+        seg = [(0.0, 2.0, "Welcome to Adverse Area.")]
+        assert self._fix(seg, None) == seg
+        assert self._fix(seg, "") == seg
+
+    def test_term_absent_text_untouched(self):
+        text = "Welcome to Adverse Area."
+        assert self._one(text, "Glossary: Tatweer OS") == text
+
+    def test_idempotent(self):
+        once = self._one(
+            "Welcome to Adverse Area, the most advanced note taker.", self.PROMPT
+        )
+        assert self._one(once, self.PROMPT) == once
+
+    def test_short_term_skips_fuzzy_but_fixes_casing(self):
+        # "Hira" normalizes to 4 chars (< 6): fuzzy is off ("Hera" stays), but
+        # the case-insensitive exact match still gets the user's casing.
+        assert self._one("I met hira yesterday", "Glossary: Hira") == "I met Hira yesterday"
+        assert self._one("I met Hera yesterday", "Glossary: Hira") == "I met Hera yesterday"
+
+    def test_multi_word_term_window(self):
+        assert (
+            self._one("so Tatveer OS organizes everything", "Glossary: Tatweer OS, Claude")
+            == "so Tatweer OS organizes everything"
+        )
+
+    def test_window_never_swallows_following_word(self):
+        # The +1-word window must not absorb "area": the length bound rejects it.
+        assert self._one("Adversaria area of work", self.PROMPT) == "Adversaria area of work"
+
+    def test_punctuation_adjacency_preserved(self):
+        assert self._one("(adverse area)", self.PROMPT) == "(Adversaria)"
+        assert self._one("try adversaria.", self.PROMPT) == "try Adversaria."
+
+    def test_timestamps_preserved(self):
+        result = self._fix([(1.5, 4.0, "Adverse Area rocks")], self.PROMPT)
+        assert result == [(1.5, 4.0, "Adversaria rocks")]
+
+    def test_follower_words_survive_exact_term(self):
+        # Regression (2026-08-02 review): the +1-word fuzzy window used to
+        # outrank the exact match and swallow a short follower ("Adversaria is"
+        # -> "Adversaria"). Exact matches now win at every window size.
+        for text in (
+            "Adversaria is ready.",
+            "Adversaria, I think, is great.",
+            "We tried Adversaria on Monday.",
+        ):
+            assert self._one(text, self.PROMPT) == text
+        assert (
+            self._one("Tatweer OS is nice", "Glossary: Tatweer OS") == "Tatweer OS is nice"
+        )
+
+    def test_possessive_suffix_preserved(self):
+        # "'s" is peeled off the window and re-attached, never fuzzy-eaten.
+        text = "Adversaria's summary was good."
+        assert self._one(text, self.PROMPT) == text
+        assert (
+            self._one("adversaria's launch was smooth", self.PROMPT)
+            == "Adversaria's launch was smooth"
+        )
+
+    def test_near_miss_with_follower_keeps_follower(self):
+        # Fuzzy tries the term's natural window shape first, so a 1-word
+        # near-miss never drags the next word into its window.
+        assert self._one("Adversario is great", self.PROMPT) == "Adversaria is great"
+
+    def test_lowercase_entry_never_downgrades_casing(self):
+        # Regression (2026-08-02 review): an all-lowercase vocabulary entry
+        # (Hamza's live config) used to rewrite correct "Adversaria" to
+        # "adversaria". No casing signal -> correct text stays untouched.
+        assert (
+            self._one("Adversaria launched today.", "Glossary: adversaria")
+            == "Adversaria launched today."
+        )
+        assert (
+            self._one("Hira joined the call.", "Glossary: hira") == "Hira joined the call."
+        )
+
+    def test_lowercase_entry_still_corrects_near_misses(self):
+        # Fuzzy replacements from a lowercase entry mirror the window's
+        # sentence capital instead of imposing lowercase.
+        assert (
+            self._one("Adverse Area launched today.", "Glossary: adversaria")
+            == "Adversaria launched today."
+        )
+        assert (
+            self._one("the adverse area demo", "Glossary: adversaria")
+            == "the adversaria demo"
+        )
+
+
+class TestVocabularyCorrectionWiring:
+    """Corrected text must flow into the labeled turns for BOTH channels —
+    system and mic — so turns, titles, and summaries see the fixed terms."""
+
+    def test_merge_dual_corrects_both_channels(self, tmp_path, monkeypatch):
+        import src.transcriber as tr
+
+        sys_wav = tmp_path / "system.wav"
+        mic_wav = tmp_path / "mic.wav"
+        sys_wav.write_bytes(b"RIFF")  # _merge_dual only checks existence
+        mic_wav.write_bytes(b"RIFF")
+        sys_path, mic_path = str(sys_wav), str(mic_wav)
+
+        def collect(path):
+            if path == sys_path:
+                seg = [(0.0, 2.0, "Welcome to Adverse Area, the note taker.")]
+                return seg, tr._TranscriptInfo("en", 7.0)
+            return [(3.0, 5.0, "I love adverse area already.")], tr._TranscriptInfo("en", 7.0)
+
+        monkeypatch.setattr(tr, "_voiced_regions", lambda path: None)  # VAD off — keep all
+        resp = tr._merge_dual(
+            collect, sys_path, mic_path, diarize=False,
+            initial_prompt="Glossary: Adversaria",
+        )
+        assert [t.text for t in resp.turns] == [
+            "Welcome to Adversaria, the note taker.",
+            "I love Adversaria already.",
+        ]
+
+
 class TestSystemTrackVadGate:
     """A silent SYSTEM track makes Whisper echo the custom-vocabulary
     `initial_prompt` back as a "transcription" ("Tatweer OS, Echelon, Tatweer")

@@ -8,6 +8,8 @@ import os
 import platform
 import re
 import sys
+from datetime import date
+from urllib.parse import urlparse
 
 import httpx
 from ollama import Client
@@ -39,6 +41,39 @@ def _stated(value: object) -> str:
 # safe on modest hardware. Raise OLLAMA_NUM_CTX (e.g. 32768) for marathon
 # meetings on a GPU with headroom.
 DEFAULT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+
+
+def _ollama_options() -> dict[str, float | int]:
+    """Base ``options`` for EVERY Ollama completion call (chat + stream).
+
+    ``num_ctx`` must always be present: a completion request without it makes
+    Ollama load the model at its *model-default* context — qwen3.5:9b defaults
+    to 262,144, observed live 2026-08-02 as a 16 GB resident runner vs ~7 GB at
+    our 16,384. Any new completion call site must build its options through
+    this helper (override temperature per-site if needed; never drop num_ctx).
+    """
+    return {"temperature": 0.0, "num_ctx": DEFAULT_NUM_CTX}
+
+
+def _is_local_ollama_url(url: str | None) -> bool:
+    """True when a base_url is the local Ollama OpenAI-compatible surface.
+
+    Rust routes local Ollama tags through ``http://127.0.0.1:11434/v1``
+    (commands.rs OLLAMA_OPENAI_BASE_URL) — but the OpenAI chat API has no
+    ``num_ctx``, so requests on that path load the model at its model-default
+    context (qwen3.5:9b: 262,144 = the 16 GB runner observed live 2026-08-02).
+    Such URLs must be served by the native Ollama client instead, where
+    ``_ollama_options()`` applies. Loopback host + Ollama's port is the test:
+    anything else on 11434 is not a realistic deployment.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.hostname in ("127.0.0.1", "localhost", "::1") and parsed.port == 11434
+
 
 def _is_apple_silicon() -> bool:
     """True on Apple-Silicon macOS, where the LLM is served by Rapid-MLX."""
@@ -299,6 +334,48 @@ def _language_directive(language: str | None) -> str | None:
     if lang in ("en", "english"):
         return "OUTPUT LANGUAGE: Write the entire output in English."
     return None
+
+
+#: Weekday names indexed by ``date.weekday()``. Hard-coded rather than
+#: ``strftime("%A")`` so the prompt never varies with the host's locale.
+_WEEKDAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+#: Strict ISO calendar date. ``date.fromisoformat`` alone is too permissive on
+#: Python 3.11+ (it accepts "20260807" and full datetimes).
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _date_directive(meeting_date: str | None) -> str | None:
+    """A one-line system-prompt directive stating the recording's date.
+
+    Without it the model cannot turn a spoken "by Friday" into a real date.
+    Returns None for anything that is not a well-formed ``YYYY-MM-DD`` — no
+    date context is strictly better than a wrong one, and the prompt then looks
+    exactly as it did before this field existed.
+    """
+    if not meeting_date:
+        return None
+    value = meeting_date.strip()
+    if not _ISO_DATE_RE.fullmatch(value):
+        return None
+    try:
+        day = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return (
+        f"DATE CONTEXT: Today is {value} ({_WEEKDAYS[day.weekday()]}) — the date "
+        "of this recording. Use it ONLY to resolve relative dates that were "
+        'actually spoken in the transcript (e.g. "Friday", "next week"); never '
+        "introduce a date that was not spoken."
+    )
 
 
 class OllamaSummarizer:
@@ -626,35 +703,51 @@ class OllamaSummarizer:
         Ollama uses ``format=schema``; OpenAI-compatible servers use
         ``response_format={"type":"json_schema", ...}``.
 
-        When ``base_url`` is provided and non-empty, the request is always routed
+        When ``base_url`` is provided and non-empty, the request is routed
         through the OpenAI-compatible path with that URL and key, regardless of
-        ``self.backend`` (supports per-request cloud provider overrides).
+        ``self.backend`` (supports per-request cloud provider overrides) —
+        UNLESS the URL is the local Ollama /v1 surface, which is served by the
+        native Ollama client so ``num_ctx`` applies (the OpenAI API can't carry
+        it, and without it Ollama loads the model at its 262k model default).
         Otherwise, the default backend routing (``self.backend``) applies.
         """
+        if _is_local_ollama_url(base_url):
+            return self._chat_ollama(messages, model, json_schema)
         if base_url:
             return self._chat_openai(messages, model, json_schema, base_url=base_url, api_key=api_key)
         if self.backend == "openai":
             return self._chat_openai(messages, model, json_schema)
         return self._chat_ollama(messages, model, json_schema)
 
+    def _ollama_client(self) -> Client:
+        """The native Ollama client, created lazily on the openai backend.
+
+        The openai backend skips client construction at init, but a local
+        Ollama base_url override still needs one (see ``_is_local_ollama_url``).
+        """
+        if self.client is None:
+            self.client = Client(host=self.host)
+        return self.client
+
     def _chat_ollama(self, messages: list[dict], model: str, json_schema: dict | None) -> str:
         chat_kwargs = dict(
             model=model,
             messages=messages,
-            options={"temperature": 0.0, "num_ctx": DEFAULT_NUM_CTX},
+            options=_ollama_options(),
         )
         if json_schema is not None:
             chat_kwargs["format"] = json_schema
         if _is_thinking_model(model):
             chat_kwargs["think"] = False
+        client = self._ollama_client()
         try:
-            response = self.client.chat(**chat_kwargs)
+            response = client.chat(**chat_kwargs)
         except Exception as exc:
             if "think" in chat_kwargs:
                 logger.warning("chat with think=False failed (%s) — retrying without.", exc)
                 chat_kwargs.pop("think")
                 try:
-                    response = self.client.chat(**chat_kwargs)
+                    response = client.chat(**chat_kwargs)
                 except Exception as exc2:
                     logger.error("Ollama request failed: %s", exc2)
                     raise RuntimeError(f"Ollama request failed: {exc2}") from exc2
@@ -771,6 +864,7 @@ class OllamaSummarizer:
         category_hint: str | None = None,
         auto_template: bool = False,
         viewer_label: str | None = None,
+        meeting_date: str | None = None,
     ) -> SummarizeResponse:
         """Summarize a meeting transcript into grounded, structured notes.
 
@@ -790,6 +884,10 @@ class OllamaSummarizer:
                 directive is injected encouraging the LLM to use these exact
                 spellings, and extracted names are grounded to the closest
                 roster entry before deduplication.
+            meeting_date: The recording's date as ISO ``YYYY-MM-DD``. When
+                well-formed, a single date line is added to the system prompt so
+                spoken relative deadlines resolve to absolute dates. Absent or
+                malformed leaves the prompt untouched.
 
         Returns:
             SummarizeResponse with markdown ``summary``, ``title``, and
@@ -858,6 +956,14 @@ class OllamaSummarizer:
         )
 
         system_prompt = self._instructions_only(self._load_template(template_name))
+        # Opt-in: only templates that SAY they use the date get it. A template
+        # handed a "Today is …" line it has no rules for is being invited to do
+        # something undefined with it (2026-08-03 review) — and most of the nine
+        # templates say nothing about deadlines. Mentioning DATE CONTEXT is how a
+        # template (including a user's own) declares it knows what to do.
+        date_line = _date_directive(meeting_date) if "DATE CONTEXT" in system_prompt else None
+        if date_line:
+            system_prompt = f"{system_prompt}\n\n{date_line}"
         directive = _language_directive(output_language)
         if directive:
             system_prompt = f"{system_prompt}\n\n{directive}"
@@ -1082,7 +1188,12 @@ class OllamaSummarizer:
             raise ValueError("Question is empty.")
         use_model = model or self.model
         messages = self._chat_messages(transcript, question)
-        if base_url or self.backend == "openai":
+        # Same dispatch as _chat(): a local Ollama base_url is served natively
+        # so num_ctx applies; any other base_url (or openai backend) streams
+        # over the OpenAI-compatible path.
+        if _is_local_ollama_url(base_url):
+            raw = self._chat_ollama_stream(messages, use_model)
+        elif base_url or self.backend == "openai":
             raw = self._chat_openai_stream(
                 messages, use_model, base_url=base_url, api_key=api_key
             )
@@ -1153,11 +1264,11 @@ class OllamaSummarizer:
             model=model,
             messages=messages,
             stream=True,
-            options={"temperature": 0.0, "num_ctx": DEFAULT_NUM_CTX},
+            options=_ollama_options(),
         )
         if _is_thinking_model(model):
             kwargs["think"] = False
-        for chunk in self.client.chat(**kwargs):
+        for chunk in self._ollama_client().chat(**kwargs):
             piece = chunk.get("message", {}).get("content")
             if piece:
                 yield piece

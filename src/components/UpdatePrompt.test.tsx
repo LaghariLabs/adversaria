@@ -1,9 +1,9 @@
 import type { Update } from "@tauri-apps/plugin-updater";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { UpdatePrompt } from "./UpdatePrompt";
+import { RECHECK_MS, UpdatePrompt } from "./UpdatePrompt";
 
 function fakeUpdate(
   downloadAndInstall: Update["downloadAndInstall"] = vi.fn(),
@@ -58,5 +58,85 @@ describe("UpdatePrompt", () => {
     );
     await waitFor(() => expect(relaunchApp).toHaveBeenCalledOnce());
     expect(downloadAndInstall).toHaveBeenCalledOnce();
+  });
+
+  describe("periodic re-check", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("re-checks after 6 hours and shows the toast when a release appears", async () => {
+      const checkForUpdate = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(fakeUpdate());
+      render(<UpdatePrompt enabled checkForUpdate={checkForUpdate} />);
+
+      // Flush the launch check — nothing released yet, no toast.
+      await act(async () => {});
+      expect(checkForUpdate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Update available — v0.4.0")).not.toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RECHECK_MS);
+      });
+      expect(checkForUpdate).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Update available — v0.4.0")).toBeVisible();
+    });
+
+    it("keeps checking silently while there is nothing to install", async () => {
+      const checkForUpdate = vi.fn().mockResolvedValue(null);
+      const { container } = render(
+        <UpdatePrompt enabled checkForUpdate={checkForUpdate} />,
+      );
+
+      await act(async () => {});
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RECHECK_MS * 3);
+      });
+      expect(checkForUpdate).toHaveBeenCalledTimes(4);
+      expect(container).toBeEmptyDOMElement();
+    });
+
+    it("stops re-checking once an update is found", async () => {
+      const checkForUpdate = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(fakeUpdate());
+      render(<UpdatePrompt enabled checkForUpdate={checkForUpdate} />);
+
+      await act(async () => {});
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RECHECK_MS);
+      });
+      expect(screen.getByText("Update available — v0.4.0")).toBeVisible();
+
+      // The toast is up — further ticks must not fire more checks.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RECHECK_MS * 3);
+      });
+      expect(checkForUpdate).toHaveBeenCalledTimes(2);
+    });
+
+    it("clears the timer on unmount", async () => {
+      const checkForUpdate = vi.fn().mockResolvedValue(null);
+      const { unmount } = render(
+        <UpdatePrompt enabled checkForUpdate={checkForUpdate} />,
+      );
+
+      await act(async () => {});
+      expect(checkForUpdate).toHaveBeenCalledTimes(1);
+
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RECHECK_MS * 3);
+      });
+      expect(checkForUpdate).toHaveBeenCalledTimes(1);
+    });
   });
 });

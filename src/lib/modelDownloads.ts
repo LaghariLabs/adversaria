@@ -7,6 +7,7 @@
  * `whisper-model:<key>`; anything else writes meeting notes.
  */
 import type { ModelDownloadStatus } from "../types";
+import { startModelDownload } from "./tauri";
 
 /** The transcription engine's own pair (main pass + live captions). */
 export const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main"] as const;
@@ -39,6 +40,45 @@ export function isInFlight(status: ModelDownloadStatus): boolean {
 
 export function formatGb(bytes: number): string {
   return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+// ---- Download-start event bus ----------------------------------------------
+//
+// Pollers used to hammer the status endpoints every few seconds forever just in
+// case a download had started somewhere (96% of the sidecar log on an idle
+// install). Instead, every UI code path starts downloads through
+// `beginModelDownload`, which pings subscribers the moment one begins — so
+// pollers can idle on a slow safety heartbeat and still react instantly.
+
+type ModelDownloadStartedListener = (profileId: string) => void;
+
+const startListeners = new Set<ModelDownloadStartedListener>();
+
+/** Subscribe to download starts. Returns the unsubscribe function. */
+export function onModelDownloadStarted(fn: ModelDownloadStartedListener): () => void {
+  startListeners.add(fn);
+  return () => {
+    startListeners.delete(fn);
+  };
+}
+
+/** The one way the UI starts a model download: kicks the backend and notifies
+ *  every subscriber synchronously — even if the call later fails, since a poll
+ *  that finds nothing running is cheap, while a poller that never wakes is the
+ *  bug. Callers still get the backend's promise. */
+export function beginModelDownload(profileId: string): Promise<ModelDownloadStatus> {
+  const started = startModelDownload(profileId);
+  started
+    .catch(() => {}) // never an unhandled rejection if a caller fires-and-forgets
+    .finally(() => {
+      // Second ping once the backend has actually registered (or refused) the
+      // download: the synchronous ping below can race the start command, and a
+      // poll that lands too early sees nothing running — which would park the
+      // pollers back on the slow heartbeat while bytes are already flowing.
+      startListeners.forEach((fn) => fn(profileId));
+    });
+  startListeners.forEach((fn) => fn(profileId));
+  return started;
 }
 
 /** Aggregate percentage across several downloads, or null when sizes are unknown. */

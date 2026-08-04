@@ -43,18 +43,52 @@ ASSET_NAME="$(basename "$ARTIFACT")"
 ASSET_URL="https://github.com/$RELEASE_REPO/releases/download/$TAG/$ASSET_NAME"
 PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# Windows half of the manifest. A manifest with no windows-x86_64 entry is why
+# Windows users have never seen an update prompt (2026-08-03): the app polls,
+# gets a macOS-only document, and correctly concludes there is nothing for it.
+# Point ADVERSARIA_WINDOWS_DIR at a directory holding the CI build's
+# `*-setup.exe` AND `*-setup.exe.sig` — e.g.
+#   gh run download <run-id> --repo LaghariLabs/meeting-note-taker -D /tmp/win
+# NOTE: with `createUpdaterArtifacts: true` (tauri.conf.json) Tauri v2 re-uses
+# the NSIS installer itself as the update bundle, so the pair is
+# `-setup.exe` + `-setup.exe.sig`. The `.nsis.zip` shape belongs to
+# `"v1Compatible"` and is NOT what this build produces.
+WIN_EXE=""
+WIN_SIG=""
+if [ -n "${ADVERSARIA_WINDOWS_DIR:-}" ]; then
+  WIN_EXE="$(find "$ADVERSARIA_WINDOWS_DIR" -name '*-setup.exe' -type f 2>/dev/null | head -1 || true)"
+  [ -n "$WIN_EXE" ] || { echo "ERROR: no *-setup.exe under $ADVERSARIA_WINDOWS_DIR."; exit 1; }
+  WIN_SIG="$WIN_EXE.sig"
+  [ -f "$WIN_SIG" ] || {
+    echo "ERROR: $WIN_EXE has no .sig next to it — that CI build had no updater signing key,"
+    echo "       so it produced an installer-only candidate. Add TAURI_SIGNING_PRIVATE_KEY"
+    echo "       (+ _PASSWORD) to the PUBLIC repo's Actions secrets and re-run the build."
+    exit 1
+  }
+fi
+# The website links .../releases/latest/download/Adversaria-windows-x64-setup.exe,
+# so publish under that stable name and point the updater at the same asset.
+WIN_ASSET_NAME="Adversaria-windows-x64-setup.exe"
+WIN_URL="https://github.com/$RELEASE_REPO/releases/download/$TAG/$WIN_ASSET_NAME"
+
 LATEST_JSON="$(mktemp -d)/${MANIFEST_NAME}"
-python3 - "$VERSION" "$NOTES" "$PUB_DATE" "$ASSET_URL" "$SIG" > "$LATEST_JSON" <<'PY'
+python3 - "$VERSION" "$NOTES" "$PUB_DATE" "$ASSET_URL" "$SIG" "$WIN_URL" "$WIN_SIG" > "$LATEST_JSON" <<'PY'
 import json, sys
-version, notes, pub_date, url, sigpath = sys.argv[1:6]
+version, notes, pub_date, url, sigpath, win_url, win_sig = sys.argv[1:8]
+platforms = {
+    # Apple Silicon only on the mac side; add darwin-x86_64 when one is built.
+    "darwin-aarch64": {"signature": open(sigpath).read().strip(), "url": url},
+}
+if win_sig:
+    platforms["windows-x86_64"] = {
+        "signature": open(win_sig).read().strip(),
+        "url": win_url,
+    }
 print(json.dumps({
     "version": version,
     "notes": notes,
     "pub_date": pub_date,
-    # Apple Silicon only for now; add darwin-x86_64 / windows-x86_64 when built.
-    "platforms": {
-        "darwin-aarch64": {"signature": open(sigpath).read().strip(), "url": url},
-    },
+    "platforms": platforms,
 }, indent=2))
 PY
 
@@ -72,11 +106,25 @@ else
   echo "    Re-run scripts/build-dmg.sh, then: gh release upload $TAG <dmg> --repo $RELEASE_REPO"
 fi
 
+WIN_ARGS=()
+if [ -n "$WIN_EXE" ]; then
+  # Upload under the stable name the website and the manifest both reference.
+  WIN_STAGED="$(mktemp -d)/$WIN_ASSET_NAME"
+  cp "$WIN_EXE" "$WIN_STAGED"
+  WIN_ARGS+=("$WIN_STAGED")
+  echo "==> Including Windows: $(basename "$WIN_EXE") → $WIN_ASSET_NAME (signed, windows-x86_64)"
+else
+  echo "==> WARNING: no Windows artifacts (ADVERSARIA_WINDOWS_DIR unset)."
+  echo "    This release will carry a macOS-ONLY manifest, so installed Windows"
+  echo "    copies will not see an update prompt for it."
+fi
+
 gh release create "$TAG" \
   --repo "$RELEASE_REPO" \
   --title "Adversaria $TAG" \
   --notes "$NOTES" \
-  "$ARTIFACT" "$LATEST_JSON" ${DMG_ARGS+"${DMG_ARGS[@]}"}
+  "$ARTIFACT" "$LATEST_JSON" ${DMG_ARGS+"${DMG_ARGS[@]}"} ${WIN_ARGS+"${WIN_ARGS[@]}"}
 
 echo "✅ Published $TAG."
 echo "   Manifest: https://github.com/$RELEASE_REPO/releases/latest/download/${MANIFEST_NAME}"
+[ -n "$WIN_EXE" ] || echo "   Windows clients: NOT served by this release (see the warning above)."

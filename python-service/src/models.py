@@ -142,6 +142,15 @@ class SummarizeRequest(BaseModel):
             "are normalized to the closest roster entry."
         ),
     )
+    meeting_date: str | None = Field(
+        default=None,
+        description=(
+            "The recording's calendar date as ISO YYYY-MM-DD. When set, a date "
+            "line is added to the system prompt so spoken relative deadlines "
+            "('by Friday') can be resolved to absolute dates. Absent or "
+            "malformed = no date context, and no dates are resolved."
+        ),
+    )
 
 
 class TemplateSaveRequest(BaseModel):

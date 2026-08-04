@@ -501,6 +501,159 @@ def strip_glossary_echo(
     return kept
 
 
+# Vocabulary near-miss correction: the initial_prompt only BIASES Whisper toward
+# the vocabulary — with "adversaria" in the custom vocabulary it still produced
+# "Adverse Area" (meetings 217-219, 2026-08-02) minutes after take 216 got it
+# right. This deterministic post-pass rewrites word windows that are near-misses
+# of a vocabulary term to the user's term, verbatim.
+# Calibration (SequenceMatcher.ratio, normalized window vs "adversaria"):
+#   "adverse area" -> 0.8571, len diff 1   (the live miss — MUST correct)
+#   "adverse"      -> 0.7059, len diff 3   (real word — must NEVER correct)
+#   "tatveer os" vs "tatweer os" -> 0.8889 (typical multi-word near-miss)
+# Threshold 0.80 keeps >= 0.02 margin on both contract sides (0.8571 - 0.80 =
+# 0.0571 above; 0.80 - 0.7059 = 0.0941 below). Known tradeoff: with
+# "Adversaria" in the vocabulary the real words "adversary" (0.8421) and
+# "adversarial" (0.9524) would also be corrected — accepted, because the user
+# adding the brand name to the vocabulary makes it the far likelier intent.
+_VOCAB_FUZZY_MIN_CHARS = 6  # fuzzy only for terms with >= this many normalized chars
+_VOCAB_FUZZY_RATIO = 0.80  # SequenceMatcher.ratio() floor on normalized text
+_VOCAB_FUZZY_MAX_LEN_DIFF = 2  # normalized length difference bound
+
+
+def apply_vocabulary_corrections(
+    segments: list[Segment], initial_prompt: str | None
+) -> list[Segment]:
+    """Rewrite near-miss transcriptions of vocabulary terms to the term verbatim.
+
+    Scans each segment with sliding word-windows of 1..(term word count + 1)
+    words; a window is a near-miss when the normalized (lowercase, alphanumeric
+    only) window and term have SequenceMatcher.ratio() >= _VOCAB_FUZZY_RATIO,
+    bounded length difference, and the same first character. Exact matches
+    (case-insensitive, with a possessive 's peeled off and preserved) always
+    win over fuzzy ones, at every window size, so correct text never loses a
+    short neighbor word to a greedy fuzzy window. Cased entries rewrite exact
+    matches to the entry's casing; an all-lowercase entry carries no casing
+    signal and never downgrades correct text (its fuzzy replacements mirror the
+    window's sentence capital instead). Fuzzy matching is skipped for terms
+    under _VOCAB_FUZZY_MIN_CHARS normalized chars ("Hira" must not attract
+    "Hera"). Longest terms first; replaced text is never re-scanned;
+    idempotent. Pure — unit-testable.
+    """
+    terms = _glossary_terms(initial_prompt)
+    if not terms or not segments:
+        return segments
+    from difflib import SequenceMatcher
+
+    def norm(text: str) -> str:
+        return "".join(c for c in text.lower() if c.isalnum())
+
+    # Longest normalized term first so multi-word terms claim windows before a
+    # shorter term can.
+    prepared = sorted(
+        ((term, norm(term), len(term.split())) for term in terms),
+        key=lambda t: len(t[1]),
+        reverse=True,
+    )
+    prepared = [(t, n, wc) for t, n, wc in prepared if n]
+    if not prepared:
+        return segments
+
+    corrected = 0
+
+    def correct(text: str) -> str:
+        nonlocal corrected
+        words = list(re.finditer(r"\S+", text))
+        out: list[str] = []
+        cursor = 0  # next un-emitted character position in text
+        i = 0
+
+        def window_parts(size: int) -> tuple[str, str, str, str]:
+            """Split a window into (punct prefix, core, possessive tail, punct
+            suffix) so "(Adversaria's)," keeps everything but the core intact."""
+            window = text[words[i].start() : words[i + size - 1].end()]
+            k = 0
+            while k < len(window) and not window[k].isalnum():
+                k += 1
+            m = len(window)
+            while m > 0 and not window[m - 1].isalnum():
+                m -= 1
+            core = window[k:m]
+            tail = ""
+            if core[-2:] in ("'s", "’s"):
+                core, tail = core[:-2], core[-2:]
+            return window[:k], core, tail, window[m:]
+
+        def find_match() -> tuple[int, str] | None:
+            avail = len(words) - i
+            # Exact matches (case-insensitive, possessive-aware) win over fuzzy
+            # across ALL window sizes, so a correct transcription can never lose
+            # its short neighbor to a greedy fuzzy window: "Adversaria is"
+            # resolves to the exact 1-word window and "is" survives, where the
+            # 2-word fuzzy window (len diff 2, ratio 0.909) would swallow it.
+            for term, term_norm, term_wc in prepared:
+                for size in range(min(term_wc + 1, avail), 0, -1):
+                    prefix, core, tail, suffix = window_parts(size)
+                    if not core or norm(core) != term_norm:
+                        continue
+                    if term == term.lower():
+                        # An all-lowercase vocabulary entry carries no casing
+                        # signal — never downgrade already-correct text. Still
+                        # claim the window so fuzzy can't touch it.
+                        return size, text[words[i].start() : words[i + size - 1].end()]
+                    return size, prefix + term + tail + suffix
+            for term, term_norm, term_wc in prepared:
+                if len(term_norm) < _VOCAB_FUZZY_MIN_CHARS:
+                    continue
+                # The term's natural window shape first, then the mis-split
+                # shape (+1 word), then smaller merges — so "Adversario is"
+                # corrects the 1-word near-miss without swallowing "is".
+                sizes = [term_wc, term_wc + 1] + list(range(term_wc - 1, 0, -1))
+                for size in (s for s in sizes if 1 <= s <= avail):
+                    prefix, core, tail, suffix = window_parts(size)
+                    core_norm = norm(core)
+                    if (
+                        core_norm
+                        and core_norm != term_norm
+                        and abs(len(core_norm) - len(term_norm))
+                        <= _VOCAB_FUZZY_MAX_LEN_DIFF
+                        and core_norm[0] == term_norm[0]
+                        and SequenceMatcher(None, core_norm, term_norm).ratio()
+                        >= _VOCAB_FUZZY_RATIO
+                    ):
+                        fixed = term
+                        if term == term.lower() and core[:1].isupper():
+                            # Lowercase entry: mirror the window's sentence
+                            # capital instead of imposing lowercase.
+                            fixed = term[:1].upper() + term[1:]
+                        return size, prefix + fixed + tail + suffix
+            return None
+
+        while i < len(words):
+            match = find_match()
+            if match:
+                size, replacement = match
+                original = text[words[i].start() : words[i + size - 1].end()]
+                if replacement != original:
+                    corrected += 1
+                out.append(text[cursor : words[i].start()])
+                out.append(replacement)
+                cursor = words[i + size - 1].end()
+                i += size  # never re-scan replaced text
+            else:
+                i += 1
+        out.append(text[cursor:])
+        return "".join(out)
+
+    result = [(start, end, correct(text)) for start, end, text in segments]
+    if corrected:
+        logger.info(
+            "Vocabulary: corrected %d near-miss term(s) across %d segments.",
+            corrected,
+            len(segments),
+        )
+    return result
+
+
 # Hallucination gate: Whisper (especially the MLX backend, which has NO built-in
 # VAD) invents text on a near-silent mic track — "thank you for watching",
 # repetition loops ("God of God of God…") — when the user is mostly listening.
@@ -1081,6 +1234,8 @@ class WhisperTranscriber:
         mic_segments = drop_unvoiced_segments(mic_segments, mic_audio_path, "mic")
         system_segments = strip_glossary_echo(system_segments, self.initial_prompt)
         mic_segments = strip_glossary_echo(mic_segments, self.initial_prompt)
+        system_segments = apply_vocabulary_corrections(system_segments, self.initial_prompt)
+        mic_segments = apply_vocabulary_corrections(mic_segments, self.initial_prompt)
         mic_segments = strip_mic_bleed(system_segments, mic_segments)
         sys_labels = (
             None  # playback: TTS/media voices must not become "Speaker N"
@@ -1238,6 +1393,8 @@ def _merge_dual(collect, audio_path: str, mic_audio_path: str, diarize: bool = T
     mic_segments = drop_unvoiced_segments(mic_segments, mic_audio_path, "mic")
     system_segments = strip_glossary_echo(system_segments, initial_prompt)
     mic_segments = strip_glossary_echo(mic_segments, initial_prompt)
+    system_segments = apply_vocabulary_corrections(system_segments, initial_prompt)
+    mic_segments = apply_vocabulary_corrections(mic_segments, initial_prompt)
     mic_segments = strip_mic_bleed(system_segments, mic_segments)
     sys_labels = (
         None  # playback: TTS/media voices must not become "Speaker N"

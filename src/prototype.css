@@ -2999,6 +2999,15 @@ nav {
 .welcome-download > div { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; font-size: 11px; }
 .welcome-download progress { width: 100%; accent-color: var(--accent-blue, #24a0ed); }
 .welcome-download.error { background: color-mix(in srgb, #ff453a 10%, transparent); }
+/* 2026-08-03: the card's in-place model picker (choose → one click → progress).
+   A fieldset so `.welcome-download > div`'s header-row styling can't touch it. */
+.welcome-model-list { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; }
+.welcome-model-list .welcome-check { margin-top: 8px; }
+/* A failure states itself above the picker (the card never dead-ends), and a
+   refused start explains itself below the actions. Scoped to the card so these
+   win over the page-level `.welcome-error` margin defined further down. */
+.welcome-download .welcome-download-error { margin: 0 0 10px; }
+.welcome-download .welcome-download-note { margin: 10px 0 0; }
 /* V3: the Ready screen states what's missing instead of fetching it. */
 .welcome-ready-line { margin-top: 14px; font-size: 12px; color: var(--accent-green, #34c759); }
 .welcome-guide-copy { margin: 0 0 10px; font-size: 12px; color: var(--text-secondary); }

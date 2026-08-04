@@ -91,6 +91,37 @@ function bulletText(line: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+// Trailing due marker on an action bullet. The general template emits
+// `… — due 2026-08-07`; models drift, so an en dash / plain hyphen, a `due:`
+// colon, a parenthesized `(due 2026-08-07)`, and NO separator at all are
+// accepted. The separator must stay optional: a bare `due: 2026-08-07` used to
+// fall through to splitLabel, which claimed the whole run-up as the assignee
+// and left the bare date as the task (2026-08-03 review). `\bdue\b` keeps
+// "overdue"/"subdued" out.
+const DUE_MARKER = /\s*(?:[-–—]\s*)?\(?\s*\bdue\b\s*:?\s*(\d{4}-\d{2}-\d{2})\s*\)?\s*\.?$/i;
+
+/** True only for a real calendar date written as `YYYY-MM-DD`. */
+function isCalendarDate(iso: string): boolean {
+  const parsed = new Date(`${iso}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === iso;
+}
+
+/**
+ * Split a trailing due marker off an action bullet, returning the text without
+ * it plus the ISO date (`""` when there is none). Only a real calendar date is
+ * taken — a malformed one stays part of the text rather than becoming a bogus
+ * due date. Mirror of the Rust `split_due` in src-tauri/src/storage.rs, which
+ * fills the `due` column the To-dos tab reads — keep the two in sync.
+ */
+export function splitDue(text: string): { text: string; due: string } {
+  const match = text.match(DUE_MARKER);
+  const iso = match ? match[1] : undefined;
+  if (!match || match.index === undefined || !iso || !isCalendarDate(iso)) {
+    return { text: text.trim(), due: "" };
+  }
+  return { text: text.slice(0, match.index).trim(), due: iso };
+}
+
 export function parseSummary(markdown: string): ParsedSummary {
   const preamble: string[] = [];
   const sections: SummarySection[] = [];
@@ -120,8 +151,12 @@ export function parseSummary(markdown: string): ParsedSummary {
 
     const bullet = bulletText(line);
     const text = bullet !== null ? bullet : line;
-    if (current) current.bullets.push(text);
-    else preamble.push(text);
+    if (current) {
+      // Strip the due marker exactly where the Rust extractor does (actionable
+      // sections only) so the rendered note reads the same as the to-do row,
+      // which shows the date as a badge off the `due` column instead.
+      current.bullets.push(current.actionable ? splitDue(text).text : text);
+    } else preamble.push(text);
   }
 
   return { preamble, sections };

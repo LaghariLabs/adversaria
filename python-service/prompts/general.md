@@ -7,11 +7,14 @@ The transcript is provided separately and is labeled by speaker:
 Fill the fields:
 - **title:** a short, specific title naming the meeting (5–8 words). No markdown.
 - **attendees:** list every distinct participant. Whenever a participant's name is spoken anywhere, use that name (the "Them" side often includes several people — capture each named person). Use "Me"/"Them" only for participants whose names are never stated. Set `role` only if a role/title is explicitly stated, else null.
-- **sections:** in this order — "Key Topics Discussed", "Decisions Made", "Action Items", "Follow-ups Needed".
+- **sections:** in this order — "TL;DR", "Key Topics Discussed", "Decisions Made", "Action Items", "Follow-ups Needed".
+
+**TL;DR:** exactly ONE bullet containing ONE sentence — what this meeting was about and what came out of it. Same faithfulness rules as everything else: it may only compress what was actually said, never add a conclusion, judgement, or purpose nobody stated. If the transcript is too sparse to support even one grounded sentence, use the single bullet "None mentioned".
 
 **What qualifies (read carefully — this is where notes usually go wrong):**
 - A **Decision** is an explicit choice the participants COMMITTED TO during THIS meeting ("we'll go with…", "let's do…", "we decided…"). Describing how an existing system works, explaining a past choice, or restating a pre-existing plan is NOT a decision. If no explicit decision was made in the meeting, the whole section is the single bullet "None mentioned".
 - An **Action Item** is a task someone will do: one they AGREED TO DO, said they INTEND or NEED to do, or explicitly called a "to-do", "task", or "next step" — INCLUDING when a speaker enumerates their own to-dos ("my to-do is…", "I need to…", "the things I have to do are X, Y, Z", "let me list my to-dos: …"). Capture EACH such task as its own bullet with an owner (the speaker's stated name, or "Me" for the recorder listing their own tasks). A topic merely discussed, a capability described, or something already done is NOT an action item. If none, "None mentioned".
+- **Deadlines on Action Items:** when — and ONLY when — a deadline for that task was explicitly spoken ("by Friday", "before the 15th", "end of the month", "tomorrow"), append exactly ` — due YYYY-MM-DD` to the END of that bullet, after the task text. Resolve relative deadlines against the date given in the DATE CONTEXT line of these instructions. If no DATE CONTEXT line was provided, or the deadline is too vague to pin to one day ("soon", "at some point", "next quarter"), append NOTHING. If no deadline was spoken for a task, append NOTHING. NEVER invent, guess, or infer a date, and never add a due date to a bullet in any other section. (Resolving a spoken relative deadline to an ISO date is not an invention; supplying a deadline nobody stated is.)
 - A **Follow-up** is an explicitly stated next step. If none, "None mentioned".
 
 **Grounding rules — these OVERRIDE any urge to be helpful or complete:**
@@ -25,7 +28,7 @@ Fill the fields:
 
 **No substitutions or "clean-ups" — this is where confident models fail:**
 - Keep every specific term (tool, library, vendor, product, company, place) EXACTLY as spoken, even if it sounds garbled, misspelled, or unfamiliar. If a term is unclear, write it verbatim or append "(unclear)". NEVER replace it with a similar, more-plausible real-world name you assume was meant — guessing "the correct name" is a hallucination. (E.g. if the transcript says "FIOS" and "Nelvis", write those, not "FAISS"/"Milvus"/"Weaviate".)
-- Do not state a number, date, or quantity unless it was spoken; do not round or "tidy" it.
+- Do not state a number, date, or quantity unless it was spoken; do not round or "tidy" it. (The sole exception is the Action Items ` — due` suffix above, which only ever restates a deadline that WAS spoken.)
 - **People:** do not merge two distinct named people into one, and do not split one person into two. If it is unclear who is who or who holds a role, list them separately and leave the role null — never fuse names or guess a title.
 
 **Depth — within the grounding rules:** in "Key Topics Discussed", capture the SPECIFIC facts actually stated (names, numbers, systems, tools, domains, constraints) rather than vague one-liners; prefer several precise, sourced bullets. Cover every distinct workstream discussed; don't let the biggest topic crowd out smaller distinct ones. But depth never licenses invention — if it wasn't said, it doesn't go in. Keep each bullet to one or two sentences; precision over length.

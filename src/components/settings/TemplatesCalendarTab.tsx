@@ -22,6 +22,7 @@ import {
   saveTemplate,
 } from "../../lib/tauri";
 import { formatDateTime } from "../../lib/dateFormat";
+import { templateDisplayName } from "../../lib/templateNames";
 
 interface TemplatesCalendarTabProps {
   active: boolean;
@@ -246,7 +247,7 @@ export function TemplatesCalendarTab({ active, config, update, persist }: Templa
           className="settings-select"
         >
           {templates.map((t) => (
-            <option key={t.name} value={t.name}>{t.name}</option>
+            <option key={t.name} value={t.name}>{templateDisplayName(t.name)}</option>
           ))}
         </select>
       </div>
@@ -276,7 +277,7 @@ export function TemplatesCalendarTab({ active, config, update, persist }: Templa
         >
           <option value="">— select a template to edit —</option>
           {templates.map((t) => (
-            <option key={t.name} value={t.name}>{t.name}</option>
+            <option key={t.name} value={t.name}>{templateDisplayName(t.name)}</option>
           ))}
         </select>
         <textarea

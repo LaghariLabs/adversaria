@@ -58,6 +58,21 @@ PRIVATE_PREFIXES=(
   "landing/"
   "marketing/"
   "release/"
+  # Local AI-agent tooling — installed skills, hooks and their vendored
+  # detectors. Added 2026-08-03 after a sync staged 74 such files and ~140k
+  # lines (one bundled detector alone is 8,283), which would have (a)
+  # republished third-party skill content under this repo's licence, (b) buried
+  # a ~48-file product change in a 357-file PR, and (c) shipped machine-local
+  # tooling that has nothing to do with building the app on any platform.
+  # NB: the installer wrote THREE copies — .agents/, .claude/skills/ and
+  # .github/skills/ (~3.2 MB each). `.github/` itself must stay public: the
+  # workflows there are what build macOS and Windows, so scope this to the
+  # skills subtree only.
+  ".agents/"
+  ".claude/"
+  ".codex/"
+  ".github/skills/"
+  "skills-lock.json"
 )
 
 # The only docs that DO ship publicly — architecture and the privacy/network

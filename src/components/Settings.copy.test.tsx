@@ -165,6 +165,9 @@ describe("Settings copy", () => {
       appConfig({
         llm_provider: "groq",
         llm_base_url: "https://api.groq.com/openai/v1",
+        // The engine picker follows the provider, so set it or the cloud
+        // transcription branch never renders and this guard goes vacuous.
+        transcription_provider: "cloud",
         transcription_base_url: "https://api.groq.com/openai/v1",
         pin_hash: "hash",
       }),
