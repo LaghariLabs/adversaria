@@ -1,7 +1,7 @@
 {
   "name": "meeting-note-taker",
   "private": true,
-  "version": "0.3.71",
+  "version": "0.3.72",
   "type": "module",
   "engines": {
     "node": ">=20 <25"

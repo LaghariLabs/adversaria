@@ -326,6 +326,18 @@ _BLEED_SIMILARITY = 0.85  # SequenceMatcher ratio on normalized text
 _BLEED_WINDOW_SECONDS = 10.0  # bleed lands within seconds of the source
 _BLEED_MIN_WORDS = 3  # short interjections ("yeah", "okay") can't be matched reliably
 _BLEED_CONTAINMENT = 0.8  # fraction of mic tokens present in the system text
+# Segment-to-segment matching alone misses the common case: the two channels are
+# transcribed independently, so Whisper chunks them at DIFFERENT boundaries and a
+# mic segment straddles two system segments. Meeting 221 (2026-08-04) was 20/20
+# bleed reported as a two-person meeting — every mic line scored only 0.14-0.57
+# against any single system segment while being 100% contained in the channel as
+# a whole. So also compare against the system text JOINED across the time window.
+# Bigrams, not words: genuine speech on the same subject reuses the other
+# channel's vocabulary but not its word ORDER. Measured on that transcript —
+# real bleed 0.87-1.00 (median 1.00), genuine same-topic speech 0.12-0.38 — so
+# 0.70 sits clear of both by a wide margin.
+_BLEED_WINDOW_BIGRAM_CONTAINMENT = 0.70
+_BLEED_WINDOW_MIN_WORDS = 6  # below this there are too few bigrams to judge
 
 # Glossary-echo gate: Whisper sometimes "transcribes" the vocabulary
 # initial_prompt back into the output — shuffled and repeated — even over
@@ -347,6 +359,27 @@ def _token_containment(candidate_tokens: list[str], system_tokens: list[str]) ->
     cand = Counter(candidate_tokens)
     sysc = Counter(system_tokens)
     return sum((cand & sysc).values()) / len(candidate_tokens)
+
+
+def _bigram_containment(candidate: str, reference: str) -> float:
+    """Fraction of the candidate's word PAIRS that also occur in reference.
+
+    Word pairs rather than words because the two channels talk about the same
+    subject: unigram overlap is high for genuine speech too ("meeting",
+    "accuracy"), while sharing word ORDER at scale means one channel is echoing
+    the other. Multiset-aware, so a repeated pair must be repeated in reference.
+    """
+    from collections import Counter
+
+    def pairs(text: str) -> list[str]:
+        words = text.split()
+        return [f"{words[i]} {words[i + 1]}" for i in range(len(words) - 1)]
+
+    candidate_pairs = pairs(candidate)
+    if not candidate_pairs:
+        return 0.0
+    overlap = Counter(candidate_pairs) & Counter(pairs(reference))
+    return sum(overlap.values()) / len(candidate_pairs)
 
 
 def strip_mic_bleed(
@@ -375,6 +408,20 @@ def strip_mic_bleed(
         candidate = norm(text)
         candidate_tokens = candidate.split()
         num_words = len(candidate_tokens)
+        # Boundary-independent pass: the system channel as one span of text
+        # around this segment, so a mic line straddling two system segments is
+        # still recognised as the echo it is.
+        if num_words >= _BLEED_WINDOW_MIN_WORDS:
+            window = " ".join(
+                sys_text
+                for sys_start, sys_text in normalized_system
+                if abs(start - sys_start) <= _BLEED_WINDOW_SECONDS
+            )
+            if (
+                _bigram_containment(candidate, window)
+                >= _BLEED_WINDOW_BIGRAM_CONTAINMENT
+            ):
+                continue
         if num_words >= _BLEED_MIN_WORDS and any(
             abs(start - sys_start) <= _BLEED_WINDOW_SECONDS
             and (
