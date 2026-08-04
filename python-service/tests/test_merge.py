@@ -246,6 +246,37 @@ class TestStripMicBleed:
         mic = [(2.0, 5.0, "I should try this pattern in the Adversaria project.")]
         assert self._strip(system, mic) == mic
 
+    def test_bleed_straddling_two_system_segments_dropped(self):
+        """Regression, meeting 221 (2026-08-04): the whole recording was one
+        voice bleeding from the speakers, but it reached the summarizer as a
+        two-person meeting. The channels are transcribed independently, so
+        Whisper chunked them at different boundaries — every mic line was the
+        TAIL of one system segment plus the HEAD of the next, scoring only
+        0.14-0.57 against any single segment while being fully contained in the
+        channel as a whole."""
+        # Verbatim from that recording: the mic line's head is the tail of the
+        # first system segment, its tail is the head of the second.
+        system = [
+            (0.0, 4.0, "without it at the tap of a button You can use it for live meetings, "
+                       "upload recordings, or even record in-person conversations. So it's "
+                       "not just locked into one workflow."),
+            (4.0, 8.0, "Now here's where it really stood out for me. The transcription "
+                       "accuracy is really strong."),
+        ]
+        mic = [(2.1, 6.2, "just locked into one workflow. Now here's where it really stood out for me the")]
+        assert self._strip(system, mic) == []
+
+    def test_same_topic_speech_survives_the_window_check(self):
+        """The window check must not eat real speech just because the user is
+        talking ABOUT what is playing. Shared vocabulary is expected; shared
+        word ORDER is what marks an echo."""
+        system = [
+            (0.0, 4.0, "the transcription accuracy is really strong so you can trust the output"),
+            (4.0, 8.0, "it also supports over 120 plus languages which is huge for teams"),
+        ]
+        mic = [(3.0, 7.0, "yeah I think the transcription accuracy is the thing that matters most for us")]
+        assert self._strip(system, mic) == mic
+
     def test_same_words_far_apart_in_time_kept(self):
         # The user quoting the video a minute later is speech, not bleed.
         system = [(0.0, 3.0, "The original gist achieved forty thousand stars.")]
