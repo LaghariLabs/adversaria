@@ -364,3 +364,53 @@ describe("AiModelTab background downloads", () => {
     });
   });
 });
+
+describe("AiModelTab local AI recovery", () => {
+  it("offers a real restart when the sidecar is unreachable", async () => {
+    let restartCalls = 0;
+    mockIPC((command, payload) => {
+      if (command === "get_setup_status") {
+        return { schema_version: 1, platform: "windows", profiles: [] };
+      }
+      if (command === "list_whisper_models") {
+        return [{ key: "large-v3", label: "Large v3", size: "3 GB", downloaded: true }];
+      }
+      if (command === "check_service_health") {
+        throw new Error("connection refused");
+      }
+      if (command === "get_model_download_status") {
+        return {
+          profile_id: (payload as { profileId?: string }).profileId ?? "",
+          state: "idle",
+          downloaded_bytes: 0,
+          total_bytes: 0,
+          detail: "",
+          error_code: null,
+          verified: false,
+          can_retry: true,
+        };
+      }
+      if (command === "restart_local_ai_service") {
+        restartCalls += 1;
+        return null;
+      }
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AiModelTab
+        active
+        config={appConfig()}
+        update={vi.fn()}
+        replaceConfig={vi.fn()}
+      />,
+    );
+
+    await screen.findByText(/The on-device service is not reachable/);
+    await user.click(screen.getByRole("button", { name: "Restart Local AI" }));
+
+    expect(restartCalls).toBe(1);
+    expect(screen.getByText("Local AI is restarting…")).toBeTruthy();
+  });
+});

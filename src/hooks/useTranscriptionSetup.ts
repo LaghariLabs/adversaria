@@ -3,8 +3,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { HealthResponse, ModelDownloadStatus } from "../types";
 import {
   checkServiceHealth,
+  getConfig,
   getModelDownloadStatus,
   listWhisperModels,
+  onConfigUpdated,
 } from "../lib/tauri";
 import {
   ENGINE_WHISPER_IDS,
@@ -63,11 +65,38 @@ export function useTranscriptionSetup(): TranscriptionSetup {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [serviceOnline, setServiceOnline] = useState<boolean | null>(null);
   const [downloads, setDownloads] = useState<Record<string, ModelDownloadStatus>>({});
+  // null until the persisted config has answered. A configured remote engine
+  // makes every local Whisper download state irrelevant: the recording path
+  // does not use those weights at all.
+  const [remoteConfigured, setRemoteConfigured] = useState<boolean | null>(null);
   // null = catalogue not fetched yet (the sidecar may still be booting).
   const [modelKeys, setModelKeys] = useState<string[] | null>(null);
   const [tick, setTick] = useState(0);
 
   const refresh = useCallback(() => setTick((n) => n + 1), []);
+
+  useEffect(() => {
+    let alive = true;
+    const apply = (config: {
+      transcription_provider?: string;
+      transcription_base_url?: string;
+    } | null) => {
+      if (!alive) return;
+      setRemoteConfigured(
+        Boolean(
+          config &&
+            config.transcription_provider !== "local" &&
+            config.transcription_base_url?.trim(),
+        ),
+      );
+    };
+    getConfig().then(apply).catch(() => apply(null));
+    const unsubscribe = onConfigUpdated(apply);
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Every profile id that can hold the transcription weights: the engine pair
   // plus one per curated model in the picker.
@@ -124,7 +153,10 @@ export function useTranscriptionSetup(): TranscriptionSetup {
 
   // Byte progress is only worth asking for while transcription is NOT ready —
   // a settled machine polls nothing at all.
-  const watchDownloads = transcriberState !== undefined && transcriberState !== "ready";
+  const watchDownloads =
+    remoteConfigured === false &&
+    transcriberState !== undefined &&
+    transcriberState !== "ready";
 
   // Only a live download earns the fast cadence.
   const anyInFlight = whisperIds.some((id) => {
@@ -165,29 +197,38 @@ export function useTranscriptionSetup(): TranscriptionSetup {
   const running = statuses.filter(isInFlight);
   const failed = statuses.find((status) => status.state === "error");
 
-  // A live download outranks health: the service still reports "missing" for
-  // the whole fetch, and "Downloading 62 %" is the truer sentence.
+  // A configured remote endpoint is the transcription engine, so the local
+  // sidecar and its model cache cannot make setup fail. For the on-device path,
+  // real transcriber readiness outranks an old failed alias: Windows exposes
+  // the same cached CT2 artifact through `whisper-main`, `whisper-live`, and a
+  // picker profile, and one stale alias used to keep the whole app red even
+  // while recordings were transcribing successfully.
   let state: TranscriptionSetupState;
-  if (running.length > 0) state = "downloading";
-  else if (failed) state = "failed";
+  if (remoteConfigured === null) state = "unknown";
+  else if (remoteConfigured) state = "ready";
   else if (transcriberState === "ready") state = "ready";
+  // A live download outranks a non-ready health response: the service reports
+  // "missing" for the whole fetch, and "Downloading 62 %" is the truer sentence.
+  else if (running.length > 0) state = "downloading";
+  else if (failed) state = "failed";
   else if (transcriberState === "loading") state = "loading";
   else if (transcriberState === "error") state = "failed";
   else if (transcriberState === "missing") state = "missing";
   else state = "unknown";
 
   const retry = useCallback(() => {
+    if (remoteConfigured) return;
     whisperIds.forEach((id) => {
       if (downloads[id]?.state === "error") {
         beginModelDownload(id).catch(() => {});
       }
     });
-  }, [whisperIds, downloads]);
+  }, [remoteConfigured, whisperIds, downloads]);
 
   return {
     state,
     percent: running.length > 0 ? aggregatePercent(running) : null,
-    detail: failed?.detail || health?.transcriber_detail || "",
+    detail: state === "ready" ? "" : failed?.detail || health?.transcriber_detail || "",
     serviceOnline,
     refresh,
     retry,

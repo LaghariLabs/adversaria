@@ -5,6 +5,67 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.73] - 2026-08-05
+
+### Fixed
+- **"Transcription model download failed" no longer sticks when transcription
+  is working.** If you transcribe on your own server or a cloud provider, the
+  app no longer reports problems with the on-device model it isn't using. And on
+  Windows, three internal names point at the same downloaded model — one could
+  stay marked failed after another had already downloaded and verified it, which
+  is what produced a permanent error beside working transcription.
+- **The local AI service can be restarted from inside the app.** If Windows
+  Security or company software blocks it, you now get a message that says so and
+  a Restart Local AI button, instead of "Offline — check again" that could never
+  change anything. Previously, after a few failed restarts the app gave up
+  silently while still promising it would retry automatically.
+- **Windows: templates you save are no longer written to a folder nothing
+  reads.** The service was using a macOS path on Windows, so a saved or edited
+  template could appear to vanish.
+- **Windows: the local AI service no longer exits immediately in three
+  situations** — an unreadable input pipe, an unwritable templates folder, or a
+  missing system runtime library. The last one now reports what is wrong instead
+  of the service simply never starting.
+
+### Changed
+- **The daily to-do notification can be turned off.** A summary of due and
+  overdue to-dos has been sent once a day with no way to stop it. It stays on so
+  nothing changes for you by surprise, and Settings → General now has a switch
+  and a choice of hour.
+
+## [0.3.72] - 2026-08-04
+
+### Fixed
+- **A one-person recording is no longer written up as a two-person meeting.**
+  Your microphone bleeding into the system audio channel could be transcribed
+  twice and read as a second speaker, including where the bleed straddled a
+  segment boundary.
+
+## [0.3.71] - 2026-08-03
+
+### Added
+- **Bring your own transcription.** Transcribe on this device, on a Whisper
+  server you control, or with a cloud provider — with the privacy wording on
+  screen determined by where the audio actually goes.
+- **Names and terms you choose are spelled correctly** in transcripts.
+- **A rebuilt first-run setup** that tells you what it needs and downloads
+  nothing until you say so.
+- **Summaries lead with a TL;DR and pick up deadlines** ("by Friday" becomes a
+  real date), plus a new **Brain dump** template for turning a solo monologue
+  into to-dos.
+
+### Fixed
+- **The app no longer runs hot or slows the machine while idle.** A status check
+  was firing constantly — 96% of the service log on every install — and closed
+  or crashed sessions could leave a ~1.6 GB helper process resident.
+- **Notes that never generated.** Long meetings hit a limit that silently
+  truncated the transcript before summarizing.
+- **Windows updates now install automatically.** They had never worked: the
+  update manifest listed macOS only.
+- **Template improvements from the last six weeks now reach the app.** Packaged
+  installs kept a template frozen at 20 June; your own edits are preserved and
+  backed up.
+
 ## [0.3.70] - 2026-08-01
 
 ### Added

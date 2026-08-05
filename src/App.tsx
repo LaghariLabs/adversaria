@@ -22,6 +22,7 @@ import { TranscriptionSetupChip } from "./components/TranscriptionSetupChip";
 import { useTranscriptionSetup } from "./hooks/useTranscriptionSetup";
 import {
   getConfig,
+  restartLocalAiService,
   updateConfig,
   deleteMeeting,
   setMeetingPinned,
@@ -630,6 +631,22 @@ function App() {
 
   const serviceOnline = transcription.serviceOnline;
 
+  const handleLocalAiStatus = async () => {
+    if (serviceOnline !== false) {
+      transcription.refresh();
+      return;
+    }
+    setNotice("Restarting the local AI service…");
+    try {
+      await restartLocalAiService();
+      setNotice("Local AI is restarting. Your saved recording is safe.");
+      window.setTimeout(transcription.refresh, 2_000);
+      window.setTimeout(transcription.refresh, 8_000);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  };
+
   return (
     <div className={`h-screen flex flex-col${companionActive ? " companion-mode" : ""}`}>
       <Welcome onOpenModelSettings={openModelSettings} transcriptionSetup={transcription} />
@@ -761,10 +778,10 @@ function App() {
             <button
               type="button"
               className="chrome-chip"
-              onClick={transcription.refresh}
+              onClick={() => void handleLocalAiStatus()}
               title={
                 serviceOnline === false
-                  ? "The on-device AI isn't answering. Click to check again."
+                  ? "The on-device AI isn't answering. Click to restart it."
                   : "On-device AI — transcription and notes run here. Click to check again."
               }
               style={{
@@ -792,7 +809,7 @@ function App() {
                 ? "Checking…"
                 : serviceOnline
                   ? "Online"
-                  : "Offline — check again"}
+                  : "Offline — restart"}
             </button>
           </div>
         </div>

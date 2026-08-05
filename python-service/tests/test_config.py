@@ -206,3 +206,109 @@ class TestPackagedPromptSeeding:
         target = self._resolve(monkeypatch, bundle, data_dir)
 
         assert (target / "q3-planning.md").read_text(encoding="utf-8") == "mine"
+
+
+class TestPackagedDataDir:
+    """The frozen data dir must match Rust's, per platform.
+
+    Rust uses `directories::BaseDirs::data_dir()/meeting-note-taker`
+    (src-tauri/src/config.rs). Until 2026-08-05 this branch hardcoded the macOS
+    path with no platform switch, so the Windows sidecar read and wrote
+    `C:\\Users\\<user>\\Library\\Application Support\\…` — which Rust never looks
+    at, making a template saved on Windows look like it had vanished.
+    """
+
+    def test_windows_uses_appdata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On Windows the base is %APPDATA%, matching BaseDirs::data_dir()."""
+        monkeypatch.delenv("ADVERSARIA_DATA_DIR", raising=False)
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("APPDATA", r"C:\Users\hamza\AppData\Roaming")
+
+        resolved = config._packaged_data_dir()
+
+        assert resolved == Path(r"C:\Users\hamza\AppData\Roaming") / "meeting-note-taker"
+        assert "Library" not in str(resolved), "the macOS path must not leak to Windows"
+
+    def test_windows_without_appdata_falls_back_to_roaming(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing %APPDATA% still resolves inside the user profile."""
+        monkeypatch.delenv("ADVERSARIA_DATA_DIR", raising=False)
+        monkeypatch.delenv("APPDATA", raising=False)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        resolved = config._packaged_data_dir()
+
+        assert resolved.parts[-3:] == ("AppData", "Roaming", "meeting-note-taker")
+
+    def test_macos_uses_application_support(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """macOS keeps ~/Library/Application Support — unchanged behaviour."""
+        monkeypatch.delenv("ADVERSARIA_DATA_DIR", raising=False)
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        resolved = config._packaged_data_dir()
+
+        assert resolved.parts[-4:] == (
+            "Library",
+            "Application Support",
+            "meeting-note-taker",
+        ) or resolved == Path.home() / "Library" / "Application Support" / "meeting-note-taker"
+
+    def test_env_override_wins_on_every_platform(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """ADVERSARIA_DATA_DIR is honoured before any platform default."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("ADVERSARIA_DATA_DIR", str(tmp_path / "custom"))
+
+        assert config._packaged_data_dir() == tmp_path / "custom"
+
+
+class TestResolveNeverRaises:
+    """`PROMPTS_DIR = _resolve_prompts_dir()` runs at import time.
+
+    Anything that escapes it kills the sidecar before uvicorn binds a port, which
+    Rust can only observe as a service that never answered.
+    """
+
+    def test_unwritable_target_falls_back_to_the_bundled_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing mkdir degrades to read-only templates instead of raising."""
+        bundled = tmp_path / "bundle" / "prompts"
+        bundled.mkdir(parents=True)
+        (bundled / "general.md").write_text("bundled", encoding="utf-8")
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "bundle"), raising=False)
+        monkeypatch.setenv("ADVERSARIA_DATA_DIR", str(tmp_path / "blocked"))
+
+        def deny(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError("controlled folder access")
+
+        monkeypatch.setattr(Path, "mkdir", deny)
+
+        resolved = config._resolve_prompts_dir()
+
+        assert resolved == bundled
+        assert (resolved / "general.md").read_text(encoding="utf-8") == "bundled"
+
+    def test_failed_seeding_still_returns_the_writable_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Seeding is best-effort: the dir is usable even if a refresh fails."""
+        bundled = tmp_path / "bundle" / "prompts"
+        bundled.mkdir(parents=True)
+        (bundled / "general.md").write_text("bundled", encoding="utf-8")
+        data_dir = tmp_path / "appdata"
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "bundle"), raising=False)
+        monkeypatch.setenv("ADVERSARIA_DATA_DIR", str(data_dir))
+        monkeypatch.setattr(
+            config,
+            "_seed_bundled_prompts",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        assert config._resolve_prompts_dir() == data_dir / "prompts"

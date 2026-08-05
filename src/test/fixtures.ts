@@ -38,6 +38,8 @@ export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     second_brain_enabled: false,
     meeting_reminder_enabled: false,
     meeting_reminder_minutes: 5,
+    todo_digest_enabled: true,
+    todo_digest_hour: 9,
     tour_completed: false,
     calendar: {
       google: null,

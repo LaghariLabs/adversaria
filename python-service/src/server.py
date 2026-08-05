@@ -275,7 +275,17 @@ def _watch_parent_stdin() -> None:
     try:
         sys.stdin.buffer.read()
     except Exception:
-        pass  # a broken stdin pipe is treated the same as parent death
+        # NOT parent death. An unusable stdin (None in a windowed frozen build,
+        # a closed/invalid fd, an EDR-interposed handle) used to fall through to
+        # os._exit(0) below, so the sidecar killed itself milliseconds after
+        # every launch — and logged it as though the app had quit. Leave the
+        # process running: `reap_stale_sidecars` on the Rust side is the backstop
+        # for a genuinely orphaned service.
+        logger.warning(
+            "Parent-death guard could not read stdin; staying alive without it.",
+            exc_info=True,
+        )
+        return
     logger.info("Parent process closed stdin — exiting sidecar.")
     os._exit(0)
 

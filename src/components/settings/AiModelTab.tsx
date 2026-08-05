@@ -18,6 +18,7 @@ import {
   getModelDownloadStatus,
   getSetupStatus,
   listWhisperModels,
+  restartLocalAiService,
   setLocalModelProfile,
   testLlmConnection,
   updateConfig,
@@ -104,6 +105,8 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
   const [healthStatus, setHealthStatus] = useState<
     "checking" | "ok" | "degraded" | "unreachable"
   >("checking");
+  const [serviceRestarting, setServiceRestarting] = useState(false);
+  const [serviceRestartMessage, setServiceRestartMessage] = useState("");
   // Profiles seen mid-download during THIS mount. Only those may auto-activate
   // on completion — a profile that was already finished when the tab mounted
   // must never hijack the model the user is actually using.
@@ -144,6 +147,22 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
       setHealthStatus("unreachable");
     }
   }, []);
+
+  const restartService = async () => {
+    if (serviceRestarting) return;
+    setServiceRestarting(true);
+    setServiceRestartMessage("");
+    try {
+      await restartLocalAiService();
+      setServiceRestartMessage("Local AI is restarting…");
+      window.setTimeout(() => void checkHealth(), 2_000);
+      window.setTimeout(() => void checkHealth(), 8_000);
+    } catch (error) {
+      setServiceRestartMessage(String(error));
+    } finally {
+      setServiceRestarting(false);
+    }
+  };
 
   const loadWhisperModels = useCallback(async (): Promise<WhisperModelInfo[]> => {
     try {
@@ -844,7 +863,20 @@ export function AiModelTab({ active, config, update, replaceConfig }: AiModelTab
           ) : healthStatus === "degraded" ? (
             <p className="settings-msg warn">● Service reachable, but the model server is not available</p>
           ) : (
-            <p className="settings-msg err">● The on-device service is not reachable</p>
+            <>
+              <p className="settings-msg err">● The on-device service is not reachable</p>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => void restartService()}
+                disabled={serviceRestarting}
+              >
+                {serviceRestarting ? "Restarting…" : "Restart Local AI"}
+              </button>
+              {serviceRestartMessage && (
+                <p className="settings-help" role="status">{serviceRestartMessage}</p>
+              )}
+            </>
           )}
         </div>
         <div className="settings-form-group">

@@ -6,6 +6,15 @@ import wave
 
 import numpy as np
 
+# These tests decode real WAV bytes, so they need the real decoder — and
+# `live.ingest` resolves `faster_whisper.audio.decode_audio` lazily, at call
+# time. Other test modules replace `sys.modules["faster_whisper"]` with a
+# MagicMock during collection, which shadows the package for everyone. Importing
+# the submodule here caches it under its full dotted name, so the lazy lookup
+# still resolves regardless of collection order. This used to work only by
+# accident, via `transcriber.py`'s module-scope import of `faster_whisper`.
+import faster_whisper.audio  # noqa: F401
+
 from src import live
 from src.live import LiveCaptionSession, completed_utterances
 

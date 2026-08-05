@@ -543,6 +543,20 @@ pub struct AppConfig {
     /// `meeting_reminder_enabled` is set.
     #[serde(default = "default_meeting_reminder_minutes")]
     pub meeting_reminder_minutes: u32,
+    /// Daily OS notification summarising to-dos that are due or overdue
+    /// (`reminders.rs`). Distinct from `meeting_reminder_enabled`, which is the
+    /// pre-meeting alert in `meeting_reminders.rs`.
+    ///
+    /// Defaults to **true**: this digest shipped with no gate at all until
+    /// 2026-08-05, so defaulting to false would silently switch off a
+    /// notification existing users already receive. The point of the field is
+    /// that they can now turn it off.
+    #[serde(default = "default_true")]
+    pub todo_digest_enabled: bool,
+    /// Local hour (0–23) at which the daily to-do digest fires. Only meaningful
+    /// while `todo_digest_enabled` is set.
+    #[serde(default = "default_todo_digest_hour")]
+    pub todo_digest_hour: u32,
     /// One-time guided tour after setup (coach marks ending on Settings › AI
     /// Model). False = not yet shown; set true on finish OR skip.
     #[serde(default)]
@@ -586,6 +600,11 @@ fn default_meeting_alert_style() -> String {
 
 fn default_meeting_reminder_minutes() -> u32 {
     5
+}
+
+/// 09:00 local — the hour the digest hardcoded before it became configurable.
+fn default_todo_digest_hour() -> u32 {
+    9
 }
 
 /// One curated on-device Whisper model + whether it's already downloaded.

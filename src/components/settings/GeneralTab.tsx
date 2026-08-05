@@ -74,6 +74,41 @@ export function GeneralTab({ active, config, update, onReplayTour }: GeneralTabP
         </p>
       </div>
 
+      {/* Daily to-do digest. Separate from the pre-meeting alert above: this one
+          summarises due/overdue action items. It shipped with no setting at all
+          until 2026-08-05, so it stays ON by default — the point is that it can
+          now be turned off. */}
+      <div className="settings-form-group">
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={config.todo_digest_enabled}
+            onChange={(e) => update({ todo_digest_enabled: e.target.checked })}
+          />
+          Send me a daily to-do summary
+        </label>
+        {config.todo_digest_enabled && (
+          <select
+            id="settings-todo-digest-hour"
+            aria-label="Hour to send the daily to-do summary"
+            value={config.todo_digest_hour}
+            onChange={(e) => update({ todo_digest_hour: Number(e.target.value) })}
+            className="settings-select"
+          >
+            <option value={7}>At 07:00</option>
+            <option value={8}>At 08:00</option>
+            <option value={9}>At 09:00 (default)</option>
+            <option value={12}>At 12:00</option>
+            <option value={18}>At 18:00</option>
+          </select>
+        )}
+        <p className="settings-help">
+          One notification a day covering to-dos that are due or overdue — never
+          one per task. Adversaria has to be running; if it was closed at that
+          hour you get the summary shortly after the next launch.
+        </p>
+      </div>
+
       {/* Default summary language */}
       <div className="settings-form-group">
         <label className="settings-label" htmlFor="settings-summary-language">Summary Language</label>

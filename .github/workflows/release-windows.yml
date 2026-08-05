@@ -95,6 +95,47 @@ jobs:
           ADVERSARIA_BUNDLE_CUDA: ${{ inputs.bundle_cuda && '1' || '0' }}
         run: uv run --with pyinstaller pyinstaller adversaria-service-windows.spec --noconfirm
 
+      # A successful PyInstaller command proves only that files were collected.
+      # The first real Windows machine exposed several failures before the
+      # process bound its port, and a packaged service that has never answered
+      # /health is not a release candidate.
+      - name: Smoke the frozen ML service
+        working-directory: python-service
+        shell: pwsh
+        run: |
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+          $stdout = Join-Path $env:RUNNER_TEMP 'adversaria-service-smoke.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'adversaria-service-smoke.stderr.log'
+          $exe = Join-Path $PWD 'dist\adversaria-service\adversaria-service.exe'
+          $service = Start-Process -FilePath $exe `
+            -ArgumentList @('--host', '127.0.0.1', '--port', "$port") `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          $ready = $false
+          try {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($service.HasExited) {
+                throw "Frozen service exited before /health (code $($service.ExitCode))."
+              }
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 2
+                if ($health.status) {
+                  $ready = $true
+                  Write-Host "Frozen service /health: $($health.status)"
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ready) { throw 'Frozen service did not answer /health within 60 seconds.' }
+          } finally {
+            if (-not $service.HasExited) { Stop-Process -Id $service.Id -Force }
+            if (Test-Path $stdout) { Get-Content $stdout }
+            if (Test-Path $stderr) { Get-Content $stderr }
+          }
+
       # tauri.windows.conf.json is merged automatically on this target: it
       # selects the NSIS bundle and drops the Apple-only rapid-mlx resource.
       # The channel config only overrides the updater endpoint.

@@ -11,8 +11,13 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from faster_whisper import WhisperModel
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    # Import for types only. `faster_whisper` loads ctranslate2's native
+    # extension, which is imported lazily in `_create_model` instead — see the
+    # note there. `from __future__ import annotations` keeps the runtime clean.
+    from faster_whisper import WhisperModel
 
 from .models import TranscriptTurn, TranscribeResponse
 
@@ -1208,7 +1213,17 @@ class WhisperTranscriber:
         checksum-verified pipeline (SETUP_REDESIGN_SPEC V3) — loading here used
         to fetch ~3 GB synchronously inside service startup, which left the
         port unbound for the whole download and killed the process on failure.
+
+        The `faster_whisper` import is deliberately here rather than at module
+        scope. It loads ctranslate2's native extension, so on a clean Windows box
+        without the MSVC redistributable it raises `ImportError: DLL load failed`
+        — and at module scope that killed the sidecar before uvicorn could bind,
+        which Rust could only observe as a service that never answered. Deferred,
+        the service binds, `/health` reports `transcriber_state = error`, and the
+        UI can say what is actually wrong.
         """
+        from faster_whisper import WhisperModel
+
         logger.info(
             "Loading whisper model: size=%s device=%s compute_type=%s",
             self.model_size,

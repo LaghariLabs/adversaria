@@ -2,10 +2,12 @@ import { useEffect, useRef, useState } from "react";
 
 import type { ModelDownloadStatus, OnboardingState } from "../types";
 import {
+  getConfig,
   getModelDownloadStatus,
   getOnboardingState,
   getSetupStatus,
   listWhisperModels,
+  onConfigUpdated,
 } from "../lib/tauri";
 import {
   ENGINE_WHISPER_IDS,
@@ -41,6 +43,9 @@ export function SetupStatusStrip() {
   const [downloads, setDownloads] = useState<Record<string, ModelDownloadStatus>>({});
   const [watchedIds, setWatchedIds] = useState<string[]>([...ENGINE_WHISPER_IDS]);
   const [transcriptionDone, setTranscriptionDone] = useState(false);
+  // null until config has loaded: do not flash a local-model error before we
+  // know whether this installation even uses the local transcription engine.
+  const [remoteTranscription, setRemoteTranscription] = useState<boolean | null>(null);
   // Ids seen mid-download on the previous poll, so a completion can be noticed.
   const runningRef = useRef<Set<string>>(new Set());
 
@@ -67,6 +72,30 @@ export function SetupStatusStrip() {
   }, [onboarding?.setup_complete]);
 
   const active = Boolean(onboarding?.setup_complete);
+
+  useEffect(() => {
+    if (!active) return;
+    let alive = true;
+    const apply = (config: {
+      transcription_provider?: string;
+      transcription_base_url?: string;
+    } | null) => {
+      if (!alive) return;
+      setRemoteTranscription(
+        Boolean(
+          config &&
+            config.transcription_provider !== "local" &&
+            config.transcription_base_url?.trim(),
+        ),
+      );
+    };
+    getConfig().then(apply).catch(() => apply(null));
+    const unsubscribe = onConfigUpdated(apply);
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [active]);
 
   // Everything that CAN be downloading: the transcription engine pair, one id
   // per curated transcription model, and the pinned notes-model tiers. The
@@ -171,11 +200,20 @@ export function SetupStatusStrip() {
   const statuses = watchedIds
     .map((id) => downloads[id])
     .filter((status): status is ModelDownloadStatus => Boolean(status));
-  const inFlight = statuses.filter(isInFlight);
-  const failed = statuses.find((status) => status.state === "error");
+  const relevant = (status: ModelDownloadStatus) =>
+    !isTranscriptionProfile(status.profile_id) || remoteTranscription === false;
+  const inFlight = statuses.filter((status) => isInFlight(status) && relevant(status));
+  const failed = statuses.find(
+    (status) =>
+      status.state === "error" &&
+      // Self-hosted/cloud transcription never reads local Whisper weights.
+      // Keep notes-model work visible, but do not tell a user whose remote
+      // transcription is working that local transcription is busy or failed.
+      relevant(status),
+  );
 
   if (inFlight.length === 0 && !failed) {
-    return transcriptionDone ? (
+    return transcriptionDone && remoteTranscription === false ? (
       <div className="setup-strip" role="status" aria-live="polite">
         <div className="setup-strip-text">
           <strong>✓ Transcription ready</strong>
@@ -198,7 +236,9 @@ export function SetupStatusStrip() {
 
   const retry = () => {
     statuses.forEach((status) => {
-      if (status.state === "error") beginModelDownload(status.profile_id).catch(() => {});
+      if (status.state === "error" && relevant(status)) {
+        beginModelDownload(status.profile_id).catch(() => {});
+      }
     });
   };
 

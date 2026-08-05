@@ -20,7 +20,7 @@ use crate::types::{
 
 /// The local service didn't answer at all (not started yet, or mid-respawn).
 const SERVICE_DOWN: &str =
-    "The local AI service isn't running. It restarts automatically — try again in a moment.";
+    "The local AI service isn't running. Use Local AI: Offline → Restart at the top of the app, then retry.";
 /// No Whisper model is cached, so nothing can transcribe yet.
 const TRANSCRIBER_MISSING: &str = "No transcription model is downloaded yet. Open Settings → AI \
      Model and download one — this meeting will be transcribed once it's ready.";

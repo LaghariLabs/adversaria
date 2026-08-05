@@ -7,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { OnboardingState } from "../types";
 import { beginModelDownload } from "../lib/modelDownloads";
+import { updateConfig } from "../lib/tauri";
+import { appConfig } from "../test/fixtures";
 import { SetupStatusStrip } from "./SetupStatusStrip";
 
 const onboarding = (overrides: Partial<OnboardingState> = {}): OnboardingState => ({
@@ -206,6 +208,35 @@ describe("SetupStatusStrip", () => {
     // Retry goes through the shared beginModelDownload entry point → backend.
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(retried).toEqual(["whisper-main"]));
+  });
+
+  it("clears an irrelevant local transcription failure after switching to self-hosted", async () => {
+    const local = appConfig();
+    mockIPC((command, payload) => {
+      if (command === "get_onboarding_state") return onboarding();
+      if (command === "get_config") return local;
+      if (command === "update_config") return null;
+      if (command === "list_whisper_models") return WHISPER_MODELS;
+      if (command === "get_setup_status") return SETUP;
+      if (command === "get_model_download_status") {
+        const id = (payload as { profileId?: string }).profileId ?? "";
+        return id === "whisper-main" ? status(id, "error") : status(id, "ready", 1, 1);
+      }
+      return null;
+    });
+
+    const { container } = render(<SetupStatusStrip />);
+    expect(await screen.findByText("Transcription model — download failed")).toBeInTheDocument();
+
+    await act(async () => {
+      await updateConfig(
+        appConfig({
+          transcription_provider: "self_hosted",
+          transcription_base_url: "http://dgx.office.local:8000/v1",
+        }),
+      );
+    });
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
 
   it("never runs sample verification or touches onboarding (SPEC v2)", async () => {

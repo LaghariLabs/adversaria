@@ -358,12 +358,38 @@ export function clearAskConversation(): Promise<void> {
 
 // ---- Config ----
 
+type ConfigUpdatedListener = (config: AppConfig) => void;
+
+const configUpdatedListeners = new Set<ConfigUpdatedListener>();
+
+/** Subscribe to successful config writes made through this module.
+ *
+ * Long-lived chrome (notably the transcription setup indicators) otherwise
+ * keeps judging the machine from the config it read at mount. That made a
+ * failed on-device download remain visible after the user switched to a
+ * working self-hosted transcription server. */
+export function onConfigUpdated(listener: ConfigUpdatedListener): () => void {
+  configUpdatedListeners.add(listener);
+  return () => {
+    configUpdatedListeners.delete(listener);
+  };
+}
+
 export function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
 }
 
-export function updateConfig(config: AppConfig): Promise<void> {
-  return invoke("update_config", { config });
+export async function updateConfig(config: AppConfig): Promise<void> {
+  await invoke("update_config", { config });
+  // A chrome subscriber is advisory; once Rust has persisted the config, a
+  // faulty listener must not make the caller believe the save itself failed.
+  configUpdatedListeners.forEach((listener) => {
+    try {
+      listener(config);
+    } catch (error) {
+      console.error("Config update listener failed:", error);
+    }
+  });
 }
 
 // ---- Templates ----
@@ -392,6 +418,11 @@ export function deleteTemplate(name: string): Promise<void> {
 
 export function checkServiceHealth(): Promise<HealthResponse> {
   return invoke("check_service_health");
+}
+
+/** Retry the bundled local-AI process after a launch block/crash loop. */
+export function restartLocalAiService(): Promise<void> {
+  return invoke("restart_local_ai_service");
 }
 
 /** Probe a cloud LLM provider's /models endpoint to validate base URL + key. */

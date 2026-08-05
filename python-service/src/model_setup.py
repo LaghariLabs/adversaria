@@ -347,6 +347,47 @@ def _set_state(profile_id: str, **updates: object) -> None:
             setattr(state, key, value)
 
 
+def _equivalent_profile_ids(profile_id: str) -> tuple[str, ...]:
+    """All profile ids backed by the exact same immutable artifact.
+
+    Windows deliberately aliases ``whisper-main``, ``whisper-live`` and the
+    default Settings picker entry to one CT2 snapshot. Treating their download
+    states as independent left one alias red after another alias had fetched
+    and verified the shared model — even while transcription was working.
+    """
+    pin = _pin(profile_id)
+    identity = (pin.repo_id, pin.revision, pin.allow_patterns)
+    return tuple(
+        candidate_id
+        for candidate_id, candidate in MODEL_PINS.items()
+        if (candidate.repo_id, candidate.revision, candidate.allow_patterns) == identity
+    )
+
+
+def _mark_equivalent_ready(
+    profile_id: str, files: tuple[ExpectedFile, ...], total: int
+) -> None:
+    """Clear stale sibling errors once their shared snapshot verifies."""
+    equivalent = _equivalent_profile_ids(profile_id)
+    with _LOCK:
+        for candidate_id in equivalent:
+            _EXPECTED[candidate_id] = files
+            state = _STATES[candidate_id]
+            state.state = "ready"
+            state.downloaded_bytes = total
+            state.total_bytes = total
+            state.detail = "Local meeting model is downloaded and verified."
+            state.error_code = None
+            state.verified = True
+            state.can_retry = False
+
+
+def _equivalent_profile_ready(profile_id: str) -> bool:
+    equivalent = _equivalent_profile_ids(profile_id)
+    with _LOCK:
+        return any(_STATES[candidate_id].state == "ready" for candidate_id in equivalent)
+
+
 def _run_download(profile_id: str) -> None:
     pin = _pin(profile_id)
     try:
@@ -379,22 +420,18 @@ def _run_download(profile_id: str) -> None:
             detail="Verifying model checksums…",
         )
         _verify_snapshot(pin, files)
-        _set_state(
-            profile_id,
-            state="ready",
-            downloaded_bytes=total,
-            total_bytes=total,
-            detail="Local meeting model is downloaded and verified.",
-            error_code=None,
-            verified=True,
-            can_retry=False,
-        )
+        _mark_equivalent_ready(profile_id, files, total)
         for callback in list(_READY_CALLBACKS):
             try:
                 callback(profile_id)
             except Exception:  # a listener must never poison the download state
                 logger.exception("Model-ready callback failed for %s", profile_id)
     except Exception as exc:  # worker boundary: expose only a redacted code/message
+        # An equivalent alias may have completed while this duplicate worker
+        # was still running. Never overwrite a verified shared artifact with a
+        # late network error from the losing worker.
+        if _equivalent_profile_ready(profile_id):
+            return
         code, detail = _safe_failure(exc)
         _set_state(
             profile_id,

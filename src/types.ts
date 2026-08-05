@@ -304,6 +304,12 @@ export interface AppConfig {
   /** OS notification N minutes before a calendar meeting starts. */
   meeting_reminder_enabled: boolean;
   meeting_reminder_minutes: number;
+  /** Daily OS notification summarising due/overdue to-dos (`reminders.rs`).
+   *  Distinct from `meeting_reminder_enabled` (the pre-meeting alert). Defaults
+   *  to true: it shipped ungated, so this preserves existing behaviour. */
+  todo_digest_enabled: boolean;
+  /** Local hour (0–23) the daily to-do digest fires. Default 9. */
+  todo_digest_hour: number;
   /** One-time guided tour shown after setup; true once finished or skipped. */
   tour_completed: boolean;
   calendar: CalendarConfig;
