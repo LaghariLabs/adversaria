@@ -113,26 +113,52 @@ jobs:
           $service = Start-Process -FilePath $exe `
             -ArgumentList @('--host', '127.0.0.1', '--port', "$port") `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          Write-Host "Smoking $exe on 127.0.0.1:$port"
+          # A frozen onedir build imports the whole ML stack (torch, transformers,
+          # sherpa-onnx, av) off a cold CI filesystem before uvicorn binds. The
+          # first version of this gate allowed ~180 s and failed at 181 s while the
+          # service was starting perfectly well, so the budget is generous and
+          # deadline-based rather than a count of attempts.
+          $deadline = [Diagnostics.Stopwatch]::StartNew()
+          $budget = [TimeSpan]::FromMinutes(8)
           $ready = $false
+          $lastError = 'no attempt completed'
           try {
-            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            while ($deadline.Elapsed -lt $budget) {
               if ($service.HasExited) {
-                throw "Frozen service exited before /health (code $($service.ExitCode))."
+                throw "Frozen service exited before answering /health (exit code $($service.ExitCode)). See the captured output below."
               }
               try {
-                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 2
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 5
                 if ($health.status) {
                   $ready = $true
-                  Write-Host "Frozen service /health: $($health.status)"
+                  Write-Host "Frozen service /health: $($health.status) after $([int]$deadline.Elapsed.TotalSeconds)s"
+                  Write-Host "  whisper_model=$($health.whisper_model) transcriber_state=$($health.transcriber_state)"
                   break
                 }
-              } catch {}
-              Start-Sleep -Seconds 1
+                $lastError = "200 but no status field: $($health | ConvertTo-Json -Compress)"
+              } catch {
+                $lastError = $_.Exception.Message
+              }
+              Start-Sleep -Seconds 5
             }
-            if (-not $ready) { throw 'Frozen service did not answer /health within 60 seconds.' }
+            if (-not $ready) {
+              # Distinguish "never bound the port" from "bound but /health fails" —
+              # they have completely different causes and the log alone is ambiguous
+              # because src/server.py filters /health out of the access log.
+              $listening = $false
+              try {
+                $probe = [Net.Sockets.TcpClient]::new()
+                $listening = $probe.ConnectAsync('127.0.0.1', $port).Wait(3000)
+                $probe.Dispose()
+              } catch { $listening = $false }
+              throw "Frozen service did not answer /health within $([int]$budget.TotalMinutes) minutes. TCP port open: $listening. Last error: $lastError"
+            }
           } finally {
             if (-not $service.HasExited) { Stop-Process -Id $service.Id -Force }
+            Write-Host '--- service stdout ---'
             if (Test-Path $stdout) { Get-Content $stdout }
+            Write-Host '--- service stderr ---'
             if (Test-Path $stderr) { Get-Content $stderr }
           }
 
