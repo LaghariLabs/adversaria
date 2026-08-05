@@ -196,6 +196,11 @@ impl Default for AppConfig {
             second_brain_enabled: false,
             meeting_reminder_enabled: false,
             meeting_reminder_minutes: 5,
+            // On by default: the digest already fires for every existing user
+            // (it had no gate until 2026-08-05), so this preserves behaviour
+            // while making it switchable.
+            todo_digest_enabled: true,
+            todo_digest_hour: 9,
             tour_completed: false,
         }
     }
@@ -217,6 +222,37 @@ fn default_llm_model() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The to-do digest fired for everyone before it had a setting
+    /// (`reminders.rs`, gated 2026-08-05). Defaulting it to false — or letting
+    /// serde's `bool::default()` apply to an existing `config.json` that predates
+    /// the field — would silently switch off a notification users already get.
+    #[test]
+    fn todo_digest_defaults_to_on_at_nine() {
+        let config = AppConfig::default();
+        assert!(config.todo_digest_enabled);
+        assert_eq!(config.todo_digest_hour, 9);
+    }
+
+    #[test]
+    fn todo_digest_survives_a_config_written_before_the_field_existed() {
+        // Model a real upgrade: a full config.json from before 2026-08-05, i.e.
+        // every field except the two new ones. `bool`'s serde default is false,
+        // so without `default = "default_true"` this silently disables a
+        // notification the user was already receiving.
+        let mut json = serde_json::to_value(AppConfig::default()).expect("serializes");
+        let object = json.as_object_mut().expect("config is a JSON object");
+        object.remove("todo_digest_enabled");
+        object.remove("todo_digest_hour");
+
+        let config: AppConfig = serde_json::from_value(json).expect("older config parses");
+
+        assert!(
+            config.todo_digest_enabled,
+            "a pre-existing install must keep receiving the digest it already had"
+        );
+        assert_eq!(config.todo_digest_hour, 9);
+    }
 
     fn assert_all(urls: &[&str], expected: &str) {
         for url in urls {

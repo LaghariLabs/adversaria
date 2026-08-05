@@ -264,6 +264,7 @@ pub fn run() {
             commands::get_config,
             commands::update_config,
             commands::check_service_health,
+            commands::restart_local_ai_service,
             commands::test_llm_connection,
             commands::biometric_authenticate,
             commands::get_registration_state,

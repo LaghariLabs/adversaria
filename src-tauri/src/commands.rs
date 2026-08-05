@@ -57,6 +57,14 @@ pub struct AppState {
     /// tells "the app is quitting" apart from "the service crashed" and doesn't
     /// respawn a service on the way out.
     pub shutting_down: Arc<AtomicBool>,
+    /// Only one watchdog may own sidecar recovery. A manual retry after the
+    /// original watchdog exhausted its budget starts a new one; a retry while
+    /// it is still active must not create a second competing respawner.
+    pub sidecar_watchdog_running: Arc<AtomicBool>,
+    /// Last launch-level failure, kept free of paths and process output. The UI
+    /// returns this from a manual restart so Windows security/EDR blocks no
+    /// longer look like a generic unreachable port.
+    pub sidecar_last_error: Mutex<Option<String>>,
     /// Bundled Rapid-MLX child. Its loopback URL and per-launch credential are
     /// process-only and never written to config or logs.
     pub managed_llm: Mutex<Option<crate::setup::ManagedLlmProcess>>,
@@ -77,6 +85,8 @@ impl AppState {
             recording_started: Mutex::new(None),
             sidecar: Mutex::new(None),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            sidecar_watchdog_running: Arc::new(AtomicBool::new(false)),
+            sidecar_last_error: Mutex::new(None),
             managed_llm: Mutex::new(None),
         }
     }
@@ -154,7 +164,29 @@ pub fn spawn_sidecar(app: &AppHandle) {
     // Runs in dev too — dev orphans were the live 2026-08-02 evidence.
     reap_stale_sidecars();
     if launch_sidecar(app).is_some() {
-        spawn_sidecar_watchdog(app.clone());
+        ensure_sidecar_watchdog(app.clone());
+    }
+}
+
+fn set_sidecar_launch_error(app: &AppHandle, event: &str, detail: impl Into<String>) {
+    let detail = detail.into();
+    *app.state::<AppState>().sidecar_last_error.lock().unwrap() = Some(detail.clone());
+    crate::diagnostics::record(event, &detail);
+    append_to_sidecar_log(&format!(
+        "{} [{event}] {detail}",
+        chrono::Utc::now().to_rfc3339()
+    ));
+}
+
+fn sidecar_spawn_failure_message(kind: std::io::ErrorKind) -> String {
+    match kind {
+        std::io::ErrorKind::PermissionDenied =>
+            "Windows blocked the bundled local AI service. Check Windows Security → Protection history or your company security software, allow adversaria-service.exe, then retry.".to_string(),
+        std::io::ErrorKind::NotFound =>
+            "The bundled local AI service is missing. Security software may have quarantined it; allow or restore adversaria-service.exe, reinstall Adversaria, then retry.".to_string(),
+        _ => format!(
+            "The bundled local AI service could not start ({kind:?}). Fully quit Adversaria, reopen it, and retry."
+        ),
     }
 }
 
@@ -162,7 +194,17 @@ pub fn spawn_sidecar(app: &AppHandle) {
 /// and stash the child for shutdown. Returns the port, or `None` when the app
 /// isn't packaged (dev) or the process couldn't be started.
 fn launch_sidecar(app: &AppHandle) -> Option<u16> {
-    let resource_dir = app.path().resource_dir().ok()?;
+    let resource_dir = match app.path().resource_dir() {
+        Ok(path) => path,
+        Err(_) => {
+            set_sidecar_launch_error(
+                app,
+                "sidecar.resource_dir_failed",
+                "The bundled local AI service location is unavailable. Reinstall Adversaria and retry.",
+            );
+            return None;
+        }
+    };
     let exe = resource_dir
         .join("adversaria-service")
         .join(if cfg!(windows) {
@@ -171,6 +213,16 @@ fn launch_sidecar(app: &AppHandle) -> Option<u16> {
             "adversaria-service"
         });
     if !exe.exists() {
+        // Expected in dev, where uvicorn is run from source. In a packaged
+        // release the directory is a declared Tauri resource; absence after
+        // install strongly indicates antivirus/EDR quarantine.
+        if !cfg!(debug_assertions) {
+            set_sidecar_launch_error(
+                app,
+                "sidecar.executable_missing",
+                sidecar_spawn_failure_message(std::io::ErrorKind::NotFound),
+            );
+        }
         return None; // dev / not bundled — use the manually-run service
     }
 
@@ -179,6 +231,11 @@ fn launch_sidecar(app: &AppHandle) -> Option<u16> {
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.port());
     let Some(port) = port else {
+        set_sidecar_launch_error(
+            app,
+            "sidecar.port_failed",
+            "The local AI service could not reserve a private port. Restart Windows and retry.",
+        );
         eprintln!("[sidecar] could not find a free port");
         return None;
     };
@@ -237,10 +294,17 @@ fn launch_sidecar(app: &AppHandle) -> Option<u16> {
             app.state::<AppState>()
                 .client
                 .set_base_url(format!("http://127.0.0.1:{port}"));
+            *app.state::<AppState>().sidecar_last_error.lock().unwrap() = None;
+            crate::diagnostics::record("sidecar.spawned", "Bundled local AI process started.");
             eprintln!("[sidecar] adversaria-service spawned on port {port}");
             Some(port)
         }
         Err(e) => {
+            set_sidecar_launch_error(
+                app,
+                "sidecar.spawn_failed",
+                sidecar_spawn_failure_message(e.kind()),
+            );
             eprintln!("[sidecar] failed to spawn: {e}");
             None
         }
@@ -252,7 +316,11 @@ fn launch_sidecar(app: &AppHandle) -> Option<u16> {
 /// notes, with no signal beyond every request failing. Plain thread (no async
 /// runtime, no lock held across a wait) polling `try_wait`; restarts back off
 /// 2s/4s/8s… and stop after `SIDECAR_MAX_FAST_DEATHS` consecutive fast deaths.
-fn spawn_sidecar_watchdog(app: AppHandle) {
+fn ensure_sidecar_watchdog(app: AppHandle) {
+    let running = app.state::<AppState>().sidecar_watchdog_running.clone();
+    if running.swap(true, Ordering::SeqCst) {
+        return;
+    }
     std::thread::spawn(move || {
         let mut started = std::time::Instant::now();
         let mut fast_deaths: u32 = 0;
@@ -260,6 +328,7 @@ fn spawn_sidecar_watchdog(app: AppHandle) {
             std::thread::sleep(SIDECAR_WATCHDOG_INTERVAL);
             let state = app.state::<AppState>();
             if state.shutting_down.load(Ordering::SeqCst) {
+                running.store(false, Ordering::SeqCst);
                 return;
             }
             // Reap without blocking, then drop the guard immediately — nothing
@@ -286,10 +355,16 @@ fn spawn_sidecar_watchdog(app: AppHandle) {
             }
             fast_deaths += 1;
             if fast_deaths > SIDECAR_MAX_FAST_DEATHS {
+                set_sidecar_launch_error(
+                    &app,
+                    "sidecar.restart_exhausted",
+                    "The local AI service stopped repeatedly. Check Windows Security → Protection history or your company security software, then press Restart Local AI.",
+                );
                 eprintln!(
                     "[sidecar] gave up after {SIDECAR_MAX_FAST_DEATHS} failed restarts — see \
                      logs/adversaria-service.log"
                 );
+                running.store(false, Ordering::SeqCst);
                 return;
             }
             let backoff = std::time::Duration::from_secs(1 << fast_deaths.min(6));
@@ -307,6 +382,56 @@ fn spawn_sidecar_watchdog(app: AppHandle) {
             started = std::time::Instant::now();
         }
     });
+}
+
+/// Retry the packaged local-AI process after a launch block or exhausted crash
+/// loop. This is deliberately a retry, not an antivirus bypass: Windows or the
+/// user's EDR must allow the executable first.
+#[tauri::command]
+pub fn restart_local_ai_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // The watchdog owns the child handle while it is active. Taking/replacing
+    // that handle here could race its dead-child reap and make it wait on the
+    // newly spawned process. Manual retry is for the two states the watchdog
+    // cannot recover from itself: spawn was blocked, or its retry budget ended.
+    if state.sidecar_watchdog_running.load(Ordering::SeqCst) {
+        return Err(
+            "Adversaria is already restarting Local AI automatically. Wait a moment, then check again."
+                .to_string(),
+        );
+    }
+    // Clear a dead handle left after a fast failure. If the process is alive it
+    // may still be importing native libraries; starting a duplicate would race
+    // two services and two watchdogs, so ask the user to wait instead.
+    let dead = {
+        let mut guard = state.sidecar.lock().unwrap();
+        let alive = guard
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if alive {
+            return Err(
+                "The local AI process is already starting. Wait a moment, then check again."
+                    .to_string(),
+            );
+        }
+        guard.take()
+    };
+    if let Some(mut child) = dead {
+        let _ = child.wait();
+    }
+
+    if launch_sidecar(&app).is_some() {
+        ensure_sidecar_watchdog(app);
+        return Ok(());
+    }
+    Err(state
+        .sidecar_last_error
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| {
+            "The bundled local AI service is unavailable. Reinstall Adversaria and retry."
+                .to_string()
+        }))
 }
 
 /// Stop the bundled sidecar on app exit (kill + reap). No-op in dev.
@@ -5268,6 +5393,15 @@ mod tests {
         assert!(!is_stale_sidecar("adversaria-serv", None, false));
         assert!(!is_stale_sidecar("meeting-note-taker", Some(1), true));
         assert!(!is_stale_sidecar("", None, false));
+    }
+
+    #[test]
+    fn sidecar_permission_failure_names_windows_security_and_the_blocked_executable() {
+        let message = sidecar_spawn_failure_message(std::io::ErrorKind::PermissionDenied);
+        assert!(message.contains("Windows"));
+        assert!(message.contains("Security"));
+        assert!(message.contains("adversaria-service.exe"));
+        assert!(message.contains("retry"));
     }
 
     #[test]

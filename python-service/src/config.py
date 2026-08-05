@@ -75,6 +75,31 @@ def _seed_bundled_prompts(target: Path, bundled: Path) -> None:
         dest.write_text(current, encoding="utf-8")
 
 
+def _packaged_data_dir() -> Path:
+    """The per-user app-data dir, matching what the Rust side uses.
+
+    Must agree with `src-tauri/src/config.rs::app_data_dir` (which is
+    `directories::BaseDirs::data_dir()/meeting-note-taker`) or the two halves of
+    the app read different folders. Until 2026-08-05 this branch hardcoded the
+    macOS path with no platform switch, so the Windows sidecar seeded and saved
+    templates into `C:\\Users\\<user>\\Library\\Application Support\\…` — a legal
+    but nonsense path that Rust never reads, which is why a template saved on
+    Windows appeared to vanish.
+    """
+    override = os.environ.get("ADVERSARIA_DATA_DIR")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        # directories::BaseDirs::data_dir() is %APPDATA% (Roaming) on Windows.
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / "meeting-note-taker"
+
+
 def _resolve_prompts_dir() -> Path:
     """Where editable prompt templates live.
 
@@ -83,17 +108,31 @@ def _resolve_prompts_dir() -> Path:
     read-only, so the user-editable templates feature must write elsewhere,
     and the bundled defaults are seeded/refreshed there by
     ``_seed_bundled_prompts``.
+
+    Runs at import time (``PROMPTS_DIR`` below), so it must never raise: an
+    unwritable target falls back to the read-only bundled copy rather than
+    killing the whole service before it can bind a port.
     """
+    bundled = Path(getattr(sys, "_MEIPASS", "")) / "prompts"
     if getattr(sys, "frozen", False):
-        base = Path(
-            os.environ.get("ADVERSARIA_DATA_DIR")
-            or (Path.home() / "Library" / "Application Support" / "meeting-note-taker")
-        )
-        target = base / "prompts"
-        target.mkdir(parents=True, exist_ok=True)
-        bundled = Path(getattr(sys, "_MEIPASS", "")) / "prompts"
+        target = _packaged_data_dir() / "prompts"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error(
+                "Could not create the prompts directory %s (%s) — falling back to "
+                "the read-only bundled templates; edits will not persist.",
+                target,
+                exc,
+            )
+            return bundled
         if bundled.is_dir():
-            _seed_bundled_prompts(target, bundled)
+            try:
+                _seed_bundled_prompts(target, bundled)
+            except OSError as exc:
+                # The directory exists and is usable for reads; a failed refresh
+                # must not take the service down at import.
+                logger.error("Could not refresh bundled templates in %s: %s", target, exc)
         return target
     return Path(__file__).parent.parent / "prompts"
 

@@ -95,3 +95,9 @@ design-artifacts/
 # Prompt-template ownership record + seeding backups (per-install, never source)
 python-service/prompts/_user_templates.json
 python-service/prompts/*.bak-*.md
+
+# `impeccable` design-tooling state: hook cache + critique output, and the
+# generated PRODUCT.md design-context doc (see .agents/skills/impeccable).
+# Local tool state, not product source — kept out of the public mirror.
+.impeccable/
+PRODUCT.md

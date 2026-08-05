@@ -1,8 +1,10 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { beginModelDownload } from "../lib/modelDownloads";
+import { updateConfig } from "../lib/tauri";
+import { appConfig } from "../test/fixtures";
 import { useTranscriptionSetup } from "./useTranscriptionSetup";
 
 const status = (id: string, state: string) => ({
@@ -36,6 +38,7 @@ describe("useTranscriptionSetup download cadence", () => {
             transcriber_detail: "No transcription model on this machine yet.",
           };
         }
+        if (command === "get_config") return appConfig();
         if (command === "list_whisper_models") return WHISPER_MODELS;
         if (command === "start_model_download") {
           downloading = true;
@@ -80,5 +83,75 @@ describe("useTranscriptionSetup download cadence", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("trusts a ready transcriber over a stale failed download alias", async () => {
+    let transcriberState = "missing";
+    mockIPC((command, payload) => {
+      if (command === "get_config") return appConfig();
+      if (command === "check_service_health") {
+        return {
+          status: "ok",
+          whisper_model: "large-v3-turbo",
+          ollama_available: true,
+          transcriber_state: transcriberState,
+          transcriber_detail: "",
+        };
+      }
+      if (command === "list_whisper_models") return WHISPER_MODELS;
+      if (command === "get_model_download_status") {
+        const id = (payload as { profileId?: string }).profileId ?? "";
+        return {
+          ...status(id, id === "whisper-live" ? "error" : "idle"),
+          detail: id === "whisper-live" ? "The model download was interrupted." : "",
+        };
+      }
+      return null;
+    });
+
+    const { result } = renderHook(() => useTranscriptionSetup());
+    await waitFor(() => expect(result.current.state).toBe("failed"));
+
+    transcriberState = "ready";
+    act(() => result.current.refresh());
+    await waitFor(() => expect(result.current.state).toBe("ready"));
+    expect(result.current.detail).toBe("");
+  });
+
+  it("retires local-model failures as soon as self-hosted transcription is saved", async () => {
+    const local = appConfig();
+    mockIPC((command, payload) => {
+      if (command === "get_config") return local;
+      if (command === "update_config") return null;
+      if (command === "check_service_health") {
+        return {
+          status: "ok",
+          whisper_model: "large-v3-turbo",
+          ollama_available: true,
+          transcriber_state: "missing",
+          transcriber_detail: "No transcription model on this machine yet.",
+        };
+      }
+      if (command === "list_whisper_models") return WHISPER_MODELS;
+      if (command === "get_model_download_status") {
+        const id = (payload as { profileId?: string }).profileId ?? "";
+        return status(id, id === "whisper-main" ? "error" : "idle");
+      }
+      return null;
+    });
+
+    const { result } = renderHook(() => useTranscriptionSetup());
+    await waitFor(() => expect(result.current.state).toBe("failed"));
+
+    await act(async () => {
+      await updateConfig(
+        appConfig({
+          transcription_provider: "self_hosted",
+          transcription_base_url: "http://dgx.office.local:8000/v1",
+        }),
+      );
+    });
+    await waitFor(() => expect(result.current.state).toBe("ready"));
+    expect(result.current.detail).toBe("");
   });
 });

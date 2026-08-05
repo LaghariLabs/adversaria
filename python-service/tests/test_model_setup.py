@@ -360,3 +360,42 @@ def test_ready_callback_fires_after_verified_download() -> None:
         assert model_setup.model_download_status("whisper-main")["state"] == "ready"
     finally:
         model_setup._READY_CALLBACKS.remove(calls.append)
+
+
+def test_verified_download_clears_errors_for_equivalent_profile_aliases() -> None:
+    """One immutable snapshot must have one effective ready/error state.
+
+    On Windows, the main, live and Settings turbo ids all name the same CT2
+    artifact. A failed alias used to stay red after a sibling successfully
+    verified that artifact, leaving the app broken-looking while it worked.
+    """
+    source = "whisper-main"
+    aliases = model_setup._equivalent_profile_ids(source)
+    if len(aliases) < 2:
+        pytest.skip("This backend has no equivalent Whisper aliases")
+    files = (model_setup.ExpectedFile(name="model.bin", size=7, sha256=None),)
+    try:
+        for profile_id in aliases:
+            model_setup._STATES[profile_id] = model_setup.DownloadState(
+                profile_id,
+                state="error",
+                detail="The model download was interrupted.",
+                error_code="network",
+            )
+        with (
+            patch.object(model_setup, "_load_manifest", return_value=files),
+            patch.object(model_setup, "snapshot_download"),
+            patch.object(model_setup, "_verify_snapshot"),
+        ):
+            model_setup._run_download(source)
+
+        for profile_id in aliases:
+            ready = model_setup.model_download_status(profile_id)
+            assert ready["state"] == "ready"
+            assert ready["verified"] is True
+            assert ready["downloaded_bytes"] == 7
+            assert ready["error_code"] is None
+    finally:
+        for profile_id in aliases:
+            model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+            model_setup._EXPECTED.pop(profile_id, None)

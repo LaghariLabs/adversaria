@@ -835,8 +835,9 @@ class TestAccessLogPollFilter:
 class TestParentGuard:
     """Decision logic for the parent-death watchdog (ADVERSARIA_PARENT_GUARD).
 
-    Only the guard-on/guard-off decision is tested; the thread body blocks on
-    stdin and hard-exits, so Thread is mocked (never started under pytest).
+    `install_parent_guard` mocks Thread (never started under pytest). The thread
+    body is exercised directly with `os._exit` patched, because telling real
+    parent death apart from an unusable stdin is the whole point of the guard.
     """
 
     def test_guard_off_without_env(self, monkeypatch) -> None:
@@ -856,3 +857,41 @@ class TestParentGuard:
         assert kwargs["daemon"] is True
         assert kwargs["target"] is _server_mod._watch_parent_stdin
         thread_cls.return_value.start.assert_called_once()
+
+    def test_clean_eof_exits(self, monkeypatch) -> None:
+        """EOF on the inherited pipe IS parent death — hard-exit, code 0."""
+        stdin = MagicMock()
+        stdin.buffer.read.return_value = b""
+        monkeypatch.setattr(_server_mod.sys, "stdin", stdin)
+
+        with patch.object(_server_mod.os, "_exit") as hard_exit:
+            _server_mod._watch_parent_stdin()
+
+        hard_exit.assert_called_once_with(0)
+
+    def test_unreadable_stdin_does_not_exit(self, monkeypatch) -> None:
+        """A broken stdin is NOT parent death.
+
+        Regression: the old body swallowed every exception and fell through to
+        `os._exit(0)`, so a frozen windowed build whose stdin was unusable killed
+        itself milliseconds after each launch — six times, until Rust's watchdog
+        gave up permanently and the user was told the service "restarts
+        automatically" forever.
+        """
+        stdin = MagicMock()
+        stdin.buffer.read.side_effect = OSError("handle is invalid")
+        monkeypatch.setattr(_server_mod.sys, "stdin", stdin)
+
+        with patch.object(_server_mod.os, "_exit") as hard_exit:
+            _server_mod._watch_parent_stdin()
+
+        hard_exit.assert_not_called()
+
+    def test_missing_stdin_does_not_exit(self, monkeypatch) -> None:
+        """`sys.stdin is None` (windowed PyInstaller build) must not exit."""
+        monkeypatch.setattr(_server_mod.sys, "stdin", None)
+
+        with patch.object(_server_mod.os, "_exit") as hard_exit:
+            _server_mod._watch_parent_stdin()
+
+        hard_exit.assert_not_called()

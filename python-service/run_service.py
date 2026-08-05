@@ -22,6 +22,12 @@ def _ensure_stdio() -> None:
 
     A no-op wherever the streams already exist (dev, and the console-mode macOS
     build), so this stays safe cross-platform.
+
+    **stdin is deliberately excluded.** The parent-death guard
+    (`server._watch_parent_stdin`) blocks on `sys.stdin` and exits when it hits
+    EOF, so substituting `os.devnull` here would hand it an instant EOF and kill
+    the sidecar milliseconds after every launch. A missing stdin is handled where
+    it matters — the guard logs it and declines to run — not by inventing one.
     """
     for name in ("stdout", "stderr"):
         if getattr(sys, name, None) is None:
