@@ -1,50 +1,103 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { Bot, CalendarDays, Mic2, ShieldCheck, User } from "lucide-react";
+import {
+  Activity,
+  AudioLines,
+  Bell,
+  FileText,
+  Mic2,
+  Plug,
+  ShieldCheck,
+  User,
+} from "lucide-react";
 
 import type { AppConfig, RegistrationState } from "../types";
 import { getConfig, updateConfig, getRegistrationState, retryRegistration } from "../lib/tauri";
 import { setDateFormat } from "../lib/dateFormat";
-import { GeneralTab } from "./settings/GeneralTab";
-import { AiModelTab } from "./settings/AiModelTab";
-import { RecordingTab } from "./settings/RecordingTab";
-import { TemplatesCalendarTab } from "./settings/TemplatesCalendarTab";
-import { PrivacyDataTab } from "./settings/PrivacyDataTab";
+import { useServiceHealth } from "../hooks/useServiceHealth";
+import { useSettingsModels } from "../hooks/useSettingsModels";
+import { SetupStatusSection } from "./settings/SetupStatusSection";
+import { RecordingSection } from "./settings/RecordingSection";
+import { NotificationsSection } from "./settings/NotificationsSection";
+import { TranscriptionSection } from "./settings/TranscriptionSection";
+import { NotesSection } from "./settings/NotesSection";
+import { IntegrationsSection } from "./settings/IntegrationsSection";
+import { PrivacyDataSection } from "./settings/PrivacyDataSection";
+import { GeneralSection } from "./settings/GeneralSection";
 
-type SettingsTab = "general" | "model" | "recording" | "templates" | "privacy";
+type SettingsTab =
+  | "setup"
+  | "recording"
+  | "notifications"
+  | "transcription"
+  | "notes"
+  | "integrations"
+  | "privacy"
+  | "general";
 
+/** Sidebar order = the order the work happens in, then the app around it.
+ *  Each `label` MUST equal its section's first `.settings-card-title`. */
 const TABS: { id: SettingsTab; label: string; icon: JSX.Element }[] = [
-  { id: "general", label: "General", icon: <User size={15} aria-hidden="true" /> },
-  { id: "model", label: "AI Model", icon: <Bot size={15} aria-hidden="true" /> },
+  { id: "setup", label: "Setup status", icon: <Activity size={15} aria-hidden="true" /> },
   { id: "recording", label: "Recording", icon: <Mic2 size={15} aria-hidden="true" /> },
+  { id: "notifications", label: "Notifications", icon: <Bell size={15} aria-hidden="true" /> },
   {
-    id: "templates",
-    label: "Templates & Calendar",
-    icon: <CalendarDays size={15} aria-hidden="true" />,
+    id: "transcription",
+    label: "Transcription",
+    icon: <AudioLines size={15} aria-hidden="true" />,
   },
-  {
-    id: "privacy",
-    label: "Privacy & Data",
-    icon: <ShieldCheck size={15} aria-hidden="true" />,
-  },
+  { id: "notes", label: "Notes", icon: <FileText size={15} aria-hidden="true" /> },
+  { id: "integrations", label: "Integrations", icon: <Plug size={15} aria-hidden="true" /> },
+  { id: "privacy", label: "Privacy & data", icon: <ShieldCheck size={15} aria-hidden="true" /> },
+  { id: "general", label: "General", icon: <User size={15} aria-hidden="true" /> },
 ];
 
-/**
- * Settings shell: owns the config, the tab menu, and the Save button. Each tab
- * is a card in `./settings/` that receives the config and edits it through
- * `update` (saved on Save) or `persist` (written immediately).
- */
+/** Tab ids that existed before the 8-section rebuild, kept working for one
+ *  release. An unknown id used to render the sidebar over a COMPLETELY EMPTY
+ *  pane — `.settings-section-card` is `display:none` without `.active-card`, so
+ *  nothing matched, with no error and no failing test. Every entry point into
+ *  Settings (the wizard, the tour's last step, the transcription chip) went
+ *  through one of these, so they resolve rather than 404 into blankness. */
+const LEGACY_TABS: Record<string, SettingsTab> = {
+  // The engine + model choice that used to live in "AI Model" is transcription's.
+  model: "transcription",
+  // Prompt templates moved in with the notes model.
+  templates: "notes",
+};
+
+const DEFAULT_TAB: SettingsTab = "setup";
+
+/** Resolve a caller-supplied id to a real section, never to a blank pane. */
+function resolveTab(id: string | undefined): SettingsTab {
+  if (!id) return DEFAULT_TAB;
+  if (TABS.some((tab) => tab.id === id)) return id as SettingsTab;
+  return LEGACY_TABS[id] ?? DEFAULT_TAB;
+}
+
 interface SettingsProps {
-  /** Tab to open on (used by the tour, the wizard and the transcription chip
-   *  to land on AI Model). */
+  /** Section to open on. Accepts the legacy ids above. */
   initialTab?: string;
   /** Bumped by the caller on every navigation request, so a Settings view that
-   *  is already open still switches tabs when the target is unchanged. */
+   *  is already open still switches sections when the target is unchanged. */
   tabNonce?: number;
   /** Clears `tour_completed` and navigates away so the tour can restart. */
   onReplayTour?: () => void;
 }
 
+/**
+ * Settings shell: owns the config, the section menu, and the Save button.
+ *
+ * It also owns the state that more than one section needs — service health and
+ * the model-download pipeline — because those are single state machines. Mounting
+ * them per section would double the IPC traffic and split the download
+ * completion-gating set, so a finished model would either steal the one in use or
+ * never activate. See docs/SETTINGS_REDESIGN.md.
+ *
+ * Sections are ALL mounted; `active` only toggles a CSS class. That is load
+ * bearing: fetches and pollers run regardless of which section is showing, which
+ * is what lets a download re-attach after navigating away, and it keeps the
+ * jargon-guard test scanning every section's copy.
+ */
 export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) {
   // App version (so the user can always tell which build is running).
   const [appVersion, setAppVersion] = useState("");
@@ -57,12 +110,10 @@ export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>(
-    (initialTab as SettingsTab) || "general",
-  );
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>(resolveTab(initialTab));
 
   useEffect(() => {
-    if (initialTab) setActiveSettingsTab(initialTab as SettingsTab);
+    if (initialTab) setActiveSettingsTab(resolveTab(initialTab));
   }, [initialTab, tabNonce]);
 
   const loadConfig = useCallback(async () => {
@@ -89,6 +140,19 @@ export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) 
       setRegistrationRetrying(false);
     }
   };
+
+  // Live mirror, assigned on every render. Immediate writes merge onto this, not
+  // onto a fresh disk read: handing the shell the whole disk copy is what wiped
+  // unsaved edits across every tab (2026-08-03).
+  const configRef = useRef<AppConfig>(config as AppConfig);
+  configRef.current = config as AppConfig;
+
+  const health = useServiceHealth();
+  useEffect(() => {
+    void health.checkHealth();
+  }, [health.checkHealth]);
+
+  const models = useSettingsModels(configRef, setConfig, health.checkHealth);
 
   const handleSave = async () => {
     if (!config) return;
@@ -141,17 +205,6 @@ export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) 
             Adversaria v{appVersion}
           </div>
         )}
-        {/* Only when a retry is actually scheduled: endpoint-less builds
-            (every dev build) queue silently — retrying there can never work. */}
-        {registrationState?.status === "pending" && registrationState.next_retry_at != null && (
-          <div className="settings-registration-pending" role="status">
-            <strong>Registration queued</strong>
-            <span>It will retry automatically when online.</span>
-            <button type="button" className="btn-link" onClick={handleRegistrationRetry} disabled={registrationRetrying}>
-              {registrationRetrying ? "Retrying…" : "Retry now"}
-            </button>
-          </div>
-        )}
         <div className="settings-menu-list">
           {TABS.map((tab) => (
             <button
@@ -169,36 +222,61 @@ export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) 
 
       {/* Inner Settings Viewport Contents */}
       <div className="settings-inner-viewport">
-        <GeneralTab
-          active={activeSettingsTab === "general"}
+        <SetupStatusSection
+          active={activeSettingsTab === "setup"}
           config={config}
           update={update}
-          onReplayTour={onReplayTour}
+          health={health}
+          setup={models.setup}
+          whisperModels={models.whisperModels}
+          appVersion={appVersion}
+          registration={registrationState}
+          registrationRetrying={registrationRetrying}
+          onRegistrationRetry={handleRegistrationRetry}
+          onOpen={setActiveSettingsTab}
         />
-        <AiModelTab
-          active={activeSettingsTab === "model"}
-          config={config}
-          update={update}
-          replaceConfig={setConfig}
-        />
-        <RecordingTab
+        <RecordingSection
           active={activeSettingsTab === "recording"}
           config={config}
           update={update}
-          onOpenModelTab={() => setActiveSettingsTab("model")}
+          onOpenTranscription={() => setActiveSettingsTab("transcription")}
         />
-        <TemplatesCalendarTab
-          active={activeSettingsTab === "templates"}
+        <NotificationsSection
+          active={activeSettingsTab === "notifications"}
+          config={config}
+          update={update}
+        />
+        <TranscriptionSection
+          active={activeSettingsTab === "transcription"}
+          config={config}
+          update={update}
+          health={health}
+          models={models}
+        />
+        <NotesSection
+          active={activeSettingsTab === "notes"}
+          config={config}
+          update={update}
+          models={models}
+        />
+        <IntegrationsSection
+          active={activeSettingsTab === "integrations"}
           config={config}
           update={update}
           persist={persist}
         />
-        <PrivacyDataTab
+        <PrivacyDataSection
           active={activeSettingsTab === "privacy"}
           config={config}
           update={update}
           persist={persist}
+        />
+        <GeneralSection
+          active={activeSettingsTab === "general"}
+          config={config}
+          update={update}
           appVersion={appVersion}
+          onReplayTour={onReplayTour}
         />
 
         {/* Bottom action bar */}
@@ -213,7 +291,6 @@ export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) 
             {saving ? "Saving…" : "Save"}
           </button>
         </div>
-
       </div>
     </div>
   );

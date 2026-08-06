@@ -6,13 +6,19 @@ import { describe, expect, it, vi } from "vitest";
 import { appConfig } from "../test/fixtures";
 import { Settings } from "./Settings";
 
-/** The five-tab information architecture (docs/SETUP_REDESIGN_SPEC.md § C). */
+/** The eight-section readiness-ledger IA (docs/SETTINGS_REDESIGN.md).
+ *  Order is the order the work happens in, then the app around it. Each label
+ *  MUST equal its section's first `.settings-card-title` — the last test here
+ *  is what enforces that coupling. */
 const TAB_LABELS = [
-  "General",
-  "AI Model",
+  "Setup status",
   "Recording",
-  "Templates & Calendar",
-  "Privacy & Data",
+  "Notifications",
+  "Transcription",
+  "Notes",
+  "Integrations",
+  "Privacy & data",
+  "General",
 ];
 
 describe("Settings", () => {
@@ -48,7 +54,7 @@ describe("Settings", () => {
     );
   });
 
-  it("offers exactly the five redesigned tabs, General first", async () => {
+  it("offers exactly the eight redesigned sections, Setup status first", async () => {
     mockIPC((command) => {
       if (command === "get_config") return appConfig();
       if (command === "list_templates") return [{ name: "general", description: "" }];
@@ -63,7 +69,35 @@ describe("Settings", () => {
     expect(Array.from(menu, (b) => b.textContent)).toEqual(TAB_LABELS);
   });
 
-  it("keeps every tab's card mounted and highlights only the active one", async () => {
+  it.each([
+    ["model", "Transcription"],
+    ["templates", "Notes"],
+    ["nonsense-id", "Setup status"],
+    [undefined, "Setup status"],
+  ])(
+    "resolves initialTab %s to the %s section instead of a blank pane",
+    async (initialTab, expected) => {
+      mockIPC((command) => {
+        if (command === "get_config") return appConfig();
+        if (command === "list_templates") return [{ name: "general", description: "" }];
+        if (command === "list_whisper_models") return [];
+        if (command === "plugin:app|version") return "0.3.41";
+        return null;
+      });
+      const { container } = render(<Settings initialTab={initialTab} />);
+
+      await screen.findByRole("button", { name: "General settings" });
+      // Regression: `.settings-section-card` is display:none without
+      // `.active-card`, so an unresolved id showed the sidebar and the Save
+      // button over nothing at all — silently, and this is the first thing a new
+      // user hits via the wizard and the tour's final step.
+      const active = container.querySelectorAll(".settings-section-card.active-card");
+      expect(active).toHaveLength(1);
+      expect(active[0].querySelector(".settings-card-title")?.textContent).toBe(expected);
+    },
+  );
+
+  it("keeps every section's card mounted and highlights only the active one", async () => {
     mockIPC((command) => {
       if (command === "get_config") return appConfig();
       if (command === "list_templates") return [{ name: "general", description: "" }];

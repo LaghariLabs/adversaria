@@ -39,14 +39,14 @@ describe("templateDisplayName", () => {
     // The slug is the API key (the sidecar validates it as a path-safe name),
     // so the formatter must never reach a `value=` or a backend call.
     for (const file of [
-      "../components/settings/TemplatesCalendarTab.tsx",
+      "../components/settings/NotesSection.tsx",
       "../components/NoteViewer.tsx",
     ]) {
       const text = source(file);
       expect(text).toContain("templateDisplayName");
       expect(text).not.toMatch(/value=\{[^}]*templateDisplayName/);
     }
-    expect(source("../components/settings/TemplatesCalendarTab.tsx")).toContain(
+    expect(source("../components/settings/NotesSection.tsx")).toContain(
       "value={t.name}",
     );
     expect(source("../components/NoteViewer.tsx")).toContain("value={name}");

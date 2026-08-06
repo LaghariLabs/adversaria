@@ -321,7 +321,13 @@ function App() {
     setView("settings");
   }, []);
   const openModelSettings = useCallback(
-    () => openSettingsTab("model"),
+    () => openSettingsTab("transcription"),
+    [openSettingsTab],
+  );
+  /** The notes engine lives in its own section now, so "Choose a notes model"
+   *  must not land on Transcription. */
+  const openNotesSettings = useCallback(
+    () => openSettingsTab("notes"),
     [openSettingsTab],
   );
 
@@ -1078,6 +1084,7 @@ function App() {
                   isQueued={transcriptionQueue.includes(selectedMeeting.id)}
                   transcriptionSetup={transcription}
                   onOpenModelSettings={openModelSettings}
+                  onOpenNotesSettings={openNotesSettings}
                   onDiscarded={() => {
                     setNotice("Recording discarded — no speech was detected.");
                     clearSelection();

@@ -30,11 +30,14 @@ const REPO_ID =
   /\b(qwen|mlx-community|thebloke|meta-llama|unsloth|ggml-org|bartowski)\/[\w.-]+/i;
 
 const TAB_LABELS = [
-  "General",
-  "AI Model",
+  "Setup status",
   "Recording",
-  "Templates & Calendar",
-  "Privacy & Data",
+  "Notifications",
+  "Transcription",
+  "Notes",
+  "Integrations",
+  "Privacy & data",
+  "General",
 ];
 
 /** A setup status whose *data* is full of jargon none of it may reach the screen. */
@@ -175,8 +178,9 @@ describe("Settings copy", () => {
     const user = userEvent.setup();
     const { container } = render(<Settings />);
 
-    await screen.findByRole("button", { name: "Templates & Calendar settings" });
-    await user.click(screen.getByRole("button", { name: "Show calendar setup" }));
+    // Calendar setup used to hide behind a "Show calendar setup" disclosure. In a
+    // section whose whole job is integrations, selecting it is enough.
+    await user.click(await screen.findByRole("button", { name: "Integrations settings" }));
     await screen.findByText(/Apple Calendar \(this Mac\)/);
 
     expectNoJargon(container, "cloud/PIN/calendar branches");

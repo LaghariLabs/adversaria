@@ -69,6 +69,10 @@ interface NoteViewerProps {
   /** Open Settings › AI Model. Without it the "go to Settings" advice is text
    *  the user has to act on themselves. */
   onOpenModelSettings?: () => void;
+  /** Opens the Notes section. Separate from `onOpenModelSettings`, which opens
+   *  Transcription: "Choose a notes model" landed on a section with no notes
+   *  controls in it once Settings split the two. */
+  onOpenNotesSettings?: () => void;
 }
 
 type Tab = "transcript" | "summary" | "chat" | "notes" | "insights";
@@ -119,6 +123,7 @@ export function NoteViewer({
   onDiscarded,
   transcriptionSetup,
   onOpenModelSettings,
+  onOpenNotesSettings,
 }: NoteViewerProps) {
   const [templateNames, setTemplateNames] = useState<string[]>([
     "general",
@@ -1238,8 +1243,11 @@ export function NoteViewer({
                       ? "Your notes model is set up — generate the notes whenever you're ready."
                       : "Checking which model will write them…"}
                 </p>
-                {hasEngine === false && onOpenModelSettings ? (
-                  <button className="btn-primary" onClick={onOpenModelSettings}>
+                {hasEngine === false && (onOpenNotesSettings ?? onOpenModelSettings) ? (
+                  <button
+                    className="btn-primary"
+                    onClick={onOpenNotesSettings ?? onOpenModelSettings}
+                  >
                     Choose a notes model
                   </button>
                 ) : (
