@@ -1376,6 +1376,29 @@ pub fn recover_recordings() -> Result<Vec<i64>, String> {
             continue;
         }
         let path = root.to_string_lossy().to_string();
+        // A start that captured nothing can never be recovered: there is no audio
+        // in it. Discard it instead of re-marking it pending on every launch and
+        // logging an authentication failure about a manifest that was never
+        // written. Guarded twice — it must hold no audio AND no meeting may point
+        // at it — because deleting a real recording is unforgivable and deleting
+        // an empty directory costs nothing.
+        if crate::recording_spool::is_empty_capture(&root)
+            && crate::storage::meeting_id_for_audio_path(&path)
+                .map_err(|e| format!("Could not check the recovered recording: {e}"))?
+                .is_none()
+        {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => eprintln!(
+                    "[recovery] discarded {} — the recording captured no audio",
+                    root.display()
+                ),
+                Err(error) => eprintln!(
+                    "[recovery] could not discard empty spool {}: {error}",
+                    root.display()
+                ),
+            }
+            continue;
+        }
         let session = match crate::recording_spool::mark_session_pending(&root) {
             Ok(session) => session,
             Err(error) => {
@@ -3291,6 +3314,31 @@ pub async fn resummarize_meeting(
 /// graph, and Ask — just like a recorded meeting. The raw text is preserved in
 /// the transcript field (so the Transcript tab shows the original and
 /// re-structuring stays possible); the structured result replaces the summary.
+/// Draft a note template from a plain-language description, using the LLM the
+/// user has already configured.
+///
+/// Nothing is written to the prompts directory: the draft goes back to the editor
+/// so the user reads it and chooses a name. A template is a system prompt — saving
+/// an unreviewed one would silently change how every future note is written.
+#[tauri::command]
+pub async fn generate_template(
+    state: State<'_, AppState>,
+    description: String,
+) -> Result<String, String> {
+    if description.trim().is_empty() {
+        return Err("Describe the notes you want before generating.".to_string());
+    }
+    state
+        .client
+        .generate_template(
+            description.trim(),
+            &configured_model().unwrap_or_default(),
+            &configured_llm_base_url().unwrap_or_default(),
+            &configured_llm_api_key().unwrap_or_default(),
+        )
+        .await
+}
+
 #[tauri::command]
 pub async fn structure_note(
     state: State<'_, AppState>,

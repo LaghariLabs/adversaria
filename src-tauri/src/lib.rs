@@ -231,6 +231,7 @@ pub fn run() {
             commands::pick_audio_file,
             commands::resummarize_meeting,
             commands::structure_note,
+            commands::generate_template,
             commands::chat_with_meeting,
             commands::get_chat_messages,
             commands::clear_chat,

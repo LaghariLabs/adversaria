@@ -23,6 +23,15 @@ const KEYRING_SERVICE: &str = "adversaria-recordings";
 const KEYRING_ACCOUNT: &str = "spool-key-v1";
 const QUEUE_CAPACITY: usize = 128;
 
+/// Leading phrase on an error that a retry can NEVER clear.
+///
+/// The transcription queue appends "the recording is safe — press Transcribe now
+/// to retry" to every failure, which is true for a service that is merely down
+/// and a lie for a spool whose index is gone. The frontend keys off this phrase to
+/// stop promising a retry that cannot work. Kept as one shared constant so the two
+/// sides cannot drift; mirrored in `src/lib/recordingErrors.ts`.
+pub const UNRECOVERABLE_PREFIX: &str = "This recording can't be recovered";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioFormat {
     pub sample_rate: u32,
@@ -525,8 +534,22 @@ fn decrypt_channel(
     key: [u8; 32],
     processing: &Path,
 ) -> Result<PathBuf, String> {
-    let manifest = read_json::<ChannelManifest>(&root.join(format!("{channel}.json")))
-        .map_err(|e| format!("Could not read {channel} recording manifest: {e}"))?;
+    // A missing channel index is terminal: the encrypted records cannot be read
+    // without their nonce prefix and format, so no amount of retrying helps.
+    // Saying "retry" here is what left a user pressing a button that could never
+    // succeed (2026-08-06). Other I/O errors stay retryable — a locked or
+    // temporarily unreadable file is a different problem from an absent one.
+    let manifest =
+        read_json::<ChannelManifest>(&root.join(format!("{channel}.json"))).map_err(|e| match e
+            .kind()
+        {
+            std::io::ErrorKind::NotFound => format!(
+                "{UNRECOVERABLE_PREFIX} — the index for its {channel} audio is missing, so the \
+                 encrypted recording can no longer be read. Security software removing files from \
+                 the recordings folder is the usual cause."
+            ),
+            _ => format!("Could not read {channel} recording manifest: {e}"),
+        })?;
     let prefix = hex_decode::<16>(&manifest.nonce_prefix_hex)?;
     let mut file = File::open(root.join(&manifest.records_file))
         .map_err(|e| format!("Could not open encrypted {channel} recording: {e}"))?;
@@ -644,6 +667,40 @@ fn decrypt_channel(
         return Err(error);
     }
     Ok(output)
+}
+
+/// Whether a spool holds no captured audio at all and never can.
+///
+/// A start that never captured anything leaves the directory and `manifest.json`
+/// behind with `channels: []`, because a channel is only recorded on `finish`.
+/// Nine such directories sat in one library for two weeks, and every launch
+/// re-marked them pending, failed to read a channel manifest that was never
+/// written, and logged it as an authentication failure — forever, with nothing to
+/// recover. Deliberately strict: a channel manifest OR a single byte of records
+/// means this is a real recording and must never be treated as disposable.
+pub fn is_empty_capture(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false; // unreadable is not the same as empty — leave it alone
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "manifest.json" {
+            continue;
+        }
+        // A channel manifest means a channel committed data.
+        if name.ends_with(".json") {
+            return false;
+        }
+        // Any non-empty file is captured audio (or its index).
+        if path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(true) {
+            return false;
+        }
+        if path.is_dir() {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn read_session(root: &Path) -> Result<SessionManifest, String> {
@@ -864,6 +921,113 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> std::io::Result<T> {
 
 #[cfg(test)]
 mod tests {
+    /// `is_empty_capture` decides whether a spool may be deleted, so the tests
+    /// that matter are the ones proving it says NO. Nine empty spools sat in a
+    /// real library for two weeks being re-marked pending on every launch; the
+    /// cost of over-deleting is a lost recording, so every "has something" case
+    /// is pinned.
+    mod empty_capture {
+        use super::super::is_empty_capture;
+
+        struct Spool(std::path::PathBuf);
+        impl Spool {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for Spool {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn spool(files: &[(&str, &[u8])]) -> Spool {
+            let root = super::test_root("empty-capture");
+            for (name, bytes) in files {
+                std::fs::write(root.join(name), bytes).expect("write");
+            }
+            Spool(root)
+        }
+
+        #[test]
+        fn manifest_only_is_empty() {
+            // Exactly the shape found on disk: start ran, nothing was captured.
+            let d = spool(&[("manifest.json", br#"{"channels":[]}"#)]);
+            assert!(is_empty_capture(d.path()));
+        }
+
+        #[test]
+        fn zero_length_records_are_still_empty() {
+            let d = spool(&[
+                ("manifest.json", br#"{"channels":[]}"#),
+                ("system.records", b""),
+                ("mic.records", b""),
+            ]);
+            assert!(is_empty_capture(d.path()));
+        }
+
+        #[test]
+        fn a_channel_manifest_means_a_real_recording() {
+            // A channel manifest is only written once a channel commits data.
+            let d = spool(&[
+                ("manifest.json", br#"{"channels":["system"]}"#),
+                ("system.json", br#"{"channel":"system"}"#),
+            ]);
+            assert!(
+                !is_empty_capture(d.path()),
+                "must never delete a committed recording"
+            );
+        }
+
+        #[test]
+        fn any_recorded_byte_means_a_real_recording() {
+            let d = spool(&[
+                ("manifest.json", br#"{"channels":[]}"#),
+                ("system.records", b"ADVSP001"),
+            ]);
+            assert!(
+                !is_empty_capture(d.path()),
+                "one byte of audio is still audio"
+            );
+        }
+
+        #[test]
+        fn an_unreadable_directory_is_not_empty() {
+            // Absence of evidence is not evidence of absence: if the directory
+            // cannot be read, leave it alone rather than delete it.
+            assert!(!is_empty_capture(std::path::Path::new(
+                "/nonexistent-spool-xyz"
+            )));
+        }
+
+        #[test]
+        fn a_missing_channel_index_is_reported_as_unrecoverable() {
+            // The friend's case: audio present, channel index gone. This must be
+            // phrased as terminal, because the queue appends a retry promise to
+            // anything that is not, and that button can never succeed here.
+            let d = spool(&[
+                ("manifest.json", br#"{"channels":["system"]}"#),
+                ("system.records", b"ADVSP001"),
+            ]);
+            let processing = super::test_root("unrecoverable-processing");
+            let error =
+                super::super::decrypt_channel(d.path(), "sess", "system", [0u8; 32], &processing)
+                    .expect_err("a missing channel index must fail");
+            assert!(
+                error.starts_with(super::super::UNRECOVERABLE_PREFIX),
+                "expected a terminal message, got: {error}"
+            );
+            let _ = std::fs::remove_dir_all(&processing);
+        }
+
+        #[test]
+        fn a_subdirectory_means_leave_it_alone() {
+            let d = spool(&[("manifest.json", br#"{}"#)]);
+            std::fs::create_dir(d.path().join("chunks")).expect("mkdir");
+            assert!(!is_empty_capture(d.path()));
+        }
+    }
+
     use super::*;
     use std::io::{Seek, SeekFrom};
 

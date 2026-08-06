@@ -1090,6 +1090,104 @@ class OllamaSummarizer:
             attendee_details=self._attendee_details(data, attendees),
         )
 
+
+    def generate_template(
+        self,
+        description: str,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        example_template: str = "general",
+    ) -> str:
+        """Write a new note template from a plain-language description.
+
+        Free-text (not schema-constrained): the product of this call IS a prompt,
+        so forcing it through the summarize JSON schema would mean smuggling
+        markdown out through a string field.
+
+        A real bundled template is passed as the example on purpose. Templates are
+        not free-form writing instructions — they must emit the structured-notes
+        shape that `storage.rs::extract_action_items` parses into to-do rows, so a
+        template invented from scratch produces notes that look right and silently
+        stop populating the to-do board. Showing the model a working template is
+        what keeps that contract.
+
+        Args:
+            description: What the user wants the notes to look like.
+            model: Model override; defaults to the summarizer's model.
+            base_url: When non-empty, route through the OpenAI-compatible path.
+            api_key: Credential for that path.
+            example_template: Name of the bundled template to show as the example.
+
+        Returns:
+            The generated template body, ready to review and save. Never written
+            to disk here — the user names and saves it.
+        """
+        if not description.strip():
+            raise ValueError("Describe the notes you want before generating.")
+
+        try:
+            example = load_prompt(example_template)
+        except Exception:  # noqa: BLE001 - a missing example must not block the feature
+            logger.warning("Example template %r unavailable; generating without one.", example_template)
+            example = ""
+
+        use_model = model or self.model
+        logger.info(
+            "Generate template: model=%s description_len=%d example=%s",
+            use_model,
+            len(description),
+            example_template if example else "none",
+        )
+
+        system = (
+            "You write system prompts ('templates') for a meeting-notes app. "
+            "A template instructs a smaller model how to turn a meeting transcript "
+            "into structured notes.\n\n"
+            "Rules:\n"
+            "1. Copy the STRUCTURE and output contract of the example exactly — the "
+            "same headings, the same bullet shape, the same action-item format. The "
+            "app parses those to build a to-do list; changing the shape breaks it.\n"
+            "2. Change only what the user asked for: the sections, the emphasis, the "
+            "tone, what to include or leave out.\n"
+            "3. Keep every anti-invention rule from the example. The notes must never "
+            "state anything the transcript does not support.\n"
+            "4. Output ONLY the template text. No preamble, no explanation, no code "
+            "fences."
+        )
+        user = (
+            f"EXAMPLE TEMPLATE (follow its structure):\n\n{example}\n\n"
+            f"END OF EXAMPLE.\n\n"
+            f"Write a new template for this request:\n\n{description.strip()}"
+            if example
+            else f"Write a note template for this request:\n\n{description.strip()}"
+        )
+
+        raw = self._chat(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            model=use_model,
+            json_schema=None,
+            base_url=base_url,
+            api_key=api_key,
+        )
+        template = _strip_think(raw).strip()
+        # Models wrap prose in fences even when told not to; the fence would end up
+        # inside the saved prompt.
+        template = re.sub(r"^```[a-zA-Z]*\n?", "", template)
+        template = re.sub(r"\n?```$", "", template).strip()
+        # A leading/trailing horizontal rule is an echoed delimiter, not content.
+        template = re.sub(r"^(?:-{3,}|\*{3,}|={3,})\s*\n", "", template)
+        template = re.sub(r"\n\s*(?:-{3,}|\*{3,}|={3,})$", "", template).strip()
+        if not template:
+            raise RuntimeError(
+                "The model returned an empty template — please try again, or "
+                "describe the notes you want in more detail."
+            )
+        return template
+
     def chat(
         self,
         transcript: str,

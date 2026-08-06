@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { TriangleAlert } from "lucide-react";
 
@@ -8,12 +8,13 @@ import { EngineInstallCard } from "../EngineInstallCard";
 import { formatGb, isInFlight } from "../../lib/modelDownloads";
 import {
   deleteTemplate,
+  generateTemplate,
   getTemplate,
   listTemplates,
   saveTemplate,
   testLlmConnection,
 } from "../../lib/tauri";
-import { templateDisplayName } from "../../lib/templateNames";
+import { templateDisplayName, templateSlug } from "../../lib/templateNames";
 
 const PROVIDER_LABEL: Record<string, string> = {
   groq: "Groq",
@@ -117,7 +118,7 @@ export function NotesSection({ active, config, update, models }: NotesSectionPro
   }, [loadTemplates]);
 
   const saveCurrentTemplate = async () => {
-    const name = (newTemplateName.trim() || editingTemplate).toLowerCase();
+    const name = templateSlug(newTemplateName) || editingTemplate;
     if (!name) {
       setTemplateMsg("Pick a template or enter a new name.");
       return;
@@ -143,6 +144,43 @@ export function NotesSection({ active, config, update, models }: NotesSectionPro
       await loadTemplates();
     } catch (err) {
       setTemplateMsg(String(err));
+    }
+  };
+
+  // Draft a template from a description, using the LLM already configured.
+  const [templateWish, setTemplateWish] = useState("");
+  const [generating, setGenerating] = useState(false);
+  // Feedback has to sit BESIDE the button. `templateMsg` renders below a 300px
+  // textarea, so the first draft looked like nothing happened: the result landed
+  // off-screen and the status was further down still.
+  const [wishMsg, setWishMsg] = useState("");
+  const editorRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const generateFromWish = async () => {
+    if (!templateWish.trim() || generating) return;
+    setGenerating(true);
+    setTemplateMsg("");
+    setWishMsg("");
+    try {
+      const draft = await generateTemplate(templateWish);
+      // Into the editor, never straight to disk: a template is a system prompt,
+      // so the user reads the draft and names it before anything is saved.
+      setTemplateBody(draft);
+      setEditingTemplate("");
+      setNewTemplateName("");
+      setTemplateMsg("Draft ready — read it, then name it and press Save.");
+      setWishMsg("Draft ready below.");
+      // Scroll the editor into view. Without this the draft appears in a textarea
+      // the user cannot see, which reads as "the button did nothing".
+      requestAnimationFrame(() => {
+        editorRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+        editorRef.current?.focus();
+      });
+    } catch (e) {
+      setTemplateMsg(String(e));
+      setWishMsg(String(e));
+    } finally {
+      setGenerating(false);
     }
   };
 
@@ -458,7 +496,43 @@ export function NotesSection({ active, config, update, models }: NotesSectionPro
 
       {/* Editor */}
       <div className="settings-form-group">
-        <label className="settings-label" htmlFor="settings-edit-template">Edit a template</label>
+        <label className="settings-label" htmlFor="settings-template-wish">
+          Describe the notes you want
+        </label>
+        <div className="settings-row">
+          <input
+            id="settings-template-wish"
+            type="text"
+            className="settings-input-text"
+            value={templateWish}
+            placeholder="e.g. a weekly 1:1 with my manager — wins, blockers, what I need from them"
+            onChange={(e) => setTemplateWish(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void generateFromWish();
+            }}
+            disabled={generating}
+          />
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => void generateFromWish()}
+            disabled={generating || !templateWish.trim()}
+          >
+            {generating ? "Writing…" : "Draft it"}
+          </button>
+        </div>
+        {(generating || wishMsg) && (
+          <p className={`settings-msg${!generating && wishMsg.startsWith("Draft ready") ? " ok" : generating ? "" : " err"}`} role="status">
+            {generating ? "Writing your template — this can take up to a minute…" : wishMsg}
+          </p>
+        )}
+        <p className="settings-help">
+          Your own AI writes the template and puts the draft below — nothing is saved
+          until you name it and press Save. It follows an existing template's shape,
+          so your notes keep filling the to-do list.
+        </p>
+
+        <label className="settings-label" htmlFor="settings-edit-template" style={{ marginTop: 16 }}>Edit a template</label>
         <select
           id="settings-edit-template"
           value={editingTemplate}
@@ -485,6 +559,7 @@ export function NotesSection({ active, config, update, models }: NotesSectionPro
           ))}
         </select>
         <textarea
+          ref={editorRef}
           value={templateBody}
           onChange={(e) => setTemplateBody(e.target.value)}
           placeholder="Select a template above, or type a new prompt and name it below."
@@ -502,16 +577,31 @@ export function NotesSection({ active, config, update, models }: NotesSectionPro
             type="text"
             value={newTemplateName}
             onChange={(e) => setNewTemplateName(e.target.value)}
-            placeholder="template-name (lowercase, hyphens) — or blank to overwrite"
-            className="settings-input-text font-mono"
+            placeholder="Name it however you like — or leave blank to overwrite"
+            className="settings-input-text"
           />
           <button onClick={saveCurrentTemplate} className="btn-primary">Save</button>
           <button onClick={deleteCurrentTemplate} disabled={!editingTemplate} className="btn-danger">
             Delete
           </button>
         </div>
+        {templateSlug(newTemplateName) &&
+          templateSlug(newTemplateName) !== newTemplateName.trim() && (
+            <p className="settings-help">
+              Will be saved as <strong>{templateSlug(newTemplateName)}</strong>
+            </p>
+          )}
         {templateMsg && (
-          <p className={`settings-msg${templateMsg === "Saved." || templateMsg === "Deleted." ? " ok" : templateMsg.startsWith("Pick") ? " warn" : ""}`}>
+          <p
+            className={`settings-msg${
+              templateMsg === "Saved." || templateMsg === "Deleted."
+                ? " ok"
+                : templateMsg.startsWith("Pick") || templateMsg.startsWith("Draft ready")
+                  ? " warn"
+                  : " err"
+            }`}
+            role="status"
+          >
             {templateMsg}
           </p>
         )}

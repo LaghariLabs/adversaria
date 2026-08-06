@@ -361,6 +361,20 @@ class SummarizeResponse(BaseModel):
     attendee_details: list[AttendeeDetail] = Field(default_factory=list)
 
 
+class GenerateTemplateRequest(BaseModel):
+    """Ask the configured LLM to write a note template from a description."""
+
+    description: str
+    model: str | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    example_template: str = "general"
+
+
+class GenerateTemplateResponse(BaseModel):
+    template: str
+
+
 class ChatResponse(BaseModel):
     answer: str
 

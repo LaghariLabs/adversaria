@@ -34,3 +34,21 @@ export function templateDisplayName(slug: string): string {
   if (!spaced) return slug;
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
+
+/** Turn anything a person types into a template name the service accepts.
+ *
+ *  The sidecar validates names against `^[a-z0-9][a-z0-9-]{0,48}$`
+ *  (`config._safe_name`) and returns 400 for anything else. Now that the app
+ *  drafts a template from a sentence, users name it in a sentence too — "daily
+ *  team standup" was rejected outright. Slugify instead of refusing: the rule is
+ *  a storage constraint, not something the user should have to learn.
+ */
+export function templateSlug(input: string): string {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 49)
+    .replace(/-+$/g, "");
+}

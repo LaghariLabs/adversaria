@@ -1031,6 +1031,13 @@ nav {
   flex-wrap: wrap;
   gap: 8px;
 }
+/* `.btn-secondary` is `flex: 1` for full-width button rows, which stretched Edit
+   and Copy across the note toolbar while Export — wrapped in a positioning div —
+   stayed compact. In a toolbar every button sizes to its label. */
+.tab-actions .btn-secondary,
+.tab-actions .btn-primary {
+  flex: none;
+}
 
 .select-dropdown {
   background: rgba(255, 255, 255, 0.05);
@@ -2721,8 +2728,11 @@ nav {
 }
 
 .btn-primary:disabled {
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text-muted);
+  /* Dimmed accent, not grey. A grey primary button reads as a broken control
+     rather than a waiting one — "Ask AI" above an empty input looked disabled in
+     the sense of missing, so it keeps its colour and only loses its contrast. */
+  background: color-mix(in srgb, var(--accent-blue) 34%, transparent);
+  color: rgba(255, 255, 255, 0.55);
   cursor: not-allowed;
 }
 

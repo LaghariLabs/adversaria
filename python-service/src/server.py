@@ -15,6 +15,8 @@ from fastapi.responses import StreamingResponse
 
 from .live import LiveCaptionSession, is_filler_hallucination, is_repetition_loop
 from .models import (
+    GenerateTemplateRequest,
+    GenerateTemplateResponse,
     ChatRequest,
     ChatResponse,
     EmbedRequest,
@@ -786,6 +788,29 @@ def live_feed(request: LiveFeedRequest) -> LiveFeedResponse:
 # ---------------------------------------------------------------------------
 # Summarize
 # ---------------------------------------------------------------------------
+
+
+@app.post("/generate-template", response_model=GenerateTemplateResponse)
+def generate_template(request: GenerateTemplateRequest) -> GenerateTemplateResponse:
+    """Draft a note template from a plain-language description.
+
+    Returns the text only — nothing is written to the prompts directory. The user
+    reviews it in the editor and names it, so a bad draft costs nothing.
+    """
+    if _summarizer is None:
+        raise HTTPException(status_code=503, detail="Summarizer not initialized")
+
+    try:
+        template = _summarizer.generate_template(
+            description=request.description,
+            model=request.model,
+            base_url=request.llm_base_url,
+            api_key=request.llm_api_key,
+            example_template=request.example_template,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return GenerateTemplateResponse(template=template)
 
 
 @app.post("/summarize", response_model=SummarizeResponse)

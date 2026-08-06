@@ -425,6 +425,15 @@ export function restartLocalAiService(): Promise<void> {
   return invoke("restart_local_ai_service");
 }
 
+/** Draft a note template from a plain-language description.
+ *
+ *  Returns the text only — nothing is saved. The caller puts it in the editor so
+ *  the user reads it and names it: a template is a system prompt, and saving an
+ *  unreviewed one silently changes how every future note is written. */
+export function generateTemplate(description: string): Promise<string> {
+  return invoke("generate_template", { description });
+}
+
 /** Probe a cloud LLM provider's /models endpoint to validate base URL + key. */
 export function testLlmConnection(baseUrl: string, apiKey: string): Promise<string> {
   return invoke("test_llm_connection", { baseUrl, apiKey });

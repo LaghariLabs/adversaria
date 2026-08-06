@@ -537,6 +537,54 @@ impl HttpClient {
             .map_err(|_| UNEXPECTED_RESPONSE.to_string())
     }
 
+    /// Draft a note template from a plain-language description.
+    ///
+    /// Returns the text only; nothing is saved. The user reviews the draft in the
+    /// editor and names it, so a poor draft costs nothing.
+    pub async fn generate_template(
+        &self,
+        description: &str,
+        model: &str,
+        llm_base_url: &str,
+        llm_api_key: &str,
+    ) -> Result<String, String> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            description: &'a str,
+            model: &'a str,
+            llm_base_url: &'a str,
+            llm_api_key: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct Reply {
+            template: String,
+        }
+
+        let base_url = self.base_url.read().unwrap().clone();
+        let resp = self
+            .client
+            .post(format!("{}/generate-template", base_url))
+            .json(&Body {
+                description,
+                model,
+                llm_base_url,
+                llm_api_key,
+            })
+            .send()
+            .await
+            .map_err(|_| SERVICE_DOWN.to_string())?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(summarize_error(&body));
+        }
+
+        resp.json::<Reply>()
+            .await
+            .map(|reply| reply.template)
+            .map_err(|_| UNEXPECTED_RESPONSE.to_string())
+    }
+
     /// Ask a grounded question about a meeting transcript; returns the answer text.
     pub async fn chat(
         &self,

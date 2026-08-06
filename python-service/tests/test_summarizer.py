@@ -1395,3 +1395,63 @@ class TestLocalOllamaBaseUrlReroute:
         assert out == "cloud"
         s._chat_openai.assert_called_once()
         assert s.client is None  # the native client was never touched
+
+
+class TestGenerateTemplate:
+    """Drafting a template from a description.
+
+    The load-bearing part is not that it returns text — it is that the draft keeps
+    the structured-notes contract. A template invented from scratch produces notes
+    that look fine and silently stop filling the to-do board, because
+    `storage.rs::extract_action_items` parses a specific bullet shape.
+    """
+
+    def _summarizer(self, monkeypatch, reply: str):
+        s = OllamaSummarizer(model="test-model", host="http://localhost:11434")
+        captured: dict = {}
+
+        def fake_chat(messages, model, json_schema, base_url=None, api_key=None):
+            captured["messages"] = messages
+            captured["json_schema"] = json_schema
+            return reply
+
+        monkeypatch.setattr(s, "_chat", fake_chat)
+        return s, captured
+
+    def test_shows_the_model_a_real_template_as_the_example(self, monkeypatch) -> None:
+        """The example is a REAL bundled template, so the output contract survives."""
+        s, captured = self._summarizer(monkeypatch, "# My template\nDo the thing.")
+        s.generate_template(description="notes for a 1:1 with my manager")
+
+        user = captured["messages"][1]["content"]
+        # The bundled general template is the example; a marker from it must appear.
+        assert "EXAMPLE TEMPLATE" in user
+        assert "1:1 with my manager" in user
+        # Free text, never schema-constrained: the product of this call IS a prompt.
+        assert captured["json_schema"] is None
+
+    def test_strips_code_fences(self, monkeypatch) -> None:
+        """Models fence prose even when told not to; the fence would be saved."""
+        s, _ = self._summarizer(monkeypatch, "```markdown\n# Template\nBody.\n```")
+        assert s.generate_template(description="anything") == "# Template\nBody."
+
+    def test_empty_description_is_rejected_before_calling_the_model(self, monkeypatch) -> None:
+        s, captured = self._summarizer(monkeypatch, "unused")
+        with pytest.raises(ValueError):
+            s.generate_template(description="   ")
+        assert "messages" not in captured, "must not spend a model call on empty input"
+
+    def test_empty_reply_is_an_error_not_an_empty_template(self, monkeypatch) -> None:
+        """Saving an empty template would silently break every note that used it."""
+        s, _ = self._summarizer(monkeypatch, "   \n  ")
+        with pytest.raises(RuntimeError, match="empty template"):
+            s.generate_template(description="notes for standups")
+
+    def test_strips_an_echoed_horizontal_rule(self, monkeypatch) -> None:
+        """Verified live: qwen3.6-35b echoed the example's delimiter into the body.
+
+        A stray `---` at the top of a system prompt is harmless to the model but
+        makes the saved template look broken to the person reading it.
+        """
+        s, _ = self._summarizer(monkeypatch, "---\nYou are an expert note taker.\n---")
+        assert s.generate_template(description="1:1 notes") == "You are an expert note taker."

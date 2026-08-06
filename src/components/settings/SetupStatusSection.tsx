@@ -328,18 +328,21 @@ export function SetupStatusSection({
         ) : (
           <p className="settings-msg err">● The on-device service is not reachable</p>
         )}
-        {/* Kept in the DOM at every status: it is the canonical recovery action,
-            and AiModelTab's suite finds it without expanding anything. Disabled
-            rather than hidden when there is nothing to recover, so the button
-            never appears and disappears under the user. */}
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={() => void health.restartService()}
-          disabled={health.serviceRestarting || !serviceDown}
-        >
-          {health.serviceRestarting ? "Restarting…" : "Restart Local AI"}
-        </button>
+        {/* Only when there is something to recover. Rendering it always — even
+            disabled — put a dead grey button directly under a green "services are
+            running" line, which reads as a broken control rather than an
+            unnecessary one. */}
+        {serviceDown && (
+          <button
+            type="button"
+            className="btn-primary"
+            style={{ marginTop: 10, alignSelf: "flex-start" }}
+            onClick={() => void health.restartService()}
+            disabled={health.serviceRestarting}
+          >
+            {health.serviceRestarting ? "Restarting…" : "Restart Local AI"}
+          </button>
+        )}
         {health.serviceRestartMessage && (
           <p className="settings-help" role="status">
             {health.serviceRestartMessage}
