@@ -1,32 +1,24 @@
-import { useState } from "react";
-import { open } from "@tauri-apps/plugin-shell";
+import { useEffect, useRef, useState } from "react";
 
 import type { AppConfig } from "../../types";
-import {
-  exportAllMeetings,
-  exportRedactedDiagnostics,
-  exportSecondBrain,
-  importAllMeetings,
-} from "../../lib/tauri";
+import { exportAllMeetings, importAllMeetings } from "../../lib/tauri";
 import { hashPin, verifyPin } from "../../lib/pin";
 
-/** Where beta sign-up + feedback emails are addressed. */
-const FEEDBACK_EMAIL = "mhlaghari@gmail.com";
-
-interface PrivacyDataTabProps {
+interface PrivacyDataSectionProps {
   active: boolean;
   config: AppConfig;
+  /** Deferred edits. Nothing in this section defers — every control here writes
+   *  immediately — but the shell hands the same props to all eight sections. */
   update: (patch: Partial<AppConfig>) => void;
-  /** Write a whole config to disk immediately (encryption + PIN take effect now). */
+  /** Write a whole config to disk immediately (encryption, PIN and Touch ID take effect now). */
   persist: (next: AppConfig) => Promise<void>;
-  appVersion: string;
 }
 
-/** Privacy & Data — the lock, the backups, the diagnostics, the vault export, and feedback. */
-export function PrivacyDataTab({ active, config, update, persist, appVersion }: PrivacyDataTabProps) {
+/** Privacy & data — the lock on your notes, and your own backup of them. */
+export function PrivacyDataSection({ active, config, persist }: PrivacyDataSectionProps) {
   // Encryption-at-rest toggle. Persisted immediately; the actual encrypt/decrypt
-  // migration runs at the next startup (so it needs an app restart, like the
-  // service-URL setting), surfaced via a restart note.
+  // migration runs at the next startup (the database is opened once when the app
+  // launches), so it needs an app restart — surfaced via a restart note.
   const [encMsg, setEncMsg] = useState<string | null>(null);
   const handleEncryptToggle = async (enabled: boolean) => {
     try {
@@ -47,6 +39,22 @@ export function PrivacyDataTab({ active, config, update, persist, appVersion }: 
   const [pinCurrent, setPinCurrent] = useState("");
   const [pinMsg, setPinMsg] = useState<string | null>(null);
 
+  // Only the two success messages auto-dismiss; errors stay until the next try.
+  // The timer is tracked so it can be cancelled — untracked, it fired setState
+  // 2s after the fact, which becomes a real bug the day sections unmount.
+  const pinMsgTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (pinMsgTimer.current !== null) window.clearTimeout(pinMsgTimer.current);
+    },
+    []
+  );
+  const flashPinMsg = (msg: string) => {
+    setPinMsg(msg);
+    if (pinMsgTimer.current !== null) window.clearTimeout(pinMsgTimer.current);
+    pinMsgTimer.current = window.setTimeout(() => setPinMsg(null), 2000);
+  };
+
   const handleSetPin = async () => {
     setPinMsg(null);
     if (!/^\d{4,}$/.test(pin1)) {
@@ -62,8 +70,7 @@ export function PrivacyDataTab({ active, config, update, persist, appVersion }: 
       await persist({ ...config, pin_hash: hash });
       setPin1("");
       setPin2("");
-      setPinMsg("PIN set.");
-      setTimeout(() => setPinMsg(null), 2000);
+      flashPinMsg("PIN set.");
     } catch (e) {
       setPinMsg(String(e));
     }
@@ -80,48 +87,35 @@ export function PrivacyDataTab({ active, config, update, persist, appVersion }: 
     try {
       await persist({ ...config, pin_hash: null });
       setPinCurrent("");
-      setPinMsg("PIN removed.");
-      setTimeout(() => setPinMsg(null), 2000);
+      flashPinMsg("PIN removed.");
     } catch (e) {
       setPinMsg(String(e));
     }
   };
 
-  // --- Data & backup ---
-  const [dataMsg, setDataMsg] = useState<string | null>(null);
-  const [dataBusy, setDataBusy] = useState(false);
-
-  const handleDiagnosticExport = async () => {
-    setDataBusy(true);
-    setDataMsg(null);
+  // Touch ID was the odd one out: it deferred to the Save button while the three
+  // controls beside it wrote immediately, so ticking it and closing Settings lost
+  // it. Promoted to an immediate write on 2026-08-06 to match its neighbours.
+  // The write can fail, so say so rather than leave the box looking switched on.
+  const [bioMsg, setBioMsg] = useState<string | null>(null);
+  const handleBiometricToggle = async (enabled: boolean) => {
+    setBioMsg(null);
     try {
-      const path = await exportRedactedDiagnostics();
-      setDataMsg(path ? "Redacted diagnostics exported." : "Export cancelled.");
-    } catch (error) {
-      setDataMsg(String(error));
-    } finally {
-      setDataBusy(false);
+      await persist({ ...config, biometric_unlock: enabled });
+    } catch (e) {
+      setBioMsg(String(e));
     }
   };
 
-  // Feedback — opens the user's own mail client pre-addressed to the developer
-  // with their typed message as the body. No backend; nothing is sent until they
-  // hit send in their email app (privacy-clean).
-  const [feedbackText, setFeedbackText] = useState("");
-  const sendFeedback = () => {
-    const subject = `Adversaria Feedback${appVersion ? ` (v${appVersion})` : ""}`;
-    const body = feedbackText.trim();
-    open(
-      `mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
-    );
-  };
+  // --- Back up & restore --- one busy/message pair for these two buttons.
+  const [dataMsg, setDataMsg] = useState<string | null>(null);
+  const [dataBusy, setDataBusy] = useState(false);
 
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`}>
-      <h3 className="settings-card-title">Privacy &amp; Data</h3>
+      <h3 className="settings-card-title">Privacy &amp; data</h3>
       <p className="settings-card-desc">
-        Locks, backups, diagnostics, and where your notes can be mirrored — all of
-        it on this machine.
+        Lock your notes on this machine, and keep your own backup of them.
       </p>
 
       {/* ---- Security & privacy lock ---- */}
@@ -209,7 +203,7 @@ export function PrivacyDataTab({ active, config, update, persist, appVersion }: 
           <input
             type="checkbox"
             checked={config.biometric_unlock}
-            onChange={(e) => update({ biometric_unlock: e.target.checked })}
+            onChange={(e) => handleBiometricToggle(e.target.checked)}
           />
           Unlock locked meetings with Touch ID
         </label>
@@ -217,6 +211,7 @@ export function PrivacyDataTab({ active, config, update, persist, appVersion }: 
           Use your fingerprint (Touch ID on Mac, Windows Hello on Windows) to open
           locked meetings, falling back to the PIN above if biometrics aren't available.
         </p>
+        {bioMsg && <p className="settings-msg err">{bioMsg}</p>}
       </div>
 
       {/* ---- Data & backup ---- */}
@@ -267,96 +262,6 @@ export function PrivacyDataTab({ active, config, update, persist, appVersion }: 
           </button>
         </div>
         {dataMsg && <p className="settings-help">{dataMsg}</p>}
-      </div>
-
-      <div className="settings-form-group">
-        <h3 className="settings-card-title">Support diagnostics</h3>
-        <p className="settings-card-desc">
-          Export a small local lifecycle log only when you choose. Email addresses,
-          filesystem paths, secrets, and meeting content are redacted; nothing is
-          uploaded automatically.
-        </p>
-        <button className="btn-secondary" disabled={dataBusy} onClick={handleDiagnosticExport}>
-          Export redacted diagnostics…
-        </button>
-      </div>
-
-      {/* Second Brain export: mirror meetings into a local vault folder as
-          markdown notes (wikilinks + OKF frontmatter) for Obsidian/graphify. */}
-      <h3 className="settings-card-title" style={{ marginTop: 18 }}>Second Brain</h3>
-      <p className="settings-card-desc">
-        Mirror your meetings into a local folder as markdown notes with
-        [[wikilinks]] — readable by Obsidian and your knowledge graph.
-        Summaries only (never raw transcripts); locked meetings are never
-        exported. Everything stays on this machine.
-      </p>
-      <div className="settings-form-group">
-        <label className="settings-label" htmlFor="second-brain-path">
-          Vault folder
-        </label>
-        <input
-          id="second-brain-path"
-          className="settings-input-text"
-          type="text"
-          value={config.second_brain_path}
-          onChange={(e) => update({ second_brain_path: e.target.value })}
-          placeholder="/Users/you/vault/wiki/meetings"
-        />
-        <label className="checkbox-label" style={{ marginTop: 8 }}>
-          <input
-            type="checkbox"
-            checked={config.second_brain_enabled}
-            onChange={(e) => update({ second_brain_enabled: e.target.checked })}
-          />
-          Auto-export after every meeting change
-        </label>
-        <p className="settings-help">
-          Remember to Save Settings after changing these. Each export rewrites
-          the notes, an index.md, and a graph.json in that folder.
-        </p>
-        <div className="settings-row" style={{ gap: 10, marginTop: 8 }}>
-          <button
-            className="btn-secondary"
-            disabled={dataBusy || !config.second_brain_path.trim()}
-            onClick={async () => {
-              setDataBusy(true);
-              setDataMsg(null);
-              try {
-                const count = await exportSecondBrain();
-                setDataMsg(
-                  `Exported ${count} meeting note${count === 1 ? "" : "s"} to ${config.second_brain_path.trim()}`,
-                );
-              } catch (e) {
-                setDataMsg(String(e));
-              } finally {
-                setDataBusy(false);
-              }
-            }}
-          >
-            Export now
-          </button>
-        </div>
-      </div>
-
-      {/* ---- Feedback ---- */}
-      <h3 className="settings-card-title" style={{ marginTop: 18 }}>Feedback</h3>
-      <p className="settings-card-desc">
-        Found a bug or have an idea? Send it straight to the developer. This opens
-        your email app with a message addressed to {FEEDBACK_EMAIL} — nothing is
-        sent until you press send.
-      </p>
-      <div className="settings-form-group">
-        <textarea
-          className="settings-textarea"
-          rows={6}
-          value={feedbackText}
-          onChange={(e) => setFeedbackText(e.target.value)}
-          placeholder="What's working, what's broken, what you'd love to see…"
-        />
-        <div className="settings-row" style={{ marginTop: 10 }}>
-          <button onClick={sendFeedback} className="btn-primary">Send Feedback</button>
-        </div>
-        <p className="settings-help">Your message is included as the email body.</p>
       </div>
     </div>
   );

@@ -5,7 +5,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AppConfig, ModelDownloadStatus, TranscriptionProvider } from "../../types";
 import { appConfig } from "../../test/fixtures";
-import { AiModelTab } from "./AiModelTab";
+import { Settings } from "../Settings";
+import { TranscriptionSection } from "./TranscriptionSection";
+import type { ServiceHealth } from "../../hooks/useServiceHealth";
+import type { SettingsModels } from "../../hooks/useSettingsModels";
 
 /**
  * Transcription engine picker (founder call, 2026-08-03): three engines, each
@@ -14,9 +17,14 @@ import { AiModelTab } from "./AiModelTab";
  * leaves the device, and it must never be handed a cloud provider's URL.
  */
 
-/** Nothing here downloads or reaches a service; the tab just needs answers. */
-function mockTabIpc() {
+/** Nothing here downloads or reaches a service; the section just needs answers. */
+function mockTabIpc(overrides: Partial<AppConfig> = {}) {
   mockIPC((command, payload) => {
+    if (command === "get_config") return appConfig(overrides);
+    if (command === "update_config") return null;
+    if (command === "plugin:app|version") return "0.3.73";
+    if (command === "get_registration_state") return null;
+    if (command === "list_templates") return [{ name: "general", description: "" }];
     if (command === "get_setup_status") {
       return { schema_version: 1, platform: "macos", profiles: [] };
     }
@@ -42,15 +50,53 @@ function mockTabIpc() {
   });
 }
 
+/** Health and the model layer are shared hooks owned by the shell, so the
+ *  section takes them as props. Stubbing them keeps these tests on what this
+ *  section is responsible for: the engine choice and the copy that follows from
+ *  it. The two tests that need the real wiring render the Settings shell. */
+const healthStub = (over: Partial<ServiceHealth> = {}): ServiceHealth => ({
+  health: {
+    status: "ok",
+    whisper_model: "large-v3",
+    ollama_available: true,
+    transcriber_state: "ready",
+  },
+  healthStatus: "ok",
+  checkHealth: async () => {},
+  restartService: async () => {},
+  serviceRestarting: false,
+  serviceRestartMessage: "",
+  ...over,
+});
+
+const modelsStub = (over: Partial<SettingsModels> = {}): SettingsModels => ({
+  setup: null,
+  whisperModels: [
+    { key: "large-v3", label: "Large v3", size: "3 GB", downloaded: true },
+  ] as SettingsModels["whisperModels"],
+  whisperMsg: "",
+  setWhisperMsg: () => {},
+  modelMsg: "",
+  setModelMsg: () => {},
+  modelSwitching: false,
+  downloads: {},
+  beginDownload: async () => {},
+  switchLocalModel: async () => {},
+  activateWhisperModel: async () => {},
+  refreshSetup: async () => {},
+  ...over,
+});
+
 function renderTab(overrides: Partial<AppConfig> = {}) {
-  mockTabIpc();
+  mockTabIpc(overrides);
   const update = vi.fn();
   const view = render(
-    <AiModelTab
+    <TranscriptionSection
       active
       config={appConfig(overrides)}
       update={update}
-      replaceConfig={vi.fn()}
+      health={healthStub()}
+      models={modelsStub()}
     />,
   );
   return { update, ...view };
@@ -62,10 +108,11 @@ const engine = () =>
 const baseUrl = () =>
   screen.getByLabelText("Transcription Base URL") as HTMLInputElement;
 
-/** Only the Transcription section — the notes engine below it names providers
- *  of its own, which would make a whole-card text match meaningless. */
+/** Only the Transcription card. Every section is mounted at once, and the notes
+ *  engine names providers of its own, so a whole-tree text match would be
+ *  meaningless. The active card is the one on screen. */
 const transcriptionCopy = (root: HTMLElement) =>
-  (root.textContent ?? "").split("Meeting notes")[0];
+  root.querySelector(".settings-section-card.active-card")?.textContent ?? "";
 
 const REMOTE_SELF_HOSTED: Partial<AppConfig> = {
   transcription_provider: "self_hosted",
@@ -76,7 +123,7 @@ const REMOTE_CLOUD: Partial<AppConfig> = {
   transcription_base_url: "https://api.groq.com/openai/v1",
 };
 
-describe("AiModelTab transcription engine", () => {
+describe("Transcription engine", () => {
   it("offers three engines and follows the saved provider, not the URL", async () => {
     // A self-hosted install has a base URL exactly like a cloud one — only the
     // saved provider tells them apart.
@@ -294,7 +341,7 @@ describe("AiModelTab transcription engine", () => {
   });
 });
 
-describe("AiModelTab background downloads", () => {
+describe("Background downloads", () => {
   const downloadStatus = (
     profile_id: string,
     state: ModelDownloadStatus["state"],
@@ -340,35 +387,74 @@ describe("AiModelTab background downloads", () => {
       return null;
     });
 
-    const replaceConfig = vi.fn();
-    render(
-      <AiModelTab
-        active
-        config={appConfig({
-          transcription_provider: "cloud",
-          transcription_base_url: "https://api.groq.com/openai/v1",
-          transcription_api_key: "typed-but-not-saved",
-        })}
-        update={vi.fn()}
-        replaceConfig={replaceConfig}
-      />,
+    const saved: Record<string, unknown>[] = [];
+    mockIPC((command, payload) => {
+      if (command === "get_setup_status") {
+        return { schema_version: 1, platform: "macos", profiles: [] };
+      }
+      if (command === "list_whisper_models") {
+        return [
+          { key: "large-v3", label: "Large v3", size: "3 GB", downloaded: false },
+          { key: "large-v3-turbo", label: "Large v3 turbo", size: "1.6 GB", downloaded: true },
+        ];
+      }
+      if (command === "check_service_health") {
+        return { status: "ok", ollama_available: true, transcriber_state: "ready" };
+      }
+      if (command === "get_model_download_status") {
+        const id = (payload as { profileId?: string }).profileId ?? "";
+        if (id !== "whisper-model:large-v3-turbo") return downloadStatus(id, "idle");
+        turboPolls += 1;
+        return downloadStatus(id, turboPolls === 1 ? "downloading" : "ready");
+      }
+      // What is on disk — it knows nothing about what the user is typing.
+      if (command === "get_config") return appConfig({ transcription_provider: "cloud" });
+      if (command === "update_config") {
+        saved.push((payload as { config: Record<string, unknown> }).config);
+        return null;
+      }
+      if (command === "plugin:app|version") return "0.3.73";
+      if (command === "list_templates") return [{ name: "general", description: "" }];
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(<Settings initialTab="transcription" />);
+
+    // An edit the user has NOT saved yet.
+    const key = await screen.findByLabelText(/API Key/);
+    await user.type(key, "typed-but-not-saved");
+
+    // The background download lands and activates the new model, which writes
+    // to disk on its own.
+    await waitFor(() =>
+      expect(saved.some((c) => c.whisper_model === "large-v3-turbo")).toBe(true),
     );
 
-    await waitFor(() => expect(replaceConfig).toHaveBeenCalled());
-    // Only the field the backend rewrote comes back; the rest is the user's.
-    expect(replaceConfig.mock.calls[0][0]).toMatchObject({
-      whisper_model: "large-v3-turbo",
-      transcription_provider: "cloud",
-      transcription_base_url: "https://api.groq.com/openai/v1",
-      transcription_api_key: "typed-but-not-saved",
-    });
+    // The invariant: the unsaved edit is still on screen, and pressing Save
+    // persists it TOGETHER with the activated model. Before the fix, activation
+    // handed Settings the whole disk copy and silently reverted the typing.
+    expect((key as HTMLInputElement).value).toBe("typed-but-not-saved");
+    await user.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() =>
+      expect(saved[saved.length - 1]).toMatchObject({
+        whisper_model: "large-v3-turbo",
+        transcription_api_key: "typed-but-not-saved",
+      }),
+    );
   });
 });
 
-describe("AiModelTab local AI recovery", () => {
+describe("Local AI recovery", () => {
   it("offers a real restart when the sidecar is unreachable", async () => {
     let restartCalls = 0;
     mockIPC((command, payload) => {
+      // The shell loads the config before it renders anything, so this mock has
+      // to answer it or Settings shows "Failed to load configuration."
+      if (command === "get_config") return appConfig();
+      if (command === "update_config") return null;
+      if (command === "plugin:app|version") return "0.3.73";
+      if (command === "list_templates") return [{ name: "general", description: "" }];
       if (command === "get_setup_status") {
         return { schema_version: 1, platform: "windows", profiles: [] };
       }
@@ -398,14 +484,9 @@ describe("AiModelTab local AI recovery", () => {
     });
 
     const user = userEvent.setup();
-    render(
-      <AiModelTab
-        active
-        config={appConfig()}
-        update={vi.fn()}
-        replaceConfig={vi.fn()}
-      />,
-    );
+    // The recovery action moved to Setup status, where a blocked pipeline is
+    // reported — it is no longer buried in an "Advanced" disclosure.
+    render(<Settings initialTab="setup" />);
 
     await screen.findByText(/The on-device service is not reachable/);
     await user.click(screen.getByRole("button", { name: "Restart Local AI" }));

@@ -5,6 +5,34 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.74] - 2026-08-06
+
+### Changed
+- **Settings has been rebuilt around what you're trying to do.** It now opens on
+  a status view showing whether a meeting can be recorded, transcribed and turned
+  into notes — and where each of those happens — with a Repair button next to
+  anything that's blocked. The old "AI Model" tab, which held two engines, two
+  model lists and the service plumbing at once, is now separate **Transcription**
+  and **Notes** sections that ask where the work should happen first and then show
+  only the settings that answer needs.
+- **Notifications are all in one place.** Whether Adversaria offers to record when
+  a meeting starts, the pre-meeting reminder, and the daily to-do summary used to
+  live in two different tabs under headings that didn't mention notifications.
+- **The notch pill and the recording window are things you can see.** Instead of
+  a dropdown describing each option, you get a live preview of the pill and of how
+  the transcript and notes share the screen.
+
+### Fixed
+- **Unlock with Touch ID no longer forgets itself.** It was the one security
+  setting that waited for Save while the others applied immediately, so ticking it
+  and closing Settings silently lost it.
+- **Settings can no longer open to an empty pane.** Certain links into Settings
+  could land on a section that no longer existed, showing the menu with nothing
+  beside it.
+- **"Choose a notes model" now opens the Notes section**, not Transcription.
+- **The local AI service can't be restarted twice at once** by double-clicking,
+  which used to show an error.
+
 ## [0.3.73] - 2026-08-05
 
 ### Fixed
