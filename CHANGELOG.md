@@ -5,6 +5,37 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.75] - 2026-08-07
+
+### Added
+- **Ask your own AI to write a note template.** In Settings → Notes, describe the
+  notes you want — "a weekly 1:1 with my manager: wins, blockers, what I need from
+  them" — and the model you already use drafts the template. The draft lands in the
+  editor for you to read and name; nothing is saved until you do. It follows an
+  existing template's shape, so your notes keep filling the to-do list.
+
+### Fixed
+- **A recording that genuinely can't be recovered now says so.** If part of a
+  recording's index has been removed from disk — usually by security software —
+  the app used to promise the recording was safe and offer a "Transcribe now"
+  button that could never succeed. It now explains what happened. Recordings that
+  failed for an ordinary reason are still retried exactly as before.
+- **Templates save under whatever name you type.** A name with spaces was rejected
+  outright while the app still reported "Saved."; names are now converted for you
+  ("daily team standup" becomes `daily-team-standup`) and shown before you commit.
+- **Failures look like failures.** Errors in the template editor rendered in the
+  same plain grey as help text, so a save that didn't happen read like one that did.
+- **Recordings that captured nothing are cleared away** instead of being retried
+  on every launch forever.
+- **Restart Local AI only appears when the local AI actually needs restarting** —
+  it used to sit greyed-out under a green "services are running" line.
+
+### Changed
+- **Edit and Copy are sized like Export** instead of stretching across the note
+  toolbar, and **Export and Regenerate Notes** now carry Adversaria's blue.
+- **A waiting button keeps its colour.** "Ask AI" above an empty box turned grey,
+  which read as broken rather than waiting.
+
 ## [0.3.74] - 2026-08-06
 
 ### Changed

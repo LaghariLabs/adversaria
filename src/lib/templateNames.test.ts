@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { templateDisplayName } from "./templateNames";
+import { templateDisplayName, templateSlug } from "./templateNames";
 
 const source = (relative: string): string =>
   readFileSync(fileURLToPath(new URL(relative, import.meta.url)), "utf8");
@@ -50,5 +50,35 @@ describe("templateDisplayName", () => {
       "value={t.name}",
     );
     expect(source("../components/NoteViewer.tsx")).toContain("value={name}");
+  });
+});
+
+describe("templateSlug", () => {
+  it("turns a sentence into a name the service accepts", () => {
+    // The exact failure: PUT /templates/daily%20team%20standup -> 400.
+    expect(templateSlug("daily team standup")).toBe("daily-team-standup");
+    expect(templateSlug("Weekly 1:1 with my Manager!")).toBe("weekly-1-1-with-my-manager");
+  });
+
+  it("produces only what `config._safe_name` allows", () => {
+    const SAFE = /^[a-z0-9][a-z0-9-]{0,48}$/;
+    for (const raw of [
+      "daily team standup",
+      "  Client Meeting — Q3  ",
+      "R&D / research",
+      "café notes",
+      "___weird___",
+      "a".repeat(80),
+    ]) {
+      const slug = templateSlug(raw);
+      if (slug) expect(slug).toMatch(SAFE);
+    }
+  });
+
+  it("returns empty for input with nothing usable, so the caller can fall back", () => {
+    // Empty must stay empty: `saveCurrentTemplate` treats it as "overwrite the
+    // selected template" rather than inventing a name.
+    expect(templateSlug("   ")).toBe("");
+    expect(templateSlug("!!!")).toBe("");
   });
 });

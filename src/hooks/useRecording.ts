@@ -9,6 +9,7 @@ import {
   getMeetings,
 } from "../lib/tauri";
 import type { CalendarEvent } from "../types";
+import { isUnrecoverable } from "../lib/recordingErrors";
 
 /** Capture status only. Transcription no longer blocks this — once a recording
  *  is stopped it's enqueued for background transcription and the status returns
@@ -194,8 +195,13 @@ export function useRecording(): UseRecordingReturn {
           `[queue] background transcription failed for meeting ${job.id} (audio kept for retry):`,
           e,
         );
+        // Only promise a retry that can actually work. A spool whose index is
+        // gone fails the same way forever, and telling the user their recording
+        // is safe while offering a doomed button is worse than saying it plainly.
         setError(
-          `${String(e)} The recording is safe on this device — open it and press "Transcribe now" to retry.`,
+          isUnrecoverable(e)
+            ? String(e)
+            : `${String(e)} The recording is safe on this device — open it and press "Transcribe now" to retry.`,
         );
       })
       .finally(() => {

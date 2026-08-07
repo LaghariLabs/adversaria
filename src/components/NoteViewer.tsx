@@ -941,7 +941,7 @@ export function NoteViewer({
             </button>
           )}
           <button
-            className="btn-secondary"
+            className="btn-primary"
             style={{ height: 28, fontSize: 11, padding: "0 10px" }}
             onClick={handleResummarize}
             disabled={resummarizing}
@@ -1150,7 +1150,7 @@ export function NoteViewer({
                   </button>
                   <div style={{ position: "relative" }}>
                     <button
-                      className="btn-secondary"
+                      className="btn-primary"
                       style={{ height: 28, fontSize: 11, padding: "0 10px" }}
                       onClick={() => setExportMenuOpen((o) => !o)}
                       aria-haspopup="menu"
