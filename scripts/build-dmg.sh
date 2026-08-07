@@ -143,6 +143,30 @@ if [ "$RELEASE_MODE" = "1" ] && [ -z "${ADVERSARIA_NOTARY_PROFILE:-}" ]; then
   exit 1
 fi
 
+# Prove the notarization credential WORKS before spending an hour signing hundreds
+# of Mach-Os. Twice now (0.3.73, 0.3.75) a full release build ran to stage 7 and
+# died at notarization because the app-specific password behind the Keychain
+# profile had been revoked out-of-band. `notarytool` reports a revoked credential
+# as "No Keychain password item found", which reads like a missing profile and
+# sends you looking in the wrong place. This turns an hour into five seconds.
+if [ "$RELEASE_MODE" = "1" ]; then
+  echo "==> [0/7] Checking the notarization credential before building…"
+  if ! xcrun notarytool history --keychain-profile "$ADVERSARIA_NOTARY_PROFILE" >/dev/null 2>&1; then
+    echo "ERROR: the notarization credential '$ADVERSARIA_NOTARY_PROFILE' is not usable."
+    echo "       notarytool says this whether the profile is missing OR its"
+    echo "       app-specific password has been revoked — the message cannot tell"
+    echo "       them apart, so re-store it and only dig deeper if that fails:"
+    echo
+    echo "         xcrun notarytool store-credentials $ADVERSARIA_NOTARY_PROFILE \\"
+    echo "           --apple-id <apple-id> --team-id 4MY4PH5PHC"
+    echo
+    echo "       An App Store Connect API key (--key/--key-id/--issuer) survives"
+    echo "       Apple Account password changes and avoids this entirely."
+    exit 1
+  fi
+  echo "    credential OK."
+fi
+
 CHANNEL="${ADVERSARIA_RELEASE_CHANNEL:-beta}"
 case "$CHANNEL" in
   beta|stable) ;;
@@ -236,8 +260,33 @@ if [ -n "${ADVERSARIA_NOTARY_PROFILE:-}" ]; then
     echo "ERROR: notarization requires a Developer ID Application identity."
     exit 1
   fi
-  xcrun notarytool submit "$OUT" \
-    --keychain-profile "$ADVERSARIA_NOTARY_PROFILE" --wait
+  # Retry the submit. Twice (0.3.73, 0.3.75) a release build reached this line and
+  # failed with "No Keychain password item found" — not because the credential was
+  # gone, but because it was momentarily unreachable: both failures landed right
+  # after signing hundreds of Mach-Os, with a load average near 10, and the same
+  # credential worked seconds later on an idle machine. notarytool reports that
+  # transient lookup failure identically to a missing profile, so the only way to
+  # tell them apart is to try again. An hour of signing must not be thrown away by
+  # one unlucky Keychain read.
+  notarize_attempt=0
+  until xcrun notarytool submit "$OUT" \
+    --keychain-profile "$ADVERSARIA_NOTARY_PROFILE" --wait; do
+    notarize_attempt=$((notarize_attempt + 1))
+    if [ "$notarize_attempt" -ge 4 ]; then
+      echo "ERROR: notarization failed $notarize_attempt times."
+      echo "       If every attempt said 'No Keychain password item found', re-store"
+      echo "       the credential — notarytool cannot distinguish a revoked password"
+      echo "       from a profile that is missing:"
+      echo "         xcrun notarytool store-credentials $ADVERSARIA_NOTARY_PROFILE \\"
+      echo "           --apple-id <apple-id> --team-id 4MY4PH5PHC"
+      echo "       The signed DMG is intact at $OUT — notarize it directly rather"
+      echo "       than rebuilding."
+      exit 1
+    fi
+    backoff=$((notarize_attempt * 20))
+    echo "==> notarization attempt $notarize_attempt failed; retrying in ${backoff}s…"
+    sleep "$backoff"
+  done
   xcrun stapler staple "$OUT"
   xcrun stapler validate "$OUT"
   spctl --assess --type open --context context:primary-signature --verbose=2 "$OUT"
