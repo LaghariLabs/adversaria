@@ -5,6 +5,19 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.80] - 2026-08-17
+
+### Fixed
+- **A machine with only Qwen3-ASR (or Cohere) downloaded now transcribes.**
+  The app previously kept insisting "No transcription model is downloaded
+  yet" and refused to transcribe unless a Whisper-family model was on disk
+  — even with a downloaded, selected Qwen model (caught in fresh-account
+  QA). Readiness and routing now recognize every on-device engine; live
+  captions honestly wait for a Whisper model, since they are the one thing
+  that still needs one.
+- Error messages that pointed at the old "Settings → AI Model" tab now
+  name the real sections (Transcription, Notes).
+
 ## [0.3.79] - 2026-08-17
 
 ### Fixed

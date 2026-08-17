@@ -1,7 +1,7 @@
 {
   "name": "meeting-note-taker",
   "private": true,
-  "version": "0.3.79",
+  "version": "0.3.80",
   "author": "Mohammad Hamza Laghari <hamza@lagharilabs.com>",
   "type": "module",
   "engines": {

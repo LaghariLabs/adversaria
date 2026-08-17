@@ -213,6 +213,28 @@ class TestInitTranscriber:
         assert server._transcriber is fake
         assert keys == ["large-v3"]
 
+    def test_qwen_only_machine_is_ready_without_a_resident(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only Qwen3-ASR weights on disk: final transcription works via
+        per-request routing, so health must say ready — but nothing loads
+        into the resident slot (live captions need Whisper)."""
+        monkeypatch.setenv("WHISPER_BACKEND", "mlx")
+        monkeypatch.setattr(
+            server,
+            "whisper_model_is_cached",
+            lambda repo: "qwen3-asr" in repo.lower(),
+        )
+        created: list[object] = []
+        monkeypatch.setattr(
+            server, "create_transcriber", lambda key=None: created.append(key)
+        )
+        server._init_transcriber()
+        assert server._transcriber is None
+        assert server._TRANSCRIBER_STATE == "ready"
+        assert "Live captions" in (server._TRANSCRIBER_DETAIL or "")
+        assert created == []
+
     def test_load_failure_is_an_error_state_not_a_crash(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

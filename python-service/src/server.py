@@ -207,6 +207,26 @@ def _init_transcriber(wait: bool = False) -> None:
                 and whisper_model_is_cached(entry["repo"])
             ]
             if not cached:
+                # A machine with only a Qwen3-ASR or Cohere model on disk CAN
+                # transcribe — those engines are routed per request and never
+                # occupy the resident slot (which live captions need). Report
+                # ready instead of falsely claiming nothing can transcribe;
+                # the resident stays None and live captions silently sit out
+                # until a Whisper model lands. (Founder hit this live on the
+                # 2026-08-17 fresh-account QA: Qwen downloaded, app insisted
+                # "No transcription model is downloaded yet".)
+                alt_cached = [
+                    key
+                    for key, entry in models.items()
+                    if whisper_engine_for(key) in {"qwen3-asr", "cohere"}
+                    and whisper_model_is_cached(entry["repo"])
+                ]
+                if alt_cached:
+                    _set_transcriber_state(
+                        "ready",
+                        "Transcription is ready. Live captions need a Whisper model.",
+                    )
+                    return
                 _set_transcriber_state(
                     "missing", "No transcription model is downloaded yet."
                 )
@@ -562,6 +582,17 @@ def _require_transcriber() -> WhisperTranscriber | MlxWhisperTranscriber:
     t = _transcriber
     if t is not None:
         return t
+    if _TRANSCRIBER_STATE == "ready":
+        # Ready-without-resident: only Qwen3-ASR/Cohere models are on disk.
+        # Requests routed to those engines never reach this guard; a request
+        # that needs resident Whisper cannot run until one is downloaded.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "transcriber_missing",
+                "message": "No Whisper model is downloaded yet.",
+            },
+        )
     code = {
         "loading": "transcriber_loading",
         "missing": "transcriber_missing",
@@ -677,7 +708,10 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
             ) from exc
 
     requested_engine = whisper_engine_for(request.whisper_model)
-    if request.whisper_model and requested_engine == "cohere":
+    if request.whisper_model and requested_engine in {"cohere", "qwen3-asr"}:
+        # These engines don't need the resident Whisper (Cohere only borrows
+        # it for language detection, with a fallback) — a missing resident
+        # must not block them on a machine that has their weights cached.
         try:
             resident = _require_transcriber()
         except HTTPException as exc:
@@ -696,6 +730,11 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
             try:
                 t = get_qwen_transcriber(whisper_repo_for(request.whisper_model))
             except RuntimeError:
+                if resident is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="The selected Qwen3-ASR model is not downloaded.",
+                    )
                 logger.warning(
                     "Whisper model %s is not downloaded; using %s instead.",
                     request.whisper_model,

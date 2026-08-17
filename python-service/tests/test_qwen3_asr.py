@@ -254,3 +254,50 @@ def test_server_falls_back_to_resident_when_qwen_is_not_cached(
     resident.transcribe.assert_called_once_with("/fake.wav")
     resident.ensure_model_repo.assert_not_called()
     assert resident.initial_prompt is None
+
+
+def test_server_routes_qwen_without_resident_whisper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A machine with ONLY a Qwen model on disk must still transcribe — the
+    2026-08-17 fresh-account QA bug: the missing resident 503'd the request
+    before qwen routing was ever reached."""
+    qwen = MagicMock()
+    qwen.model_repo = QWEN_REPO
+    qwen.initial_prompt = None
+    qwen.transcribe.return_value = _response("qwen transcript")
+
+    monkeypatch.setenv("WHISPER_BACKEND", "mlx")
+    monkeypatch.setattr(server, "_transcriber", None)
+    monkeypatch.setattr(server, "_TRANSCRIBER_STATE", "ready")
+    monkeypatch.setattr(server, "get_qwen_transcriber", lambda repo: qwen)
+
+    response = client.post(
+        "/transcribe",
+        json={"audio_path": "/fake.wav", "whisper_model": QWEN_KEY},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "qwen transcript"
+    qwen.transcribe.assert_called_once_with("/fake.wav")
+
+
+def test_server_qwen_uncached_without_resident_is_an_honest_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(repo: str):
+        raise RuntimeError(f"Qwen3-ASR model {repo} is not downloaded")
+
+    monkeypatch.setenv("WHISPER_BACKEND", "mlx")
+    monkeypatch.setattr(server, "_transcriber", None)
+    monkeypatch.setattr(server, "_TRANSCRIBER_STATE", "missing")
+    monkeypatch.setattr(server, "_init_transcriber", lambda wait=False: None)
+    monkeypatch.setattr(server, "get_qwen_transcriber", missing)
+
+    response = client.post(
+        "/transcribe",
+        json={"audio_path": "/fake.wav", "whisper_model": QWEN_KEY},
+    )
+
+    assert response.status_code == 503
+    assert "not downloaded" in str(response.json()["detail"])
