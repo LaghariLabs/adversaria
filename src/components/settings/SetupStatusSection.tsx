@@ -1,5 +1,14 @@
+import { useEffect, useState } from "react";
+
 import type { AppConfig, RegistrationState, SetupStatus, WhisperModelInfo } from "../../types";
 import type { ServiceHealth } from "../../hooks/useServiceHealth";
+import {
+  checkCapturePermissions,
+  openPrivacySettings,
+  probeSystemAudio,
+  requestMicrophonePermission,
+} from "../../lib/tauri";
+import type { CapturePermissions, PermissionState } from "../../lib/tauri";
 
 /** One row of the Record → Transcribe → Notes ledger. */
 interface Stage {
@@ -9,7 +18,8 @@ interface Stage {
   value: string;
   /** Where that work happens — the privacy-relevant half. */
   where: string;
-  tone: "ok" | "warn" | "bad";
+  /** "unknown" renders grey: not yet answered is not the same as not well. */
+  tone: "ok" | "warn" | "bad" | "unknown";
   state: string;
   /** Section to open when the stage is selected. */
   jump: SectionId;
@@ -46,6 +56,15 @@ function usesRemoteTranscription(config: AppConfig): boolean {
   return config.transcription_provider !== "local" && Boolean(config.transcription_base_url?.trim());
 }
 
+function permissionChip(state: PermissionState | undefined): {
+  label: string;
+  tone: "ok" | "warn" | "unknown";
+} {
+  if (state === "granted") return { label: "Granted", tone: "ok" };
+  if (state === "denied") return { label: "Not granted", tone: "warn" };
+  return { label: "Not checked yet", tone: "unknown" };
+}
+
 /**
  * Setup status — the readiness ledger.
  *
@@ -67,6 +86,58 @@ export function SetupStatusSection({
   onRegistrationRetry,
   onOpen,
 }: SetupStatusSectionProps) {
+  const [permissions, setPermissions] = useState<CapturePermissions | null>(null);
+  const [permissionBusy, setPermissionBusy] = useState<"" | "microphone" | "system_audio">("");
+  const [permissionError, setPermissionError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    checkCapturePermissions()
+      .then((result) => {
+        if (alive && result) setPermissions(result);
+      })
+      .catch((error) => {
+        if (alive) setPermissionError(`Couldn't load recording permissions: ${String(error)}`);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const requestMicrophone = async () => {
+    setPermissionBusy("microphone");
+    setPermissionError("");
+    try {
+      await requestMicrophonePermission();
+      setPermissions(await checkCapturePermissions());
+    } catch (error) {
+      setPermissionError(String(error));
+    } finally {
+      setPermissionBusy("");
+    }
+  };
+
+  const checkSystemAudio = async () => {
+    setPermissionBusy("system_audio");
+    setPermissionError("");
+    try {
+      setPermissions(await probeSystemAudio());
+    } catch (error) {
+      setPermissionError(String(error));
+    } finally {
+      setPermissionBusy("");
+    }
+  };
+
+  const openPermissionSettings = async (which: "microphone" | "system_audio") => {
+    setPermissionError("");
+    try {
+      await openPrivacySettings(which);
+    } catch (error) {
+      setPermissionError(String(error));
+    }
+  };
+
   const remote = usesRemoteTranscription(config);
   const serviceDown = health.healthStatus === "unreachable";
   const issues: Issue[] = [];
@@ -145,23 +216,52 @@ export function SetupStatusSection({
         state: "Starting",
         jump: "transcription",
       };
-    } else {
+    } else if (state === undefined) {
+      // Not an answer yet — the first /health has not landed, or this service
+      // predates V3 and reports no transcriber state at all. Reporting an unknown
+      // as a problem is what told a user with large-v3 sitting on disk that
+      // transcription "needs attention" (2026-08-07). Say what is true: we do not
+      // know yet, and raise nothing.
       transcribe = {
         step: "Step 2 · Transcribe",
         name: "Transcribe",
-        value: downloaded ? "Needs attention" : "No model downloaded yet",
+        value: "Checking…",
+        where: "Runs on this computer",
+        tone: "unknown",
+        state: "Checking",
+        jump: "transcription",
+      };
+    } else {
+      // state is "error" or "missing": a real answer, and a real problem.
+      const detail = health.health?.transcriber_detail?.trim();
+      transcribe = {
+        step: "Step 2 · Transcribe",
+        name: "Transcribe",
+        value:
+          state === "missing"
+            ? "No model downloaded yet"
+            : "The model on this computer wouldn't load",
         where: "Recordings are kept until this is ready",
         tone: "warn",
-        state: downloaded ? "Not ready" : "Not set up",
+        state: state === "missing" ? "Not set up" : "Not ready",
         jump: "transcription",
       };
       issues.push({
         tone: "warn",
-        title: downloaded ? "Transcription isn't ready" : "Choose how audio becomes text",
+        title:
+          state === "missing"
+            ? "Choose how audio becomes text"
+            : "The transcription model wouldn't load",
+        // The service always sends a reason for an error; prefer it over our
+        // guess, and never let a downloaded model be described as missing.
         detail:
-          health.health?.transcriber_detail ||
-          "Download a model to transcribe on this computer, or point Adversaria at a service you run.",
-        action: downloaded ? "Open" : "Choose",
+          detail ||
+          (state === "missing"
+            ? "Download a model to transcribe on this computer, or point Adversaria at a service you run."
+            : downloaded
+              ? "A model is downloaded but could not be loaded. On Windows this is usually a missing system runtime library — the service log says which."
+              : "Download a model, or point Adversaria at a transcription service you run."),
+        action: state === "missing" ? "Choose" : "Open",
         jump: "transcription",
         primary: true,
       });
@@ -202,6 +302,9 @@ export function SetupStatusSection({
   }
 
   const stages = [record, transcribe, notes];
+  // "unknown" is deliberately not counted: a pipeline still being probed is not a
+  // pipeline in trouble, and an amber badge during a normal startup trains people
+  // to ignore amber.
   const worst = stages.some((s) => s.tone === "bad")
     ? "bad"
     : stages.some((s) => s.tone === "warn")
@@ -216,6 +319,8 @@ export function SetupStatusSection({
       ? "Audio goes to a server you control · notes stay on this computer"
       : "Audio leaves this device for transcription · notes stay on this computer"
     : "Audio and transcript never leave this computer";
+  const microphonePermission = permissionChip(permissions?.microphone);
+  const systemAudioPermission = permissionChip(permissions?.system_audio);
 
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`}>
@@ -252,6 +357,101 @@ export function SetupStatusSection({
         <span className="settings-route-label">Where your data goes</span>
         <span className="settings-route-line" aria-hidden="true" />
         <span>{route}</span>
+      </div>
+
+      <h3 className="settings-card-title" style={{ marginTop: 22 }}>
+        Permissions
+      </h3>
+      <p className="settings-card-desc">
+        Confirm that both sides of a meeting can reach the recorder.
+      </p>
+      <div className="settings-subcard" aria-label="Capture permissions">
+        <div className="settings-row" style={{ justifyContent: "space-between" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <strong>Microphone</strong>
+            <p className="settings-help" style={{ margin: "2px 0 0" }}>
+              Your side of the meeting (&quot;Me&quot;)
+            </p>
+          </div>
+          <span
+            className="settings-chip"
+            data-tone={microphonePermission.tone}
+            aria-label={`Microphone permission: ${microphonePermission.label}`}
+          >
+            <span className="settings-dot" />
+            {microphonePermission.label}
+          </span>
+          <div className="settings-row">
+            {permissions?.microphone === "undetermined" || permissions == null ? (
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={permissionBusy !== ""}
+                onClick={() => void requestMicrophone()}
+              >
+                {permissionBusy === "microphone" ? "Requesting…" : "Request"}
+              </button>
+            ) : permissions.microphone === "denied" ? (
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={permissionBusy !== ""}
+                onClick={() => void openPermissionSettings("microphone")}
+              >
+                Open System Settings
+              </button>
+            ) : null}
+          </div>
+        </div>
+        <div
+          className="settings-row"
+          style={{
+            justifyContent: "space-between",
+            borderTop: "1px solid var(--border-color)",
+            marginTop: 14,
+            paddingTop: 14,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <strong>System audio</strong>
+            <p className="settings-help" style={{ margin: "2px 0 0" }}>
+              What your Mac plays (&quot;Them&quot;)
+            </p>
+          </div>
+          <span
+            className="settings-chip"
+            data-tone={systemAudioPermission.tone}
+            aria-label={`System audio permission: ${systemAudioPermission.label}`}
+          >
+            <span className="settings-dot" />
+            {systemAudioPermission.label}
+          </span>
+          <div className="settings-row">
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={permissionBusy !== ""}
+              onClick={() => void checkSystemAudio()}
+            >
+              {permissionBusy === "system_audio" ? "Checking…" : "Check"}
+            </button>
+            {permissions?.system_audio === "denied" && (
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={permissionBusy !== ""}
+                onClick={() => void openPermissionSettings("system_audio")}
+              >
+                Open System Settings
+              </button>
+            )}
+          </div>
+        </div>
+        {permissionError && (
+          <p className="settings-msg err" role="alert">
+            {permissionError}
+          </p>
+        )}
       </div>
 
       <h3 className="settings-card-title" style={{ marginTop: 22 }}>

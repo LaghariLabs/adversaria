@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   exportHtml,
   exportMeetingBundle,
@@ -9,6 +9,7 @@ import {
   getMeetingStats,
   listTemplates,
   mergeMeetingSpeakers,
+  renameMeetingPerson,
   updateMeetingLink,
   engineConfigured,
   resummarizeMeeting,
@@ -22,7 +23,14 @@ import {
   updateMeetingSummary,
   updateMeetingTags,
 } from "../lib/tauri";
-import type { ActionItem, Meeting, MeetingStats, SummaryLanguage, Tag } from "../types";
+import type {
+  ActionItem,
+  Meeting,
+  MeetingStats,
+  SummaryLanguage,
+  Tag,
+  TranscriptTurn,
+} from "../types";
 import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { MeetingChat } from "./MeetingChat";
 import { SummaryView } from "./SummaryView";
@@ -48,6 +56,14 @@ import {
 const LANGUAGE_OPTIONS: { value: SummaryLanguage; label: string }[] = [
   { value: "en", label: "English" },
   { value: "ar", label: "العربية" },
+  { value: "zh", label: "中文" },
+  { value: "hi", label: "हिन्दी" },
+  { value: "es", label: "Español" },
+  { value: "fr", label: "Français" },
+  { value: "bn", label: "বাংলা" },
+  { value: "pt", label: "Português" },
+  { value: "ru", label: "Русский" },
+  { value: "ur", label: "اردو" },
   { value: "auto", label: "Match spoken" },
 ];
 
@@ -77,11 +93,83 @@ interface NoteViewerProps {
 
 type Tab = "transcript" | "summary" | "chat" | "notes" | "insights";
 
+interface TranscriptSelection {
+  text: string;
+  left: number;
+  top: number;
+}
+
+// Keep the browser Selection API at this small boundary: jsdom tests can stub
+// window.getSelection without constructing a real selection or Range.
+export function getSelectedTextInContainer(
+  container: HTMLElement,
+): TranscriptSelection | null {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+
+  const text = selection.toString().trim();
+  if (!text || text.length > 40 || /[\r\n]/.test(text)) return null;
+
+  const range = selection.getRangeAt(0);
+  if (!container.contains(range.commonAncestorContainer)) return null;
+
+  const rect = range.getBoundingClientRect();
+  const edge = Math.min(150, window.innerWidth / 2);
+  const left = Math.min(
+    Math.max(rect.left + rect.width / 2, edge),
+    window.innerWidth - edge,
+  );
+  const top =
+    rect.bottom + 8 > window.innerHeight - 48
+      ? Math.max(8, rect.top - 46)
+      : rect.bottom + 8;
+  return { text, left, top };
+}
+
 function formatTurnTime(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   const mm = String(m).padStart(2, "0"), ss = String(sec).padStart(2, "0");
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// Stored turns from before the service-side split (and legacy backfills) can
+// be one enormous paragraph — break them into readable paragraphs at sentence
+// boundaries for display. Never splits mid-sentence.
+const TRANSCRIPT_PARAGRAPH_MAX_CHARS = 600;
+
+function splitIntoParagraphs(text: string): string[] {
+  if (text.length <= TRANSCRIPT_PARAGRAPH_MAX_CHARS) return [text];
+  const sentences = text.split(/(?<=[.!?؟۔…])\s+/u);
+  const paragraphs: string[] = [];
+  let current = "";
+  for (const sentence of sentences) {
+    if (current !== "" && current.length + sentence.length + 1 > TRANSCRIPT_PARAGRAPH_MAX_CHARS) {
+      paragraphs.push(current);
+      current = sentence;
+    } else {
+      current = current === "" ? sentence : `${current} ${sentence}`;
+    }
+  }
+  if (current !== "") paragraphs.push(current);
+  return paragraphs;
+}
+
+// Clean plain-text lines for the clipboard — the on-screen colon after the
+// speaker is CSS-generated, so DOM selection copies "[00:12]Hamzawords";
+// this builds the text people actually expect to paste.
+function transcriptToPlainText(
+  turns: TranscriptTurn[] | undefined,
+  transcript: string,
+): string {
+  if (!turns || turns.length === 0) return transcript;
+  return turns
+    .map((t) => {
+      const time = t.start != null ? `[${formatTurnTime(t.start)}] ` : "";
+      const speaker = t.speaker !== "" ? `${t.speaker}: ` : "";
+      return `${time}${speaker}${t.text}`;
+    })
+    .join("\n");
 }
 
 /* Stable per-speaker transcript colors, matching the notch pill's channels:
@@ -245,9 +333,40 @@ export function NoteViewer({
   );
   const [newAttendee, setNewAttendee] = useState("");
   const [attendeesError, setAttendeesError] = useState<string | null>(null);
+  const [editingAttendee, setEditingAttendee] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [renameMsg, setRenameMsg] = useState<string | null>(null);
+  const [renamingAttendee, setRenamingAttendee] = useState(false);
+
+  // Selection-driven transcript correction. The message mirrors renameMsg,
+  // but stays near the word the user just fixed instead of under attendees.
+  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const [transcriptFix, setTranscriptFix] = useState<
+    (TranscriptSelection & { correctedText: string; editing: boolean }) | null
+  >(null);
+  const [fixingTranscript, setFixingTranscript] = useState(false);
+  const [transcriptFixMsg, setTranscriptFixMsg] = useState<
+    TranscriptSelection | null
+  >(null);
+
+  useEffect(() => {
+    setTranscriptFix(null);
+  }, [
+    activeTab,
+    meeting.id,
+    mergeArmed,
+    mergingSpeakers,
+    editingAttendee,
+    renamingAttendee,
+  ]);
+
+  useEffect(() => {
+    setTranscriptFixMsg(null);
+  }, [activeTab, meeting.id]);
 
   // Copy / export feedback (transient).
   const [copied, setCopied] = useState(false);
+  const [transcriptCopied, setTranscriptCopied] = useState(false);
   const [exportMsg, setExportMsg] = useState<string | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
 
@@ -335,24 +454,86 @@ export function NoteViewer({
     onMeetingUpdated({ ...meeting, tags: newTags });
   };
 
+  const addTermToDictionary = async (term: string): Promise<boolean> => {
+    const cfg = await getConfig();
+    const existing = (cfg.custom_vocabulary ?? "")
+      .split(/[,\n]/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (existing.some((t) => t.toLowerCase() === term.toLowerCase())) {
+      return false;
+    }
+    const next = [...existing, term].join(", ");
+    await updateConfig({ ...cfg, custom_vocabulary: next });
+    return true;
+  };
+
+  const showTranscriptFixMessage = (
+    text: string,
+    anchor: Pick<TranscriptSelection, "left" | "top">,
+  ) => {
+    setTranscriptFixMsg({ text, ...anchor });
+    window.setTimeout(() => setTranscriptFixMsg(null), 2500);
+  };
+
+  const handleTranscriptSelection = () => {
+    if (
+      activeTab !== "transcript" ||
+      mergeArmed ||
+      mergingSpeakers ||
+      editingAttendee !== null ||
+      renamingAttendee ||
+      fixingTranscript
+    ) {
+      setTranscriptFix(null);
+      return;
+    }
+    const container = transcriptContainerRef.current;
+    if (!container) return;
+    const selected = getSelectedTextInContainer(container);
+    setTranscriptFix(
+      selected
+        ? { ...selected, correctedText: selected.text, editing: false }
+        : null,
+    );
+  };
+
+  const handleTranscriptFix = async () => {
+    if (!transcriptFix) return;
+    const { text, left, top } = transcriptFix;
+    const correctedText = transcriptFix.correctedText.trim();
+    setTranscriptFix(null);
+    if (!correctedText || correctedText === text) return;
+
+    setFixingTranscript(true);
+    setTranscriptFixMsg(null);
+    try {
+      const updated = await renameMeetingPerson(meeting.id, text, correctedText);
+      onMeetingUpdated(updated);
+      const added = await addTermToDictionary(correctedText);
+      showTranscriptFixMessage(
+        added ? "Fixed everywhere — added to dictionary" : "Fixed everywhere",
+        { left, top },
+      );
+    } catch (e) {
+      showTranscriptFixMessage(String(e), { left, top });
+    } finally {
+      setFixingTranscript(false);
+    }
+  };
+
   const handleAddToDictionary = async () => {
     const term = dictTerm.trim();
     if (!term) return;
     setDictMsg(null);
     try {
-      const cfg = await getConfig();
-      const existing = (cfg.custom_vocabulary ?? "")
-        .split(/[,\n]/)
-        .map((t) => t.trim())
-        .filter(Boolean);
-      if (existing.some((t) => t.toLowerCase() === term.toLowerCase())) {
+      const added = await addTermToDictionary(term);
+      if (!added) {
         setDictMsg("Already in dictionary");
         setDictTerm("");
         setTimeout(() => setDictMsg(null), 2000);
         return;
       }
-      const next = [...existing, term].join(", ");
-      await updateConfig({ ...cfg, custom_vocabulary: next });
       setDictTerm("");
       setDictMsg("Added to dictionary");
       setTimeout(() => setDictMsg(null), 2000);
@@ -461,6 +642,7 @@ export function NoteViewer({
     /^speaker \d+: /im.test(meeting.transcript ?? "");
 
   const handleMergeSpeakers = async () => {
+    setTranscriptFix(null);
     if (!mergeArmed) {
       setMergeArmed(true);
       window.setTimeout(() => setMergeArmed(false), 5000); // disarm quietly
@@ -505,6 +687,35 @@ export function NoteViewer({
     persistAttendees([...attendees, name]);
   };
 
+  const cancelAttendeeEdit = () => {
+    setEditingAttendee(null);
+    setEditValue("");
+  };
+
+  const handleRenameAttendee = async (name: string) => {
+    const next = editValue.trim();
+    cancelAttendeeEdit();
+    if (!next || next === name) return;
+    setAttendeesError(null);
+    setRenameMsg(null);
+    setRenamingAttendee(true);
+    try {
+      const updated = await renameMeetingPerson(meeting.id, name, next);
+      onMeetingUpdated(updated);
+      const added = await addTermToDictionary(next);
+      setRenameMsg(
+        added
+          ? "Renamed everywhere — added to dictionary"
+          : "Renamed everywhere",
+      );
+      setTimeout(() => setRenameMsg(null), 2500);
+    } catch (e) {
+      setAttendeesError(String(e));
+    } finally {
+      setRenamingAttendee(false);
+    }
+  };
+
   const handleCopy = async () => {
     const text = summaryToPlainText(meeting.summary);
     const flashCopied = () => {
@@ -533,6 +744,18 @@ export function NoteViewer({
       } catch {
         setExportMsg("Copy failed — clipboard unavailable.");
       }
+    }
+  };
+
+  const handleCopyTranscript = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        transcriptToPlainText(meeting.transcript_turns, meeting.transcript),
+      );
+      setTranscriptCopied(true);
+      setTimeout(() => setTranscriptCopied(false), 1500);
+    } catch {
+      setExportMsg("Copy failed — clipboard unavailable.");
     }
   };
 
@@ -735,7 +958,47 @@ export function NoteViewer({
         <div className="viewer-attendees" style={{ marginTop: 10 }}>
           {attendees.map((name) => (
             <span key={name} className="attendee-badge">
-              {name}
+              {editingAttendee === name ? (
+                <input
+                  className="add-attendee-input"
+                  autoFocus
+                  value={editValue}
+                  onChange={(e) => setEditValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleRenameAttendee(name);
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      cancelAttendeeEdit();
+                    }
+                  }}
+                  onBlur={cancelAttendeeEdit}
+                  aria-label={`Rename ${name}`}
+                />
+              ) : (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Rename ${name}`}
+                  title={`Rename ${name}`}
+                  style={{ cursor: "text" }}
+                  onClick={() => {
+                    setEditingAttendee(name);
+                    setEditValue(name);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setEditingAttendee(name);
+                      setEditValue(name);
+                    }
+                  }}
+                >
+                  {name}
+                </span>
+              )}
               <button
                 onClick={() => handleRemoveAttendee(name)}
                 aria-label={`Remove ${name}`}
@@ -757,6 +1020,14 @@ export function NoteViewer({
             aria-label="Add attendee"
           />
         </div>
+        {renameMsg && (
+          <p
+            role="status"
+            style={{ marginTop: 6, fontSize: 12, color: "var(--text-secondary)" }}
+          >
+            {renameMsg}
+          </p>
+        )}
         {attendeesError && (
           <p style={{ marginTop: 6, fontSize: 12, color: "var(--accent-red)" }}>
             {attendeesError}
@@ -1274,7 +1545,8 @@ export function NoteViewer({
         {/* TAB: Transcript Content */}
         {activeTab === "transcript" && (
           <div className="tab-content active" id="tab-content-transcript">
-            {hasDiarizedSpeakers && (
+            {(meeting.transcript.trim() !== "" ||
+              (meeting.transcript_turns?.length ?? 0) > 0) && (
               <div
                 className="tab-actions"
                 style={{ justifyContent: "flex-end", marginBottom: 12, gap: 8 }}
@@ -1286,45 +1558,139 @@ export function NoteViewer({
                 )}
                 <button
                   className="btn-ghost"
-                  onClick={handleMergeSpeakers}
-                  disabled={mergingSpeakers}
-                  title='Replace every diarized "Speaker N" label with "Them". Use when the speaker count is wrong — this cannot be undone (the audio was deleted after transcription).'
+                  onClick={handleCopyTranscript}
+                  title="Copy the transcript as plain text"
                 >
-                  {mergingSpeakers
-                    ? "Merging…"
-                    : mergeArmed
-                      ? "Click again to confirm — can't be undone"
-                      : "Merge speakers into “Them”"}
+                  {transcriptCopied ? "Copied!" : "Copy"}
                 </button>
+                {hasDiarizedSpeakers && (
+                  <button
+                    className="btn-ghost"
+                    onClick={handleMergeSpeakers}
+                    disabled={mergingSpeakers}
+                    title='Replace every diarized "Speaker N" label with "Them". Use when the speaker count is wrong — this cannot be undone (the audio was deleted after transcription).'
+                  >
+                    {mergingSpeakers
+                      ? "Merging…"
+                      : mergeArmed
+                        ? "Click again to confirm — can't be undone"
+                        : "Merge speakers into “Them”"}
+                  </button>
+                )}
               </div>
             )}
             {meeting.transcript_turns && meeting.transcript_turns.length > 0 ? (
-              <div id="transcript-container" className="transcript-plain">
+              <div
+                id="transcript-container"
+                ref={transcriptContainerRef}
+                className="transcript-plain"
+                onMouseUp={handleTranscriptSelection}
+              >
                 {(() => {
                   const speakerColors = speakerColorMap(meeting.transcript_turns, meName);
-                  return meeting.transcript_turns.map((turn, i) => (
-                    <p key={i} className="transcript-line" dir="auto">
-                      {turn.start != null && (
-                        <span className="transcript-time">[{formatTurnTime(turn.start)}]</span>
-                      )}
-                      <span
-                        className="transcript-speaker"
-                        style={{ color: speakerColors.get(turn.speaker) }}
-                      >
-                        {turn.speaker}
-                      </span>
-                      {turn.text}
-                    </p>
-                  ));
+                  return meeting.transcript_turns.flatMap((turn, i) => {
+                    const paragraphs = splitIntoParagraphs(turn.text);
+                    return paragraphs.map((paragraph, j) =>
+                      j === 0 ? (
+                        <p key={`${i}`} className="transcript-line" dir="auto">
+                          {turn.start != null && (
+                            <span className="transcript-time">
+                              [{formatTurnTime(turn.start)}]
+                            </span>
+                          )}
+                          {turn.speaker !== "" && (
+                            <span
+                              className="transcript-speaker"
+                              style={{ color: speakerColors.get(turn.speaker) }}
+                            >
+                              {turn.speaker}
+                            </span>
+                          )}
+                          {paragraph}
+                        </p>
+                      ) : (
+                        <p key={`${i}-${j}`} className="transcript-line" dir="auto">
+                          {paragraph}
+                        </p>
+                      ),
+                    );
+                  });
                 })()}
               </div>
             ) : (
               <p
                 dir="auto"
-                style={{ color: "var(--text-muted)", fontStyle: "italic" }}
+                style={{
+                  color: "var(--text-muted)",
+                  fontStyle: "italic",
+                  whiteSpace: "pre-wrap",
+                }}
               >
                 {meeting.transcript || "No transcript available for this note."}
               </p>
+            )}
+            {transcriptFix && (
+              <>
+                <div
+                  style={{ position: "fixed", inset: 0, zIndex: 40 }}
+                  onMouseDown={() => setTranscriptFix(null)}
+                  aria-hidden="true"
+                />
+                <div
+                  className="transcript-fix-popover"
+                  style={{ left: transcriptFix.left, top: transcriptFix.top }}
+                >
+                  {transcriptFix.editing ? (
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void handleTranscriptFix();
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setTranscriptFix(null);
+                        }
+                      }}
+                    >
+                      <input
+                        className="tag-popup-input"
+                        value={transcriptFix.correctedText}
+                        onChange={(e) =>
+                          setTranscriptFix({
+                            ...transcriptFix,
+                            correctedText: e.target.value,
+                          })
+                        }
+                        onFocus={(e) => e.currentTarget.select()}
+                        aria-label="Corrected transcript text"
+                        autoFocus
+                      />
+                      <button className="btn-ghost" type="submit">
+                        Apply
+                      </button>
+                    </form>
+                  ) : (
+                    <button
+                      className="btn-ghost"
+                      onClick={() =>
+                        setTranscriptFix({ ...transcriptFix, editing: true })
+                      }
+                    >
+                      Fix this word
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+            {transcriptFixMsg && (
+              <div
+                className="transcript-fix-popover transcript-fix-toast"
+                style={{ left: transcriptFixMsg.left, top: transcriptFixMsg.top }}
+                role="status"
+              >
+                {transcriptFixMsg.text}
+              </div>
             )}
           </div>
         )}

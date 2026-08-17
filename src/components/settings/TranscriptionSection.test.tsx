@@ -87,7 +87,11 @@ const modelsStub = (over: Partial<SettingsModels> = {}): SettingsModels => ({
   ...over,
 });
 
-function renderTab(overrides: Partial<AppConfig> = {}) {
+function renderTab(
+  overrides: Partial<AppConfig> = {},
+  health: ServiceHealth = healthStub(),
+  models: SettingsModels = modelsStub(),
+) {
   mockTabIpc(overrides);
   const update = vi.fn();
   const view = render(
@@ -95,12 +99,25 @@ function renderTab(overrides: Partial<AppConfig> = {}) {
       active
       config={appConfig(overrides)}
       update={update}
-      health={healthStub()}
-      models={modelsStub()}
+      health={health}
+      models={models}
     />,
   );
   return { update, ...view };
 }
+
+/** Minimal SetupStatus for a given platform — see SetupStatusStrip.test.tsx's
+ *  SETUP literal for the field list; only `platform` varies here. */
+const setupFor = (platform: string) => ({
+  schema_version: 1,
+  platform,
+  architecture: "aarch64",
+  total_memory_bytes: 32_000_000_000,
+  available_disk_bytes: 400_000_000_000,
+  rapid_runtime_bundled: true,
+  recommended_profile: "",
+  profiles: [],
+});
 
 /** "Engine" labels two selects in this tab (transcription, then notes). */
 const engine = () =>
@@ -493,5 +510,131 @@ describe("Local AI recovery", () => {
 
     expect(restartCalls).toBe(1);
     expect(screen.getByText("Local AI is restarting…")).toBeTruthy();
+  });
+});
+
+describe("Model re-download", () => {
+  it("resets with force before it starts the download", async () => {
+    const calls: string[] = [];
+    const status = (
+      profile_id: string,
+      state: ModelDownloadStatus["state"],
+    ): ModelDownloadStatus => ({
+      profile_id,
+      state,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      detail: "",
+      error_code: null,
+      verified: state === "ready",
+      can_retry: true,
+    });
+    mockIPC((command, payload) => {
+      if (command === "get_config") return appConfig();
+      if (command === "update_config") return null;
+      if (command === "plugin:app|version") return "0.3.73";
+      if (command === "get_registration_state") return null;
+      if (command === "list_templates") return [{ name: "general", description: "" }];
+      if (command === "get_setup_status") return setupFor("macos");
+      if (command === "list_whisper_models") {
+        return [{ key: "large-v3", label: "Large v3", size: "3 GB", downloaded: true }];
+      }
+      if (command === "check_service_health") {
+        return { status: "ok", ollama_available: true, transcriber_state: "ready" };
+      }
+      if (command === "get_model_download_status") {
+        return status((payload as { profileId?: string }).profileId ?? "", "idle");
+      }
+      if (command === "reset_model_download") {
+        calls.push("reset");
+        expect(payload).toMatchObject({
+          profileId: "whisper-model:large-v3",
+          force: true,
+        });
+        return status("whisper-model:large-v3", "idle");
+      }
+      if (command === "start_model_download") {
+        calls.push("start");
+        return status("whisper-model:large-v3", "preparing");
+      }
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(<Settings initialTab="transcription" />);
+
+    await user.click(await screen.findByRole("button", { name: "Re-download" }));
+    expect(
+      screen.getByText(
+        "Click again to delete and re-download — use when the model seems corrupt",
+      ),
+    ).toBeTruthy();
+    expect(calls).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: "Confirm re-download" }));
+    await waitFor(() => expect(calls).toEqual(["reset", "start"]));
+  });
+});
+
+describe("Offline recovery copy", () => {
+  const NOT_DOWNLOADED = [
+    { key: "large-v3-turbo", label: "Large v3 turbo", size: "1.6 GB", downloaded: false },
+  ];
+
+  it("disables model downloads and explains that they need Local AI", async () => {
+    renderTab(
+      {},
+      healthStub({ healthStatus: "unreachable" }),
+      modelsStub({
+        whisperModels: [
+          ...NOT_DOWNLOADED,
+          { key: "large-v3", label: "Large v3", size: "3 GB", downloaded: true },
+        ],
+      }),
+    );
+
+    const download = await screen.findByRole("button", { name: "Download" });
+    const redownload = screen.getByRole("button", { name: "Re-download" });
+    expect(download).toBeDisabled();
+    expect(redownload).toBeDisabled();
+    expect(download).toHaveAttribute("title", "Local AI offline — restart it first");
+    expect(redownload).toHaveAttribute("title", "Local AI offline — restart it first");
+    expect(
+      screen.getByText(
+        "The local AI service isn't running — downloads need it. Start Adversaria's service (it launches with the app) or restart the app.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("leaves Download enabled once Local AI answers again", async () => {
+    renderTab({}, healthStub({ healthStatus: "ok" }), modelsStub({ whisperModels: NOT_DOWNLOADED }));
+
+    const button = await screen.findByRole("button", { name: "Download" });
+    expect(button).not.toBeDisabled();
+    expect(button).not.toHaveAttribute("title");
+  });
+
+  it("points macOS at the log file, not Windows Security, when Local AI is unreachable", async () => {
+    const { container } = renderTab(
+      {},
+      healthStub({ healthStatus: "unreachable" }),
+      modelsStub({ setup: setupFor("macos") }),
+    );
+
+    const copy = transcriptionCopy(container);
+    expect(copy).toMatch(/adversaria-service\.log/);
+    expect(copy).not.toMatch(/Windows Security/);
+  });
+
+  it("points Windows at Windows Security, not the macOS log path, when Local AI is unreachable", async () => {
+    const { container } = renderTab(
+      {},
+      healthStub({ healthStatus: "unreachable" }),
+      modelsStub({ setup: setupFor("windows") }),
+    );
+
+    const copy = transcriptionCopy(container);
+    expect(copy).toMatch(/Windows Security/);
+    expect(copy).not.toMatch(/adversaria-service\.log/);
   });
 });

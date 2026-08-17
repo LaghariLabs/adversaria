@@ -412,6 +412,9 @@ pub struct AppConfig {
     /// Default summary output language: "en", "ar", or "auto" (match spoken).
     #[serde(default = "default_summary_language")]
     pub summary_language: String,
+    /// Main-window appearance: "dark", "light", or "system".
+    #[serde(default = "default_theme")]
+    pub theme: String,
     /// The user's display name; when set, replaces the "Me" speaker label in
     /// new transcripts so their lines/notes are attributed by name.
     #[serde(default)]
@@ -626,6 +629,10 @@ fn default_transcription_model() -> String {
 
 fn default_summary_language() -> String {
     "en".to_string()
+}
+
+fn default_theme() -> String {
+    "dark".into()
 }
 
 fn default_true() -> bool {

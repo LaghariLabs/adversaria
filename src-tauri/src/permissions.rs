@@ -1,19 +1,10 @@
-//! Capture permissions, asked for **during first-run setup** rather than lazily
-//! at the first recording.
+//! Capture permissions, handled during first-run setup rather than lazily at
+//! the first recording.
 //!
-//! The lazy path is a real churn bug: a new user finishes setup, presses
-//! Record, and only then meets a macOS prompt — and for Screen Recording, a
-//! prompt that requires *relaunching the app* before it takes effect. Setup is
-//! the right place to spend that friction, next to the model download.
-//!
-//! macOS specifics worth knowing before editing:
-//! - **Microphone** (`AVCaptureDevice`) can be requested in-process; the prompt
-//!   appears immediately and the grant applies without a restart.
-//! - **Screen Recording** (what ScreenCaptureKit needs for system audio) can be
-//!   requested exactly **once** via `CGRequestScreenCaptureAccess`. After a
-//!   denial that call is a no-op forever, so the only remaining path is System
-//!   Settings — and the grant does **not** apply until the app restarts. Both
-//!   facts are surfaced in the UI instead of being discovered by the user.
+//! macOS microphone access can be requested in-process. System audio uses a
+//! Core Audio process tap, for which macOS exposes no public check or request
+//! API; the app proves access by playing real audio and recording whether the
+//! tap hears it. Screen Recording is not used by the capture path.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,9 +14,9 @@ use serde::{Deserialize, Serialize};
 pub enum PermissionState {
     /// Usable right now.
     Granted,
-    /// Explicitly refused — only System Settings can undo it.
+    /// The last check showed that access was not available.
     Denied,
-    /// Never asked; requesting will show the system prompt.
+    /// Never checked, or the last persisted check could not be read.
     Undetermined,
 }
 
@@ -34,12 +25,9 @@ pub enum PermissionState {
 pub struct CapturePermissions {
     /// Your own voice ("Me"). Without it only the far side is recorded.
     pub microphone: PermissionState,
-    /// System audio ("Them") via ScreenCaptureKit. Without it a call isn't
-    /// captured at all — this is the one that matters most.
-    pub screen_recording: PermissionState,
-    /// True when Screen Recording was granted in this process but macOS won't
-    /// honour it until the app restarts.
-    pub needs_relaunch: bool,
+    /// System audio ("Them") via the Core Audio process tap. No public
+    /// check API exists; this is the persisted result of the last probe.
+    pub system_audio: PermissionState,
 }
 
 #[cfg(target_os = "macos")]
@@ -47,20 +35,15 @@ mod imp {
     use super::{CapturePermissions, PermissionState};
     use block2::RcBlock;
     use objc2::runtime::Bool;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use serde::{Deserialize, Serialize};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    // CoreGraphics screen-capture gate. Present since macOS 10.15.
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGPreflightScreenCaptureAccess() -> bool;
-        fn CGRequestScreenCaptureAccess() -> bool;
+    #[derive(Serialize, Deserialize)]
+    struct SystemAudioProbeResult {
+        system_audio_granted: bool,
+        checked_at: String,
     }
-
-    /// Set when we observe screen recording flip to granted inside this
-    /// process, which macOS only honours after a restart.
-    static SCREEN_GRANTED_THIS_RUN: AtomicBool = AtomicBool::new(false);
 
     fn mic_state() -> PermissionState {
         use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
@@ -75,26 +58,29 @@ mod imp {
         }
     }
 
-    fn screen_state() -> PermissionState {
-        if unsafe { CGPreflightScreenCaptureAccess() } {
-            PermissionState::Granted
-        } else if SCREEN_GRANTED_THIS_RUN.load(Ordering::Relaxed) {
-            // Granted in System Settings but not yet live in this process.
-            PermissionState::Granted
-        } else {
-            // CoreGraphics can't distinguish "never asked" from "denied", so
-            // callers treat this as "try the prompt, then fall back to
-            // Settings" — which is correct for both.
-            PermissionState::Undetermined
-        }
+    fn state_from_probe_json(bytes: &[u8]) -> Option<PermissionState> {
+        serde_json::from_slice::<SystemAudioProbeResult>(bytes)
+            .ok()
+            .map(|probe| {
+                if probe.system_audio_granted {
+                    PermissionState::Granted
+                } else {
+                    PermissionState::Denied
+                }
+            })
+    }
+
+    fn system_audio_state() -> PermissionState {
+        std::fs::read(crate::config::app_data_dir().join("permission-probe.json"))
+            .ok()
+            .and_then(|bytes| state_from_probe_json(&bytes))
+            .unwrap_or(PermissionState::Undetermined)
     }
 
     pub fn check() -> CapturePermissions {
         CapturePermissions {
             microphone: mic_state(),
-            screen_recording: screen_state(),
-            needs_relaunch: SCREEN_GRANTED_THIS_RUN.load(Ordering::Relaxed)
-                && !unsafe { CGPreflightScreenCaptureAccess() },
+            system_audio: system_audio_state(),
         }
     }
 
@@ -122,23 +108,57 @@ mod imp {
         }
     }
 
-    /// Ask for Screen Recording. Only ever prompts once per install; after a
-    /// refusal this is a no-op and the caller must send the user to Settings.
-    pub fn request_screen_recording() -> PermissionState {
-        if unsafe { CGPreflightScreenCaptureAccess() } {
-            return PermissionState::Granted;
-        }
-        if unsafe { CGRequestScreenCaptureAccess() } {
-            SCREEN_GRANTED_THIS_RUN.store(true, Ordering::Relaxed);
-            return PermissionState::Granted;
-        }
-        PermissionState::Denied
+    pub fn persist_system_audio_probe(granted: bool) -> Result<(), String> {
+        let dir = crate::config::app_data_dir();
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            format!(
+                "Couldn't prepare the permission-check folder at {}: {error}",
+                dir.display()
+            )
+        })?;
+        let path = dir.join("permission-probe.json");
+        let temporary = dir.join("permission-probe.tmp");
+        let result = SystemAudioProbeResult {
+            system_audio_granted: granted,
+            checked_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let bytes = serde_json::to_vec_pretty(&result)
+            .map_err(|error| format!("Couldn't save the system-audio check: {error}"))?;
+        std::fs::write(&temporary, bytes).map_err(|error| {
+            format!(
+                "Couldn't save the system-audio check at {}: {error}",
+                temporary.display()
+            )
+        })?;
+        std::fs::rename(&temporary, &path).map_err(|error| {
+            format!(
+                "Couldn't finish saving the system-audio check at {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 
-    /// Note that the user granted Screen Recording out-of-process, so the UI
-    /// can offer a relaunch.
-    pub fn mark_screen_granted_externally() {
-        SCREEN_GRANTED_THIS_RUN.store(true, Ordering::Relaxed);
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn persisted_probe_maps_true_false_and_unreadable_to_permission_states() {
+            assert_eq!(
+                state_from_probe_json(
+                    br#"{"system_audio_granted":true,"checked_at":"2026-08-17T00:00:00Z"}"#
+                ),
+                Some(PermissionState::Granted)
+            );
+            assert_eq!(
+                state_from_probe_json(
+                    br#"{"system_audio_granted":false,"checked_at":"2026-08-17T00:00:00Z"}"#
+                ),
+                Some(PermissionState::Denied)
+            );
+            assert_eq!(state_from_probe_json(b"not json"), None);
+        }
     }
 }
 
@@ -146,27 +166,24 @@ mod imp {
 mod imp {
     use super::{CapturePermissions, PermissionState};
 
-    // Windows has no equivalent TCC gate for loopback capture or the mic, so
-    // setup shows nothing and the recorder just works.
+    // WASAPI loopback has no TCC gate, so both capture paths are available.
     pub fn check() -> CapturePermissions {
         CapturePermissions {
             microphone: PermissionState::Granted,
-            screen_recording: PermissionState::Granted,
-            needs_relaunch: false,
+            system_audio: PermissionState::Granted,
         }
     }
+
     pub fn request_microphone() -> PermissionState {
         PermissionState::Granted
     }
-    pub fn request_screen_recording() -> PermissionState {
-        PermissionState::Granted
+
+    pub fn persist_system_audio_probe(_granted: bool) -> Result<(), String> {
+        Ok(())
     }
-    pub fn mark_screen_granted_externally() {}
 }
 
-pub use imp::{
-    check, mark_screen_granted_externally, request_microphone, request_screen_recording,
-};
+pub use imp::{check, persist_system_audio_probe, request_microphone};
 
 /// Deep link into the exact System Settings pane for a permission, so a denied
 /// user isn't told to "go to Settings" and left to find it.
@@ -175,6 +192,6 @@ pub fn settings_url(which: &str) -> &'static str {
         "microphone" => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         }
-        _ => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        _ => "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture",
     }
 }

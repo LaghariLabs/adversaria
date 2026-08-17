@@ -321,7 +321,11 @@ def test_whisper_model_profile_pins_per_backend(
     picker downloads through the byte-progress pipeline, not fire-and-pray."""
     monkeypatch.setenv("WHISPER_BACKEND", "faster-whisper")
     ct2 = model_setup._whisper_model_pins()
-    assert set(ct2) == {"whisper-model:large-v3", "whisper-model:large-v3-turbo"}
+    assert set(ct2) == {
+        "whisper-model:large-v3",
+        "whisper-model:large-v3-turbo",
+        "whisper-model:cohere-transcribe-2b",
+    }
     assert ct2["whisper-model:large-v3"].repo_id == "Systran/faster-whisper-large-v3"
     assert (
         ct2["whisper-model:large-v3-turbo"].repo_id
@@ -334,8 +338,17 @@ def test_whisper_model_profile_pins_per_backend(
         "whisper-model:large-v3",
         "whisper-model:large-v3-turbo",
         "whisper-model:large-v3-turbo-q4",
+        "whisper-model:qwen3-asr-0.6b",
+        "whisper-model:qwen3-asr-1.7b",
+        "whisper-model:cohere-transcribe-2b",
     }
-    assert all(pin.repo_id.startswith("mlx-community/") for pin in mlx.values())
+    # Whisper weights stay on mlx-community; other engines pin their own
+    # upstream mirrors (Cohere = the sherpa-onnx export's HF mirror).
+    assert all(
+        pin.repo_id.startswith("mlx-community/")
+        for key, pin in mlx.items()
+        if "large-v3" in key
+    )
     for pins in (ct2, mlx):
         for pin in pins.values():
             assert len(pin.revision) == 40
@@ -399,3 +412,199 @@ def test_verified_download_clears_errors_for_equivalent_profile_aliases() -> Non
         for profile_id in aliases:
             model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
             model_setup._EXPECTED.pop(profile_id, None)
+
+
+def test_reset_clears_incomplete_blobs_and_marks_pending_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 1.3: a stuck download banner must actually clear on reset — both
+    the in-flight partial blob (so a retry doesn't resume a corrupt stream)
+    and the in-memory state (so the UI shows a retryable idle bar, not the
+    frozen error)."""
+    profile_id = "qwen-4b-light"
+    pin = model_setup.MODEL_PINS[profile_id]
+    repo = tmp_path / f"models--{pin.repo_id.replace('/', '--')}"
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    incomplete = blobs / f"{'a' * 64}.incomplete"
+    incomplete.write_bytes(b"partial")
+    monkeypatch.setattr(model_setup.constants, "HF_HUB_CACHE", str(tmp_path))
+
+    model_setup._STATES[profile_id] = model_setup.DownloadState(
+        profile_id,
+        state="error",
+        downloaded_bytes=123,
+        detail="The model download was interrupted.",
+        error_code="network",
+        can_retry=True,
+    )
+    try:
+        result = model_setup.reset_model_download(profile_id)
+
+        assert not incomplete.exists(), "stale partial blob must be cleared"
+        assert result["state"] == "pending"
+        assert result["can_retry"] is True
+        assert result["downloaded_bytes"] == 0
+        assert result["error_code"] is None
+        assert result["verified"] is False
+    finally:
+        model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+
+
+def test_force_reset_ready_profile_deletes_only_its_cached_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_id = "qwen-4b-light"
+    sibling_id = "qwen-9b-balanced"
+    monkeypatch.setattr(model_setup.constants, "HF_HUB_CACHE", str(tmp_path))
+    target = model_setup._snapshot_path(model_setup.MODEL_PINS[profile_id])
+    sibling = model_setup._snapshot_path(model_setup.MODEL_PINS[sibling_id])
+    target.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    target_weight = target / "model.safetensors"
+    target_config = target / "config.json"
+    sibling_weight = sibling / "model.safetensors"
+    target_weight.write_bytes(b"corrupt")
+    target_config.write_bytes(b"config")
+    sibling_weight.write_bytes(b"sibling")
+    model_setup._STATES[profile_id] = model_setup.DownloadState(
+        profile_id, state="ready", verified=True, can_retry=False
+    )
+    try:
+        result = model_setup.reset_model_download(profile_id, force=True)
+
+        assert not target_weight.exists()
+        assert target_config.exists(), "non-weight files are not part of the cached check"
+        assert sibling_weight.exists(), "another profile's snapshot must survive"
+        assert result["state"] == "pending"
+        assert result["verified"] is False
+        assert result["can_retry"] is True
+    finally:
+        model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+        model_setup._FORCE_DOWNLOADS.discard(profile_id)
+
+
+def test_regular_reset_ready_profile_keeps_cached_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_id = "qwen-4b-light"
+    monkeypatch.setattr(model_setup.constants, "HF_HUB_CACHE", str(tmp_path))
+    snapshot = model_setup._snapshot_path(model_setup.MODEL_PINS[profile_id])
+    snapshot.mkdir(parents=True)
+    weight = snapshot / "model.safetensors"
+    weight.write_bytes(b"cached")
+    model_setup._STATES[profile_id] = model_setup.DownloadState(
+        profile_id, state="ready", verified=True, can_retry=False
+    )
+    try:
+        result = model_setup.reset_model_download(profile_id)
+
+        assert weight.exists()
+        assert result["state"] == "pending"
+        assert result["verified"] is False
+        assert result["can_retry"] is True
+    finally:
+        model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+
+
+def test_force_reset_forces_the_next_snapshot_fetch() -> None:
+    profile_id = "qwen-4b-light"
+    files = (model_setup.ExpectedFile("model.safetensors", 1, None),)
+    model_setup._STATES[profile_id] = model_setup.DownloadState(
+        profile_id, state="ready", verified=True, can_retry=False
+    )
+    try:
+        with patch.object(model_setup, "_cached_weight_paths", return_value=()):
+            model_setup.reset_model_download(profile_id, force=True)
+        with (
+            patch.object(model_setup, "_load_manifest", return_value=files),
+            patch.object(model_setup, "snapshot_download") as download,
+            patch.object(model_setup, "_verify_snapshot"),
+        ):
+            model_setup._run_download(profile_id)
+
+        assert download.call_args.kwargs["force_download"] is True
+    finally:
+        model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+        model_setup._EXPECTED.pop(profile_id, None)
+        model_setup._FORCE_DOWNLOADS.discard(profile_id)
+
+
+def test_force_reset_non_ready_profile_matches_regular_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_id = "qwen-4b-light"
+    pin = model_setup.MODEL_PINS[profile_id]
+    blobs = (
+        tmp_path
+        / f"models--{pin.repo_id.replace('/', '--')}"
+        / "blobs"
+    )
+    blobs.mkdir(parents=True)
+    incomplete = blobs / f"{'a' * 64}.incomplete"
+    incomplete.write_bytes(b"partial")
+    monkeypatch.setattr(model_setup.constants, "HF_HUB_CACHE", str(tmp_path))
+    model_setup._STATES[profile_id] = model_setup.DownloadState(
+        profile_id,
+        state="error",
+        downloaded_bytes=123,
+        detail="The model download was interrupted.",
+        error_code="network",
+        can_retry=True,
+    )
+    try:
+        result = model_setup.reset_model_download(profile_id, force=True)
+
+        assert not incomplete.exists()
+        assert result["state"] == "pending"
+        assert result["downloaded_bytes"] == 0
+        assert result["error_code"] is None
+        assert result["verified"] is False
+        assert result["can_retry"] is True
+    finally:
+        model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+        model_setup._FORCE_DOWNLOADS.discard(profile_id)
+
+
+def test_reset_unknown_profile_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Unknown"):
+        model_setup.reset_model_download("user-controlled-repository")
+
+
+
+def test_every_picker_model_has_a_download_pin(monkeypatch):
+    """The Settings picker's Download button routes through the pinned
+    pipeline — a registry entry without a pin 400s as an unknown profile
+    (founder hit this live on Cohere, 2026-08-14). Registry and pins must
+    never drift."""
+    from src import model_setup, transcriber
+
+    for is_mlx in (True, False):
+        monkeypatch.setattr(transcriber, "backend_is_mlx", lambda v=is_mlx: v)
+        monkeypatch.setattr(model_setup, "backend_is_mlx", lambda v=is_mlx: v)
+        pins = model_setup._whisper_model_pins()
+        for key in transcriber.active_whisper_models():
+            assert f"{model_setup.WHISPER_MODEL_PROFILE_PREFIX}{key}" in pins, (
+                f"picker model {key!r} (mlx={is_mlx}) has no download pin"
+            )
+
+
+
+def test_manifest_accepts_onnx_weights():
+    """The manifest weight predicate is independent of the transcriber's —
+    sherpa/ONNX exports (Cohere) must pass it (founder-hit 2026-08-14)."""
+    pin = model_setup.MODEL_PINS["whisper-model:cohere-transcribe-2b"]
+    info = SimpleNamespace(
+        sha=pin.revision,
+        siblings=[
+            SimpleNamespace(rfilename="tokens.txt", size=10, lfs=None),
+            SimpleNamespace(
+                rfilename="encoder.int8.onnx",
+                size=100,
+                lfs=SimpleNamespace(sha256="ab" * 32),
+            ),
+        ],
+    )
+    with patch.object(model_setup.HfApi, "model_info", return_value=info):
+        files = model_setup._load_manifest(pin)
+    assert [file.name for file in files] == ["tokens.txt", "encoder.int8.onnx"]

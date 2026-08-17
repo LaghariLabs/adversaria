@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # --- Request models ---
 
 
 class TranscribeRequest(BaseModel):
-    audio_path: str = Field(..., description="Absolute path to the audio file on disk")
+    audio_path: str | None = Field(
+        default=None,
+        description=(
+            "Absolute path to the audio file on disk. Omitted for mic-only recordings."
+        ),
+    )
     mic_audio_path: str | None = Field(
         default=None,
         description=(
@@ -70,6 +75,12 @@ class TranscribeRequest(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def require_an_audio_path(self) -> TranscribeRequest:
+        if self.audio_path is None and self.mic_audio_path is None:
+            raise ValueError("audio_path or mic_audio_path is required")
+        return self
+
 
 class SummarizeRequest(BaseModel):
     transcript: str = Field(..., description="Raw transcript text to summarize")
@@ -84,8 +95,9 @@ class SummarizeRequest(BaseModel):
     output_language: str | None = Field(
         default=None,
         description=(
-            "Language for the summary: 'en', 'ar' (Arabic), or 'auto' (match the "
-            "language spoken in the meeting). None defaults to English."
+            "Language for the summary: 'en', 'ar', 'zh', 'hi', 'es', 'fr', 'bn', "
+            "'pt', 'ru', 'ur', or 'auto' (match the language spoken in the meeting). "
+            "None defaults to English."
         ),
     )
     user_notes: str | None = Field(

@@ -84,7 +84,7 @@ export function SummaryView({ summary, actionItems, onToggleActionItem }: Summar
         // dir="auto" below so mixed-script lines resolve per-line.
         const rtl = isRtl(section.heading);
         return (
-          <div key={section.heading} dir={rtl ? "rtl" : "ltr"}>
+          <div key={section.heading} className="summary-section" dir={rtl ? "rtl" : "ltr"}>
             <h3>
               <button
                 type="button"

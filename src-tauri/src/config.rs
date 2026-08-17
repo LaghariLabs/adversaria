@@ -161,6 +161,7 @@ impl Default for AppConfig {
             auto_detect_meetings: true,
             ollama_model: default_llm_model(),
             summary_language: "en".to_string(),
+            theme: "dark".to_string(),
             user_name: String::new(),
             custom_vocabulary: String::new(),
             diarize: true,
@@ -222,6 +223,25 @@ fn default_llm_model() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_defaults_keep_language_and_theme() {
+        let config = AppConfig::default();
+        assert_eq!(config.summary_language, "en");
+        assert_eq!(config.theme, "dark");
+    }
+
+    #[test]
+    fn theme_defaults_to_dark_for_an_older_config() {
+        let mut json = serde_json::to_value(AppConfig::default()).expect("serializes");
+        json.as_object_mut()
+            .expect("config is a JSON object")
+            .remove("theme");
+
+        let config: AppConfig = serde_json::from_value(json).expect("older config parses");
+
+        assert_eq!(config.theme, "dark");
+    }
 
     /// The to-do digest fired for everyone before it had a setting
     /// (`reminders.rs`, gated 2026-08-05). Defaulting it to false — or letting

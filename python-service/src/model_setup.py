@@ -89,10 +89,18 @@ _WHISPER_KEY_REVISIONS_MLX = {
     "large-v3": ("mlx-community/whisper-large-v3-mlx", "49e6aa286ad60c14352c404340ded53710378a11"),
     "large-v3-turbo": ("mlx-community/whisper-large-v3-turbo", "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"),
     "large-v3-turbo-q4": ("mlx-community/whisper-large-v3-turbo-q4", "660c343bbf4e52ac257f0b7d952e5388e6f93bef"),
+    # Non-whisper picker engines ride the same pinned pipeline (their Download
+    # buttons 400'd as unknown profiles — founder hit it live on Cohere,
+    # 2026-08-14). Revisions verified against live Hugging Face state 2026-08-14.
+    "qwen3-asr-0.6b": ("mlx-community/Qwen3-ASR-0.6B-bf16", "eae2b51f96265328f1e7beced788adb0e4536f92"),
+    "qwen3-asr-1.7b": ("mlx-community/Qwen3-ASR-1.7B-bf16", "e1f6c266914abc5a46e8756e02580f834a6cf8a7"),
+    "cohere-transcribe-2b": ("csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01", "156a470cf08eefe706a0004f3c52d9ee567ca7a0"),
 }
 _WHISPER_KEY_REVISIONS_CT2 = {
     "large-v3": ("Systran/faster-whisper-large-v3", "edaa852ec7e145841d8ffdb056a99866b5f0a478"),
     "large-v3-turbo": ("deepdml/faster-whisper-large-v3-turbo-ct2", "4df90f75321148c3a29a9e2351b7ddf8f5b115a8"),
+    # Cohere is registered on the CT2/Windows side too (sherpa is platform-neutral).
+    "cohere-transcribe-2b": ("csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01", "156a470cf08eefe706a0004f3c52d9ee567ca7a0"),
 }
 
 WHISPER_MODEL_PROFILE_PREFIX = "whisper-model:"
@@ -194,6 +202,12 @@ class ExpectedFile:
 _LOCK = threading.Lock()
 _STATES = {profile_id: DownloadState(profile_id) for profile_id in MODEL_PINS}
 _EXPECTED: dict[str, tuple[ExpectedFile, ...]] = {}
+_FORCE_DOWNLOADS: set[str] = set()
+
+# Keep this predicate aligned with transcriber.whisper_model_is_cached: those
+# root-level weight entries are what make a snapshot appear downloaded.
+_CACHED_WEIGHT_NAMES = {"model.bin", "weights.npz"}
+_CACHED_WEIGHT_SUFFIXES = (".safetensors", ".gguf")
 
 #: Called with the profile_id after a download reaches `ready` (verified).
 #: The server registers a transcriber re-init here so a finished whisper
@@ -241,8 +255,11 @@ def _load_manifest(pin: ModelPin) -> tuple[ExpectedFile, ...]:
             files.append(ExpectedFile(name=name, size=size, sha256=sha256))
     # `.bin` covers CTranslate2 whisper repos (`model.bin`) — without it every
     # CT2 whisper pin failed here with "no weight files" before any byte moved.
+    # `.onnx` covers sherpa exports (Cohere) — this predicate is INDEPENDENT of
+    # transcriber._WEIGHT_SUFFIXES and silently vetoed the Cohere download at
+    # the manifest stage (founder-hit 2026-08-14; reported as "network").
     if not files or not any(
-        file.name.endswith((".safetensors", ".gguf", ".bin"))
+        file.name.endswith((".safetensors", ".gguf", ".bin", ".onnx"))
         or file.name == "weights.npz"
         for file in files
     ):
@@ -253,6 +270,19 @@ def _load_manifest(pin: ModelPin) -> tuple[ExpectedFile, ...]:
 def _blobs_path(pin: ModelPin) -> Path:
     """The repo's content-addressed blob directory, sibling of `snapshots/`."""
     return _snapshot_path(pin).parents[1] / "blobs"
+
+
+def _cached_weight_paths(pin: ModelPin) -> tuple[Path, ...]:
+    """Weight entries that make this pinned snapshot pass the cached check."""
+    try:
+        return tuple(
+            path
+            for path in _snapshot_path(pin).iterdir()
+            if path.name in _CACHED_WEIGHT_NAMES
+            or path.name.endswith(_CACHED_WEIGHT_SUFFIXES)
+        )
+    except OSError:
+        return ()
 
 
 def _incomplete_bytes(blobs: Path, sha256: str) -> int:
@@ -390,6 +420,8 @@ def _equivalent_profile_ready(profile_id: str) -> bool:
 
 def _run_download(profile_id: str) -> None:
     pin = _pin(profile_id)
+    with _LOCK:
+        force_download = profile_id in _FORCE_DOWNLOADS
     try:
         _set_state(
             profile_id,
@@ -412,6 +444,7 @@ def _run_download(profile_id: str) -> None:
             repo_id=pin.repo_id,
             revision=pin.revision,
             allow_patterns=list(pin.allow_patterns) if pin.allow_patterns else None,
+            force_download=force_download,
         )
         _set_state(
             profile_id,
@@ -421,6 +454,8 @@ def _run_download(profile_id: str) -> None:
         )
         _verify_snapshot(pin, files)
         _mark_equivalent_ready(profile_id, files, total)
+        with _LOCK:
+            _FORCE_DOWNLOADS.discard(profile_id)
         for callback in list(_READY_CALLBACKS):
             try:
                 callback(profile_id)
@@ -430,7 +465,7 @@ def _run_download(profile_id: str) -> None:
         # An equivalent alias may have completed while this duplicate worker
         # was still running. Never overwrite a verified shared artifact with a
         # late network error from the losing worker.
-        if _equivalent_profile_ready(profile_id):
+        if not force_download and _equivalent_profile_ready(profile_id):
             return
         code, detail = _safe_failure(exc)
         _set_state(
@@ -444,12 +479,53 @@ def _run_download(profile_id: str) -> None:
         )
 
 
+def reset_model_download(profile_id: str, force: bool = False) -> dict[str, object]:
+    """Clear stale blobs/*.incomplete for this pin so a stuck bar can recover (Phase 1.3)."""
+    pin = _pin(profile_id)
+    if force:
+        with _LOCK:
+            _FORCE_DOWNLOADS.add(profile_id)
+        for path in _cached_weight_paths(pin):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    try:
+        blobs = _blobs_path(pin)
+        for path in blobs.glob("*.incomplete"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+    with _LOCK:
+        state = _STATES[profile_id]
+        state.state = "pending"
+        state.detail = "Download reset — press Download to retry."
+        state.downloaded_bytes = 0
+        state.error_code = None
+        state.can_retry = True
+        state.verified = False
+    return asdict(state)
+
+
 def start_model_download(profile_id: str) -> dict[str, object]:
     _pin(profile_id)
     with _LOCK:
         state = _STATES[profile_id]
         if state.state in {"preparing", "downloading", "verifying", "ready"}:
             return asdict(state)
+        # Auto-clear stale incomplete files from a prior interrupted download
+        # so a user on a flaky Windows connection doesn't stare at a frozen 0%
+        if state.state == "error":
+            try:
+                blobs = _blobs_path(_pin(profile_id))
+                for p in blobs.glob("*.incomplete"):
+                    if p.stat().st_size == 0:
+                        p.unlink(missing_ok=True)
+            except Exception:
+                pass
         state.state = "preparing"
         state.detail = "Preparing the local meeting model…"
         state.error_code = None
