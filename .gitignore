@@ -32,6 +32,10 @@ mcp-server/**/__pycache__/
 # Audio recordings (privacy)
 *.wav
 recordings/
+# …except the synthetic release-smoke fixture: 5 s of `say`-generated speech,
+# no human recorded, committed on purpose so scripts/build-dmg.sh and the
+# Windows release workflow can prove a frozen build actually transcribes.
+!python-service/tests/fixtures/*.wav
 
 # Stuntman relay state
 .stuntman/
@@ -53,6 +57,9 @@ coverage/
 python-service/bench_results.json
 python-service/uvicorn_dev.log
 python-service/uvicorn_dev.err.log
+# Persistent HF cache for the release smoke's tiny Whisper model (build-dmg.sh
+# stage 3.5). ~75 MB, downloaded once, reused by every later build.
+.smoke-cache/
 
 # Cloud-sync (OneDrive/iCloud) conflict copies, e.g. "prototype 2.css" — they
 # keep reappearing under ~/Documents and otherwise pollute git status.

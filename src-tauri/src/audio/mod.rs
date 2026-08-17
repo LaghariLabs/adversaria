@@ -5,7 +5,7 @@
 //! differs:
 //! - **Windows** (`wasapi`): WASAPI loopback for system audio + WASAPI capture
 //!   for the mic.
-//! - **macOS** (`macos`): ScreenCaptureKit for system audio + cpal for the mic.
+//! - **macOS** (`macos`): Core Audio process tap for system audio + cpal for the mic.
 //!
 //! Both implementations share the WAV writer, the live-caption delta snapshot,
 //! and the `StreamState` accumulator below. Mic capture is always best-effort: a
@@ -31,12 +31,18 @@ pub use wasapi::AudioCapture;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::AudioCapture;
+pub use macos::{probe_system_audio, AudioCapture};
+
+/// WASAPI loopback has no permission gate, so the permission probe is a no-op.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_system_audio() -> Result<bool, String> {
+    Ok(true)
+}
 
 /// WAV format tag for integer PCM samples.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const WAV_FORMAT_PCM: u16 = 1;
-/// WAV format tag for IEEE float samples (WASAPI shared mode + ScreenCaptureKit).
+/// WAV format tag for IEEE float samples (WASAPI shared mode + Core Audio tap).
 pub(crate) const WAV_FORMAT_IEEE_FLOAT: u16 = 3;
 
 /// Paths of the WAV files produced by a finished recording.
@@ -230,7 +236,7 @@ pub(crate) fn snapshot_since(
 /// Root-mean-square amplitude (0.0..~1.0) of the most recent ~120 ms of a
 /// stream's buffered audio — a cheap live "loudness" reading for the recording
 /// waveform. Returns 0.0 when there's nothing buffered. Handles both IEEE-float
-/// (ScreenCaptureKit / WASAPI shared) and 16-bit PCM samples; channels are all
+/// (Core Audio process tap / WASAPI shared) and 16-bit PCM samples; channels are all
 /// folded together (we only want overall level).
 pub(crate) fn current_rms(state: &StreamState) -> f32 {
     let sample_rate = *state.sample_rate.lock().unwrap();
@@ -282,7 +288,7 @@ pub(crate) fn current_rms(state: &StreamState) -> f32 {
 /// Write a WAV file from accumulated raw samples.
 ///
 /// `format_tag` must be 1 (integer PCM) or 3 (IEEE float) and match the raw
-/// bytes — WASAPI shared mode and ScreenCaptureKit both deliver float32.
+/// bytes — WASAPI shared mode and the Core Audio process tap both deliver float32.
 pub(crate) fn write_wav_file(
     path: &Path,
     pcm_data: &[u8],

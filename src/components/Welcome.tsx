@@ -23,9 +23,8 @@ import {
   updateConfig,
   checkCapturePermissions,
   requestMicrophonePermission,
-  requestScreenPermission,
+  probeSystemAudio,
   openPrivacySettings,
-  relaunchForPermissions,
 } from "../lib/tauri";
 import type { CapturePermissions } from "../lib/tauri";
 import { beginModelDownload, whisperModelId } from "../lib/modelDownloads";
@@ -96,7 +95,7 @@ export function Welcome({ onOpenModelSettings, transcriptionSetup }: WelcomeProp
   const [setup, setSetup] = useState<SetupStatus | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [perms, setPerms] = useState<CapturePermissions | null>(null);
-  const [permBusy, setPermBusy] = useState<"" | "microphone" | "screen">("");
+  const [permBusy, setPermBusy] = useState<"" | "microphone" | "system_audio">("");
   const [loadingError, setLoadingError] = useState("");
   // Bumped by the error screen's Retry button to restart the load attempts.
   const [loadNonce, setLoadNonce] = useState(0);
@@ -255,7 +254,9 @@ export function Welcome({ onOpenModelSettings, transcriptionSetup }: WelcomeProp
     const refresh = () => {
       checkCapturePermissions()
         .then((p) => { if (alive) setPerms(p); })
-        .catch(() => {});
+        .catch((error) => {
+          if (alive) setMessage(`Couldn't load recording permissions: ${String(error)}`);
+        });
     };
     refresh();
     window.addEventListener("focus", refresh);
@@ -303,17 +304,24 @@ export function Welcome({ onOpenModelSettings, transcriptionSetup }: WelcomeProp
     }
   };
 
-  const grantScreen = async () => {
-    setPermBusy("screen");
+  const checkSystemAudio = async () => {
+    setPermBusy("system_audio");
     try {
-      const state = await requestScreenPermission();
-      // macOS shows this prompt once per install; after that only Settings works.
-      if (state !== "granted") await openPrivacySettings("screen");
-      setPerms(await checkCapturePermissions());
+      setMessage("");
+      setPerms(await probeSystemAudio());
     } catch (error) {
       setMessage(String(error));
     } finally {
       setPermBusy("");
+    }
+  };
+
+  const openSystemAudioSettings = async () => {
+    try {
+      setMessage("");
+      await openPrivacySettings("system_audio");
+    } catch (error) {
+      setMessage(String(error));
     }
   };
 
@@ -492,16 +500,52 @@ export function Welcome({ onOpenModelSettings, transcriptionSetup }: WelcomeProp
             </p>
             <ul className="welcome-permissions perm-live">
               <li>
-                <span className={`perm-dot perm-${perms?.screen_recording ?? "undetermined"}`} />
+                <span className={`perm-dot perm-${perms?.system_audio ?? "undetermined"}`} />
                 <div className="perm-copy">
                   <strong>System audio</strong>
-                  <span>Records the other people on the call. Without it a meeting captures only you.</span>
+                  <span>
+                    System audio — the sound your Mac plays (the other side of your meetings).
+                    Adversaria plays a brief quiet tone to confirm macOS lets it listen. Nothing
+                    leaves your Mac.
+                  </span>
+                  {perms?.system_audio === "denied" && (
+                    <span>
+                      macOS didn't let Adversaria hear system audio. If your Mac is muted, unmute
+                      and check again. Otherwise enable Adversaria under System Audio Recording
+                      Only:
+                    </span>
+                  )}
                 </div>
-                {perms?.screen_recording === "granted" ? (
+                {permBusy === "system_audio" ? (
+                  <span className="perm-ok" role="status">
+                    Listening… answer the macOS prompt if one appears.
+                  </span>
+                ) : perms?.system_audio === "granted" ? (
                   <span className="perm-ok">Granted</span>
+                ) : perms?.system_audio === "denied" ? (
+                  <div className="settings-row">
+                    <button
+                      className="btn-secondary"
+                      disabled={permBusy !== ""}
+                      onClick={() => void openSystemAudioSettings()}
+                    >
+                      Open System Settings
+                    </button>
+                    <button
+                      className="btn-secondary"
+                      disabled={permBusy !== ""}
+                      onClick={() => void checkSystemAudio()}
+                    >
+                      Check again
+                    </button>
+                  </div>
                 ) : (
-                  <button className="btn-secondary" disabled={permBusy !== ""} onClick={grantScreen}>
-                    {permBusy === "screen" ? "Waiting…" : "Grant"}
+                  <button
+                    className="btn-secondary"
+                    disabled={permBusy !== ""}
+                    onClick={() => void checkSystemAudio()}
+                  >
+                    Check system audio
                   </button>
                 )}
               </li>
@@ -521,25 +565,13 @@ export function Welcome({ onOpenModelSettings, transcriptionSetup }: WelcomeProp
               </li>
             </ul>
 
-            {perms?.needs_relaunch && (
-              <div className="perm-relaunch">
-                <p>
-                  <strong>Almost there.</strong> macOS only applies Screen Recording after
-                  Adversaria restarts. Everything you've set up so far is saved.
-                </p>
-                <button className="btn-primary" onClick={() => relaunchForPermissions().catch((error) => setMessage(String(error)))}>
-                  Relaunch Adversaria
-                </button>
-              </div>
-            )}
-
             <p className="welcome-footnote">
               Denying doesn't delete anything — you can grant later in System Settings.
               Adversaria never records unless you press Record.
             </p>
             <div className="welcome-actions">
               <button className="btn-primary" onClick={() => finishStep("permissions").catch((error) => setMessage(String(error)))}>
-                {perms?.screen_recording === "granted" ? "Continue" : "Continue anyway"}
+                {perms?.system_audio === "granted" ? "Continue" : "Continue anyway"}
               </button>
             </div>
           </section>

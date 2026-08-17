@@ -180,8 +180,8 @@ export interface AskMessage {
 
 export type PromptTemplate = string;
 
-/** Summary output language: English, Arabic, or "match the spoken language". */
-export type SummaryLanguage = "en" | "ar" | "auto";
+/** Summary output language, or "match the spoken language". */
+export type SummaryLanguage = "en" | "ar" | "zh" | "hi" | "es" | "fr" | "bn" | "pt" | "ru" | "ur" | "auto";
 
 /** Where transcription runs: on this device, on a Whisper server the user runs
  *  (audio stays on their network), or on a provider's cloud API. */
@@ -256,12 +256,15 @@ export interface WhisperModelInfo {
   downloaded: boolean;
 }
 
+export type AppTheme = "dark" | "light" | "cream" | "navy" | "laghari" | "system";
+
 export interface AppConfig {
   python_service_url: string;
   default_prompt_template: PromptTemplate;
   auto_detect_meetings: boolean;
   ollama_model: string;
   summary_language: string;
+  theme: string;
   user_name: string;
   custom_vocabulary: string;
   diarize: boolean;

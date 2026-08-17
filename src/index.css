@@ -13,24 +13,492 @@
   --bg-primary: #09090b;
   --bg-secondary: #121215;
   --bg-tertiary: #1a1a1f;
+  --bg-elevated: #222229;
   --bg-glass: rgba(18, 18, 21, 0.75);
+  --bg-recording: #000;
+  --bg-recording-preview-top: #17171c;
+  --bg-recording-preview-bottom: #0d0d10;
+  --bg-recording-wire: #0b0b0e;
+  --bg-recording-wire-chrome: #17171c;
+  --bg-recording-wire-footer: #101014;
+  --bg-recording-wire-dot: #3f3f46;
+  --bg-recording-wire-line: #2a2a31;
 
   --text-primary: #f4f4f5;
   --text-secondary: #a1a1aa;
   --text-muted: #71717a;
+  --text-recording-primary: #fff;
+  --text-recording-secondary: rgba(255, 255, 255, 0.5);
+  --text-recording-caption: rgba(255, 255, 255, 0.82);
+  --text-recording-muted: rgba(255, 255, 255, 0.4);
+  --text-recording-accent: #ffbcba;
+  --text-recording-wire-label: #52525b;
+  --text-recording-preview-primary: #e7e7ea;
+  --text-recording-preview-muted: #8b8b95;
+  --text-accent-highlight: #86bfff;
 
   --accent-blue: #007aff;
+  --accent-blue-glow: rgba(0, 122, 255, 0.15);
   --accent-purple: #af52de;
   --accent-green: #34c759;
   --accent-amber: #ff9500;
   --accent-red: #ff3b30;
+  --accent-red-glow: rgba(255, 59, 48, 0.2);
+
+  /* Round 3: component colors whose dark values must remain pixel-identical. */
+  --tag-blue-bg: rgba(0, 122, 255, 0.12);
+  --tag-blue-text: #8ec5ff;
+  --tag-purple-bg: rgba(175, 82, 222, 0.12);
+  --tag-purple-text: #e1b3ff;
+  --tag-orange-bg: rgba(255, 149, 0, 0.12);
+  --tag-orange-text: #ffd19a;
+  --tag-green-bg: rgba(52, 199, 89, 0.12);
+  --tag-green-text: #b7ffc6;
+  --tag-red-bg: rgba(255, 59, 48, 0.12);
+  --tag-red-text: #ffbcba;
+
+  --category-pill-bg: rgba(255, 255, 255, 0.04);
+  --category-pill-text: #a1a1aa;
+  --category-pill-border: rgba(255, 255, 255, 0.08);
+  --category-pill-hover-bg: rgba(255, 255, 255, 0.08);
+  --category-pill-hover-text: #f4f4f5;
+  --category-pill-hover-border: rgba(255, 255, 255, 0.2);
+  --category-pill-active-bg: rgba(255, 255, 255, 0.08);
+  --category-pill-active-text: #f4f4f5;
+  --category-pill-active-border: #007aff;
+  --category-pill-active-ring: rgba(0, 122, 255, 0.3);
+
+  --record-button-bg: rgba(255, 59, 48, 0.08);
+  --record-button-border: rgba(255, 59, 48, 0.35);
+  --record-button-text: #ffbcba;
+  --record-button-shadow: rgba(255, 59, 48, 0.06);
+  --record-button-hover-bg: rgba(255, 59, 48, 0.14);
+  --record-button-hover-border: rgba(255, 59, 48, 0.6);
+  --record-button-hover-text: #fff;
+  --record-button-hover-shadow: rgba(255, 59, 48, 0.12);
+  --record-button-disabled-bg: rgba(255, 59, 48, 0.08);
+  --record-button-disabled-border: rgba(255, 59, 48, 0.35);
+  --record-button-disabled-text: #ffbcba;
+
+  --focus-ring-strong: #5caeff;
+  --primary-action-hover-bg: #2997ff;
+  --primary-action-disabled-text: rgba(255, 255, 255, 0.55);
+  --mention-chip-text: #5ab0ff;
+  --heatmap-day-text: #8ec5ff;
+  --heatmap-day-strong-text: #d6e9ff;
+  --status-success-text: #42c77a;
+  --status-error-color: #ff453a;
+  --notice-amber: #f0a43a;
+  --color-swatch-selection-border: #fff;
+  --color-swatch-selection-glow: rgba(255, 255, 255, 0.6);
 
   --border-color: rgba(255, 255, 255, 0.08);
   --border-focus: rgba(0, 122, 255, 0.4);
 
+  --overlay-1: rgba(255, 255, 255, 0.01);
+  --overlay-1-5: rgba(255, 255, 255, 0.015);
+  --overlay-2: rgba(255, 255, 255, 0.02);
+  --overlay-3: rgba(255, 255, 255, 0.03);
+  --overlay-4: rgba(255, 255, 255, 0.04);
+  --overlay-5: rgba(255, 255, 255, 0.05);
+  --overlay-6: rgba(255, 255, 255, 0.06);
+  --overlay-7: rgba(255, 255, 255, 0.07);
+  --overlay-8: rgba(255, 255, 255, 0.08);
+  --overlay-9: rgba(255, 255, 255, 0.09);
+  --overlay-10: rgba(255, 255, 255, 0.1);
+  --overlay-12: rgba(255, 255, 255, 0.12);
+  --overlay-14: rgba(255, 255, 255, 0.14);
+  --overlay-15: rgba(255, 255, 255, 0.15);
+  --overlay-16: rgba(255, 255, 255, 0.16);
+  --overlay-20: rgba(255, 255, 255, 0.2);
+  --overlay-25: rgba(255, 255, 255, 0.25);
+  --overlay-28: rgba(255, 255, 255, 0.28);
+  --overlay-40: rgba(255, 255, 255, 0.4);
+
   /* Inter is self-hosted via @fontsource-variable/inter (bundled, no CDN call). */
   --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-serif: "Instrument Serif", Georgia, serif;
+
+  /* Shared action scale, mirrored in prototype.css for either stylesheet's
+     standalone token context. */
+  --btn-height: 32px;
+  --btn-padding-x: 14px;
+  --btn-radius: 8px;
+  --btn-font: 600 13px/1 var(--font-sans, -apple-system, sans-serif);
+  --btn-pill-height: 24px;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg-primary: #f6f6f7;
+  --bg-secondary: #efeff1;
+  --bg-tertiary: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-glass: rgba(255, 255, 255, 0.8);
+  --bg-recording: #ffffff;
+  --bg-recording-preview-top: #ffffff;
+  --bg-recording-preview-bottom: #f6f6f7;
+  --bg-recording-wire: #ffffff;
+  --bg-recording-wire-chrome: #efeff1;
+  --bg-recording-wire-footer: #f6f6f7;
+  --bg-recording-wire-dot: var(--overlay-20);
+  --bg-recording-wire-line: var(--overlay-12);
+  --text-primary: #1a1a1f;
+  --text-secondary: #494951;
+  --text-muted: #6b6b74;
+  --text-recording-primary: #1a1a1f;
+  --text-recording-secondary: #494951;
+  --text-recording-caption: #1a1a1f;
+  --text-recording-muted: #6b6b74;
+  --text-recording-accent: #d92d20;
+  --text-recording-wire-label: #6b6b74;
+  --text-recording-preview-primary: #1a1a1f;
+  --text-recording-preview-muted: #6b6b74;
+  --text-accent-highlight: #007aff;
+  --accent-blue: #007aff;
+  --accent-blue-glow: rgba(0, 122, 255, 0.12);
+  --accent-purple: #7c3aed;
+  --accent-green: #1f9d4d;
+  --accent-amber: #b45309;
+  --accent-red: #d92d20;
+  --accent-red-glow: rgba(217, 45, 32, 0.14);
+  --tag-blue-bg: rgba(0, 122, 255, 0.14);
+  --tag-blue-text: #0a66d0;
+  --tag-purple-bg: rgba(175, 82, 222, 0.14);
+  --tag-purple-text: #7c3aed;
+  --tag-orange-bg: rgba(255, 149, 0, 0.14);
+  --tag-orange-text: #b45309;
+  --tag-green-bg: rgba(52, 199, 89, 0.14);
+  --tag-green-text: #1f7a3d;
+  --tag-red-bg: rgba(255, 59, 48, 0.14);
+  --tag-red-text: #b3261e;
+  --category-pill-bg: rgba(20, 20, 24, 0.05);
+  --category-pill-text: #494951;
+  --category-pill-border: rgba(20, 20, 24, 0.14);
+  --category-pill-hover-bg: rgba(20, 20, 24, 0.09);
+  --category-pill-hover-text: #1a1a1f;
+  --category-pill-hover-border: rgba(20, 20, 24, 0.24);
+  --category-pill-active-bg: rgba(0, 122, 255, 0.14);
+  --category-pill-active-text: #0a66d0;
+  --category-pill-active-border: #0a66d0;
+  --category-pill-active-ring: rgba(10, 102, 208, 0.22);
+  --record-button-bg: rgba(198, 43, 30, 0.14);
+  --record-button-border: rgba(198, 43, 30, 0.52);
+  --record-button-text: #a9251a;
+  --record-button-shadow: rgba(198, 43, 30, 0.1);
+  --record-button-hover-bg: rgba(198, 43, 30, 0.2);
+  --record-button-hover-border: rgba(198, 43, 30, 0.72);
+  --record-button-hover-text: #8f1e16;
+  --record-button-hover-shadow: rgba(198, 43, 30, 0.15);
+  --record-button-disabled-bg: rgba(198, 43, 30, 0.08);
+  --record-button-disabled-border: rgba(198, 43, 30, 0.28);
+  --record-button-disabled-text: #9a4c45;
+  --focus-ring-strong: #0a66d0;
+  --primary-action-hover-bg: #0a66d0;
+  --primary-action-disabled-text: rgba(20, 20, 24, 0.68);
+  --mention-chip-text: #0a66d0;
+  --heatmap-day-text: #0a66d0;
+  --heatmap-day-strong-text: #173f6b;
+  --status-success-text: #1f7a3d;
+  --status-error-color: #b3261e;
+  --notice-amber: #b45309;
+  --color-swatch-selection-border: #1a1a1f;
+  --color-swatch-selection-glow: rgba(20, 20, 24, 0.3);
+  --border-color: rgba(20, 20, 24, 0.1);
+  --border-focus: rgba(0, 122, 255, 0.45);
+  --overlay-1: rgba(20, 20, 24, 0.01);
+  --overlay-1-5: rgba(20, 20, 24, 0.015);
+  --overlay-2: rgba(20, 20, 24, 0.03);
+  --overlay-3: rgba(20, 20, 24, 0.03);
+  --overlay-4: rgba(20, 20, 24, 0.04);
+  --overlay-5: rgba(20, 20, 24, 0.05);
+  --overlay-6: rgba(20, 20, 24, 0.06);
+  --overlay-7: rgba(20, 20, 24, 0.07);
+  --overlay-8: rgba(20, 20, 24, 0.08);
+  --overlay-9: rgba(20, 20, 24, 0.09);
+  --overlay-10: rgba(20, 20, 24, 0.1);
+  --overlay-12: rgba(20, 20, 24, 0.12);
+  --overlay-14: rgba(20, 20, 24, 0.14);
+  --overlay-15: rgba(20, 20, 24, 0.15);
+  --overlay-16: rgba(20, 20, 24, 0.16);
+  --overlay-20: rgba(20, 20, 24, 0.2);
+  --overlay-25: rgba(20, 20, 24, 0.25);
+  --overlay-28: rgba(20, 20, 24, 0.28);
+  --overlay-40: rgba(20, 20, 24, 0.4);
+}
+
+:root[data-theme="cream"] {
+  color-scheme: light;
+  --bg-primary: #f8f5ee;
+  --bg-secondary: #f1ecdf;
+  --bg-tertiary: #fffdf7;
+  --bg-elevated: #fffdf7;
+  --bg-glass: rgba(255, 253, 247, 0.8);
+  --bg-recording: #fffdf7;
+  --bg-recording-preview-top: #fffdf7;
+  --bg-recording-preview-bottom: #f8f5ee;
+  --bg-recording-wire: #fffdf7;
+  --bg-recording-wire-chrome: #f1ecdf;
+  --bg-recording-wire-footer: #f8f5ee;
+  --bg-recording-wire-dot: var(--overlay-20);
+  --bg-recording-wire-line: var(--overlay-12);
+  --text-primary: #1f2a24;
+  --text-secondary: #4b5646;
+  --text-muted: #6f7566;
+  --text-recording-primary: #1f2a24;
+  --text-recording-secondary: #4b5646;
+  --text-recording-caption: #1f2a24;
+  --text-recording-muted: #6f7566;
+  --text-recording-accent: #b3462e;
+  --text-recording-wire-label: #6f7566;
+  --text-recording-preview-primary: #1f2a24;
+  --text-recording-preview-muted: #6f7566;
+  --text-accent-highlight: #1f6f54;
+  --accent-blue: #1f6f54;
+  --accent-blue-glow: rgba(31, 111, 84, 0.12);
+  --accent-purple: #6d5a8e;
+  --accent-green: #1f6f54;
+  --accent-amber: #b98a2e;
+  --accent-red: #b3462e;
+  --accent-red-glow: rgba(179, 70, 46, 0.14);
+  --tag-blue-bg: rgba(0, 122, 255, 0.14);
+  --tag-blue-text: #0a66d0;
+  --tag-purple-bg: rgba(175, 82, 222, 0.14);
+  --tag-purple-text: #7c3aed;
+  --tag-orange-bg: rgba(255, 149, 0, 0.14);
+  --tag-orange-text: #b45309;
+  --tag-green-bg: rgba(52, 199, 89, 0.14);
+  --tag-green-text: #1f7a3d;
+  --tag-red-bg: rgba(255, 59, 48, 0.14);
+  --tag-red-text: #b3261e;
+  --category-pill-bg: rgba(31, 42, 36, 0.05);
+  --category-pill-text: #4b5646;
+  --category-pill-border: rgba(31, 42, 36, 0.16);
+  --category-pill-hover-bg: rgba(31, 42, 36, 0.1);
+  --category-pill-hover-text: #1f2a24;
+  --category-pill-hover-border: rgba(31, 42, 36, 0.26);
+  --category-pill-active-bg: rgba(31, 111, 84, 0.14);
+  --category-pill-active-text: #1f6f54;
+  --category-pill-active-border: #1f6f54;
+  --category-pill-active-ring: rgba(31, 111, 84, 0.22);
+  --record-button-bg: rgba(179, 70, 46, 0.14);
+  --record-button-border: rgba(179, 70, 46, 0.52);
+  --record-button-text: #8f321f;
+  --record-button-shadow: rgba(179, 70, 46, 0.1);
+  --record-button-hover-bg: rgba(179, 70, 46, 0.2);
+  --record-button-hover-border: rgba(179, 70, 46, 0.72);
+  --record-button-hover-text: #7c2b1b;
+  --record-button-hover-shadow: rgba(179, 70, 46, 0.15);
+  --record-button-disabled-bg: rgba(179, 70, 46, 0.08);
+  --record-button-disabled-border: rgba(179, 70, 46, 0.28);
+  --record-button-disabled-text: #87584e;
+  --focus-ring-strong: #1f6f54;
+  --primary-action-hover-bg: #195f49;
+  --primary-action-disabled-text: rgba(31, 42, 36, 0.68);
+  --mention-chip-text: #245f9e;
+  --heatmap-day-text: #245f9e;
+  --heatmap-day-strong-text: #21496f;
+  --status-success-text: #1f6f54;
+  --status-error-color: #a33f2b;
+  --notice-amber: #9a6a1a;
+  --color-swatch-selection-border: #1f2a24;
+  --color-swatch-selection-glow: rgba(31, 42, 36, 0.3);
+  --border-color: rgba(31, 42, 36, 0.14);
+  --border-focus: rgba(31, 111, 84, 0.45);
+  --overlay-1: rgba(31, 42, 36, 0.01);
+  --overlay-1-5: rgba(31, 42, 36, 0.015);
+  --overlay-2: rgba(31, 42, 36, 0.02);
+  --overlay-3: rgba(31, 42, 36, 0.03);
+  --overlay-4: rgba(31, 42, 36, 0.04);
+  --overlay-5: rgba(31, 42, 36, 0.05);
+  --overlay-6: rgba(31, 42, 36, 0.06);
+  --overlay-7: rgba(31, 42, 36, 0.07);
+  --overlay-8: rgba(31, 42, 36, 0.08);
+  --overlay-9: rgba(31, 42, 36, 0.09);
+  --overlay-10: rgba(31, 42, 36, 0.1);
+  --overlay-12: rgba(31, 42, 36, 0.12);
+  --overlay-14: rgba(31, 42, 36, 0.14);
+  --overlay-15: rgba(31, 42, 36, 0.15);
+  --overlay-16: rgba(31, 42, 36, 0.16);
+  --overlay-20: rgba(31, 42, 36, 0.2);
+  --overlay-25: rgba(31, 42, 36, 0.25);
+  --overlay-28: rgba(31, 42, 36, 0.28);
+  --overlay-40: rgba(31, 42, 36, 0.4);
+}
+
+:root[data-theme="laghari"] {
+  color-scheme: light;
+  --bg-primary: #f2ebda;
+  --bg-secondary: #e8dfc6;
+  --bg-tertiary: #fbf6ea;
+  --bg-elevated: #fbf6ea;
+  --bg-glass: rgba(242, 235, 218, 0.8);
+  --bg-recording: #fbf6ea;
+  --bg-recording-preview-top: #fbf6ea;
+  --bg-recording-preview-bottom: #f2ebda;
+  --bg-recording-wire: #fbf6ea;
+  --bg-recording-wire-chrome: #e8dfc6;
+  --bg-recording-wire-footer: #f2ebda;
+  --bg-recording-wire-dot: var(--overlay-20);
+  --bg-recording-wire-line: var(--overlay-12);
+  --text-primary: #0e0e12;
+  --text-secondary: #2b2730;
+  --text-muted: #6b6470;
+  --text-recording-primary: #0e0e12;
+  --text-recording-secondary: #2b2730;
+  --text-recording-caption: #0e0e12;
+  --text-recording-muted: #6b6470;
+  --text-recording-accent: #ff4d2e;
+  --text-recording-wire-label: #6b6470;
+  --text-recording-preview-primary: #0e0e12;
+  --text-recording-preview-muted: #6b6470;
+  --text-accent-highlight: #3a86ff;
+  --accent-blue: #3a86ff;
+  --accent-blue-glow: rgba(58, 134, 255, 0.12);
+  --accent-purple: #b388ff;
+  --accent-green: #06d6a0;
+  --accent-amber: #c29500;
+  --accent-red: #ff4d2e;
+  --accent-red-glow: rgba(255, 77, 46, 0.14);
+  --tag-blue-bg: rgba(47, 111, 214, 0.14);
+  --tag-blue-text: #2f6fd6;
+  --tag-purple-bg: rgba(175, 82, 222, 0.14);
+  --tag-purple-text: #7c3aed;
+  --tag-orange-bg: rgba(255, 149, 0, 0.14);
+  --tag-orange-text: #b45309;
+  --tag-green-bg: rgba(52, 199, 89, 0.14);
+  --tag-green-text: #1f7a3d;
+  --tag-red-bg: rgba(255, 59, 48, 0.14);
+  --tag-red-text: #b3261e;
+  --category-pill-bg: rgba(14, 14, 18, 0.05);
+  --category-pill-text: #2b2730;
+  --category-pill-border: rgba(14, 14, 18, 0.16);
+  --category-pill-hover-bg: rgba(14, 14, 18, 0.1);
+  --category-pill-hover-text: #0e0e12;
+  --category-pill-hover-border: rgba(14, 14, 18, 0.26);
+  --category-pill-active-bg: rgba(47, 111, 214, 0.14);
+  --category-pill-active-text: #2f6fd6;
+  --category-pill-active-border: #2f6fd6;
+  --category-pill-active-ring: rgba(47, 111, 214, 0.22);
+  --record-button-bg: rgba(255, 77, 46, 0.14);
+  --record-button-border: rgba(198, 43, 30, 0.55);
+  --record-button-text: #9f2016;
+  --record-button-shadow: rgba(198, 43, 30, 0.1);
+  --record-button-hover-bg: rgba(255, 77, 46, 0.2);
+  --record-button-hover-border: rgba(198, 43, 30, 0.74);
+  --record-button-hover-text: #861910;
+  --record-button-hover-shadow: rgba(198, 43, 30, 0.15);
+  --record-button-disabled-bg: rgba(255, 77, 46, 0.08);
+  --record-button-disabled-border: rgba(198, 43, 30, 0.3);
+  --record-button-disabled-text: #8f4a42;
+  --focus-ring-strong: #2f6fd6;
+  --primary-action-hover-bg: #2f6fd6;
+  --primary-action-disabled-text: rgba(14, 14, 18, 0.68);
+  --mention-chip-text: #2f6fd6;
+  --heatmap-day-text: #2f6fd6;
+  --heatmap-day-strong-text: #173f6b;
+  --status-success-text: #087a5f;
+  --status-error-color: #b52619;
+  --notice-amber: #9a6800;
+  --color-swatch-selection-border: #0e0e12;
+  --color-swatch-selection-glow: rgba(14, 14, 18, 0.3);
+  --border-color: rgba(14, 14, 18, 0.14);
+  --border-focus: rgba(58, 134, 255, 0.45);
+  --overlay-1: rgba(14, 14, 18, 0.01);
+  --overlay-1-5: rgba(14, 14, 18, 0.015);
+  --overlay-2: rgba(14, 14, 18, 0.02);
+  --overlay-3: rgba(14, 14, 18, 0.03);
+  --overlay-4: rgba(14, 14, 18, 0.04);
+  --overlay-5: rgba(14, 14, 18, 0.05);
+  --overlay-6: rgba(14, 14, 18, 0.06);
+  --overlay-7: rgba(14, 14, 18, 0.07);
+  --overlay-8: rgba(14, 14, 18, 0.08);
+  --overlay-9: rgba(14, 14, 18, 0.09);
+  --overlay-10: rgba(14, 14, 18, 0.1);
+  --overlay-12: rgba(14, 14, 18, 0.12);
+  --overlay-14: rgba(14, 14, 18, 0.14);
+  --overlay-15: rgba(14, 14, 18, 0.15);
+  --overlay-16: rgba(14, 14, 18, 0.16);
+  --overlay-20: rgba(14, 14, 18, 0.2);
+  --overlay-25: rgba(14, 14, 18, 0.25);
+  --overlay-28: rgba(14, 14, 18, 0.28);
+  --overlay-40: rgba(14, 14, 18, 0.4);
+  /* Brand fonts (vendored from lagharilabs-website, OFL) — pixel display,
+     mono body: the Laghari Labs arcade identity. */
+  --font-serif: "Pixelify Sans", Georgia, serif;
+  --font-sans: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+:root[data-theme="navy"] {
+  color-scheme: dark;
+  --bg-primary: #0e1626;
+  --bg-secondary: #121c30;
+  --bg-tertiary: #182340;
+  --bg-elevated: #1c2848;
+  --bg-glass: rgba(18, 28, 48, 0.8);
+  --bg-recording: #1c2848;
+  --bg-recording-preview-top: #182340;
+  --bg-recording-preview-bottom: #0e1626;
+  --bg-recording-wire: #182340;
+  --bg-recording-wire-chrome: #121c30;
+  --bg-recording-wire-footer: #0e1626;
+  --bg-recording-wire-dot: var(--overlay-20);
+  --bg-recording-wire-line: var(--overlay-12);
+  --text-primary: #ede7d8;
+  --text-secondary: #bcb6a5;
+  --text-muted: #918e80;
+  --text-recording-primary: #ede7d8;
+  --text-recording-secondary: #bcb6a5;
+  --text-recording-caption: #ede7d8;
+  --text-recording-muted: #918e80;
+  --text-recording-accent: #d98a7f;
+  --text-recording-wire-label: #918e80;
+  --text-recording-preview-primary: #ede7d8;
+  --text-recording-preview-muted: #918e80;
+  --text-accent-highlight: #ede7d8;
+  --accent-blue: #d4a545;
+  --accent-blue-glow: rgba(212, 165, 69, 0.14);
+  --accent-purple: #a08fc0;
+  --accent-green: #7fbf8e;
+  --accent-amber: #d4a545;
+  --accent-red: #d98a7f;
+  --accent-red-glow: rgba(217, 138, 127, 0.2);
+  --category-pill-bg: rgba(232, 224, 205, 0.04);
+  --category-pill-text: #bcb6a5;
+  --category-pill-border: rgba(232, 224, 205, 0.12);
+  --category-pill-hover-bg: rgba(232, 224, 205, 0.08);
+  --category-pill-hover-text: #ede7d8;
+  --category-pill-hover-border: rgba(232, 224, 205, 0.2);
+  --category-pill-active-bg: rgba(232, 224, 205, 0.08);
+  --category-pill-active-text: #ede7d8;
+  --category-pill-active-border: #d4a545;
+  --category-pill-active-ring: rgba(212, 165, 69, 0.3);
+  --record-button-text: #d98a7f;
+  --record-button-disabled-text: #d98a7f;
+  --focus-ring-strong: #d4a545;
+  --primary-action-hover-bg: #e0b85f;
+  --notice-amber: #d4a545;
+  --border-color: rgba(232, 224, 205, 0.12);
+  --border-focus: rgba(212, 165, 69, 0.45);
+  --overlay-1: rgba(232, 224, 205, 0.01);
+  --overlay-1-5: rgba(232, 224, 205, 0.015);
+  --overlay-2: rgba(232, 224, 205, 0.02);
+  --overlay-3: rgba(232, 224, 205, 0.03);
+  --overlay-4: rgba(232, 224, 205, 0.04);
+  --overlay-5: rgba(232, 224, 205, 0.05);
+  --overlay-6: rgba(232, 224, 205, 0.06);
+  --overlay-7: rgba(232, 224, 205, 0.07);
+  --overlay-8: rgba(232, 224, 205, 0.08);
+  --overlay-9: rgba(232, 224, 205, 0.09);
+  --overlay-10: rgba(232, 224, 205, 0.1);
+  --overlay-12: rgba(232, 224, 205, 0.12);
+  --overlay-14: rgba(232, 224, 205, 0.14);
+  --overlay-15: rgba(232, 224, 205, 0.15);
+  --overlay-16: rgba(232, 224, 205, 0.16);
+  --overlay-20: rgba(232, 224, 205, 0.2);
+  --overlay-25: rgba(232, 224, 205, 0.25);
+  --overlay-28: rgba(232, 224, 205, 0.28);
+  --overlay-40: rgba(232, 224, 205, 0.4);
 }
 
 /* Instrument Serif (OFL) — the elegant serif used for the Adversaria wordmark.
@@ -63,20 +531,20 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--overlay-10);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: var(--overlay-20);
 }
 ::selection {
   background: rgba(0, 122, 255, 0.3);
 }
 
 /* Floating "Recording" pill window (?widget=recording) — the B2 "minimal"
-   notch-drop design: a pure-black pill that hugs the notch (square top corners,
-   rounded bottom), red pulsing dot + timer on the left, blue live waveform on
-   the right, small Stop at the far right. Fills its small transparent window. */
+   design: a themed recording surface with a red pulsing dot + timer on the
+   left, blue live waveform on the right, and Stop at the far right. The actual
+   physical-notch dock is the intentionally black `.notch-island` below. */
 .record-pill {
   position: fixed;
   inset: 0;
@@ -85,9 +553,9 @@ body {
   justify-content: space-between;
   gap: 8px;
   padding: 0 11px;
-  background: #000;
+  background: var(--bg-recording);
   border-radius: 16px;
-  color: #fff;
+  color: var(--text-recording-primary);
   font-family: var(--font-sans);
   font-size: 11px;
   font-weight: 600;
@@ -102,6 +570,7 @@ body {
   align-items: center;
   gap: 7px;
 }
+/* Record red and the white glyphs on it are invariant status colors. */
 .record-pill-dot {
   width: 8px;
   height: 8px;
@@ -122,6 +591,9 @@ body {
   font-variant-numeric: tabular-nums;
   min-width: 34px;
 }
+.record-pill .record-pill-time {
+  color: var(--text-recording-primary);
+}
 /* Live waveform — CSS-animated bars whose amplitude follows the channel's real
    loudness via --lvl (0..1, polled from Rust): the "Me" wave only dances when
    the mic hears the user, "Them" only when the call has sound. Without --lvl
@@ -135,6 +607,7 @@ body {
   transform-origin: center;
   transition: transform 140ms ease-out;
 }
+/* Fixed channel colors are semantic audio identity: blue = mic, red = system. */
 .record-pill-wave span {
   width: 2.5px;
   border-radius: 2px;
@@ -180,11 +653,11 @@ body {
   flex-direction: column;
   gap: 8px;
   padding: 11px 14px 12px;
-  background: #000;
+  background: var(--bg-recording);
   border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--overlay-6);
   box-shadow: 0 14px 34px rgba(0, 0, 0, 0.7);
-  color: #fff;
+  color: var(--text-recording-primary);
   font-family: var(--font-sans);
   user-select: none;
   cursor: pointer;
@@ -204,7 +677,7 @@ body {
   align-items: center;
   justify-content: center;
 }
-/* On the red icon, the recording dot reads as a white pip, not the red glow. */
+/* Recording red and its white stop/pip contrast are semantic on every theme. */
 .isl-ico .record-pill-dot {
   background: #fff;
   box-shadow: none;
@@ -216,12 +689,12 @@ body {
 .isl-a {
   font-size: 12.5px;
   font-weight: 650;
-  color: #fff;
+  color: var(--text-recording-primary);
   line-height: 1.2;
 }
 .isl-b {
   font-size: 10.5px;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--text-recording-secondary);
 }
 .isl-time {
   font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
@@ -229,6 +702,8 @@ body {
   color: #fff;
   font-variant-numeric: tabular-nums;
 }
+/* Base island text serves the physical-notch dock, which stays black. The
+   ordinary floating island gets theme-aware overrides below. */
 .isl-cap {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.82);
@@ -242,6 +717,15 @@ body {
 .isl-idle {
   color: rgba(255, 255, 255, 0.4);
   font-style: italic;
+}
+.record-island .isl-time {
+  color: var(--text-recording-primary);
+}
+.record-island .isl-cap {
+  color: var(--text-recording-caption);
+}
+.record-island .isl-idle {
+  color: var(--text-recording-muted);
 }
 .isl-wave-row {
   display: flex;
@@ -284,22 +768,21 @@ body {
   align-items: center;
   justify-content: center;
   margin-left: 1px;
-  width: 13px;
-  height: 13px;
+  width: var(--btn-pill-height);
+  height: var(--btn-pill-height);
   padding: 0;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--btn-radius);
   background: transparent;
   color: currentColor;
   opacity: 0.55;
-  font-size: 12px;
-  line-height: 1;
+  font: var(--btn-font);
   cursor: pointer;
   transition: opacity 0.12s ease, background-color 0.12s ease;
 }
 .tag-badge-remove:hover {
   opacity: 1;
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--overlay-12);
 }
 
 /* Plain transcript (no speaker labels) — readable paragraphs per turn. */

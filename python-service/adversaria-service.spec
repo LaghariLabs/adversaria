@@ -22,6 +22,10 @@ hiddenimports = []
 for pkg in (
     "mlx",
     "mlx_whisper",
+    # Qwen3-ASR engine (0.3.77): imported lazily by transcriber.py when a qwen
+    # model is selected — invisible to import analysis, so it must be collected
+    # explicitly or the packaged app's Qwen engine silently becomes dev-only.
+    "qwen3_asr_mlx",
     "av",
     "ctranslate2",
     "faster_whisper",

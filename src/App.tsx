@@ -20,8 +20,10 @@ import { SetupStatusStrip } from "./components/SetupStatusStrip";
 import { GuidedTour } from "./components/GuidedTour";
 import { TranscriptionSetupChip } from "./components/TranscriptionSetupChip";
 import { useTranscriptionSetup } from "./hooks/useTranscriptionSetup";
+import { useTheme } from "./hooks/useTheme";
 import {
   getConfig,
+  onConfigUpdated,
   restartLocalAiService,
   updateConfig,
   deleteMeeting,
@@ -60,11 +62,14 @@ const GraphView = lazy(() =>
 const SILENCE_PROMPT_MS = 5 * 60 * 1000;
 const SILENCE_STOP_MS = 10 * 60 * 1000;
 const SILENCE_CHECK_MS = 15 * 1000;
+const THEME_PREVIEW_EVENT = "adversaria-theme-preview";
 
 type View = "meetings" | "settings" | "todos" | "weekly" | "ask" | "graph";
 
 function App() {
   const [view, setView] = useState<View>("meetings");
+  const [theme, setTheme] = useState("dark");
+  useTheme(theme);
   // Set by the guided tour, the setup wizard and the transcription chip so they
   // can land on Settings › AI Model. `settingsNav` is bumped on every request so
   // an already-open Settings switches tabs even when the target is unchanged.
@@ -143,11 +148,25 @@ function App() {
   const userNotesRef = useRef(userNotes);
   userNotesRef.current = userNotes;
 
+  useEffect(() => {
+    const previewTheme = (event: Event) => {
+      setTheme((event as CustomEvent<string>).detail);
+    };
+    const unsubscribe = onConfigUpdated((config) => setTheme(config.theme));
+
+    window.addEventListener(THEME_PREVIEW_EVENT, previewTheme);
+    return () => {
+      window.removeEventListener(THEME_PREVIEW_EVENT, previewTheme);
+      unsubscribe();
+    };
+  }, []);
+
   // Load auto-stop preferences; re-fetch on view change so a Settings save
   // (then navigating back to Meetings) takes effect without an app restart.
   useEffect(() => {
     getConfig()
       .then((c) => {
+        setTheme(c.theme);
         setDateFormat(c.date_format); // drive app-wide date rendering
         setArchiveAfterDays(c.archive_after_days);
         setSidebarView(c.sidebar_view ?? "compact");

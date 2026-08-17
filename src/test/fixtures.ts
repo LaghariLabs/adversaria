@@ -7,6 +7,7 @@ export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     auto_detect_meetings: false,
     ollama_model: "qwen3.6-35b",
     summary_language: "auto",
+    theme: "dark",
     user_name: "",
     custom_vocabulary: "",
     diarize: true,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -62,7 +63,11 @@ def _fake_summarize(
 _fake_summarizer_instance.summarize.side_effect = _fake_summarize
 
 # Use real TemplateInfo-like objects for list_templates
-from src.models import TemplateInfo  # noqa: E402 — must be after module mocks
+from src.models import (  # noqa: E402 — must be after module mocks
+    TemplateInfo,
+    TranscriptTurn,
+    TranscribeResponse,
+)
 
 _fake_summarizer_instance.list_templates.return_value = [
     TemplateInfo(name="general", description="General meeting notes template."),
@@ -200,6 +205,42 @@ class TestTranscribeEndpoint:
         )
         assert response.status_code == 400
         _fake_transcriber_instance.transcribe.side_effect = None
+
+    def test_mic_only_transcription_labels_every_turn_as_me(self) -> None:
+        previous = _fake_transcriber_instance.transcribe.return_value
+        _fake_transcriber_instance.transcribe.return_value = TranscribeResponse(
+            text="hello from the microphone",
+            language="en",
+            duration_seconds=2.5,
+            turns=[
+                TranscriptTurn(
+                    speaker="Them",
+                    text="hello from the microphone",
+                    start=0.2,
+                    end=2.0,
+                )
+            ],
+        )
+        _fake_transcriber_instance.transcribe.reset_mock()
+        _fake_transcriber_instance.transcribe_dual.reset_mock()
+        try:
+            response = client.post(
+                "/transcribe",
+                json={"mic_audio_path": "/tmp/mic.wav", "me_label": "Hamza"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["text"] == "Hamza: hello from the microphone"
+            assert [turn["speaker"] for turn in data["turns"]] == ["Hamza"]
+            _fake_transcriber_instance.transcribe.assert_called_once_with("/tmp/mic.wav")
+            _fake_transcriber_instance.transcribe_dual.assert_not_called()
+        finally:
+            _fake_transcriber_instance.transcribe.return_value = previous
+
+    def test_transcribe_without_either_audio_path_returns_422(self) -> None:
+        response = client.post("/transcribe", json={})
+        assert response.status_code == 422
+        assert "audio_path or mic_audio_path is required" in response.text
 
 
 class TestSummarizeEndpoint:
@@ -895,3 +936,49 @@ class TestParentGuard:
             _server_mod._watch_parent_stdin()
 
         hard_exit.assert_not_called()
+
+
+class TestModelDownloadReset:
+    """Tests for POST /setup/model_download/{profile_id}/reset (Phase 1.3)."""
+
+    def test_unknown_profile_returns_400(self) -> None:
+        response = client.post("/setup/model_download/not-a-real-profile/reset")
+        assert response.status_code == 400
+
+    def test_known_profile_resets_to_a_retryable_pending_state(self) -> None:
+        from src import model_setup
+
+        profile_id = "qwen-4b-light"
+        model_setup._STATES[profile_id] = model_setup.DownloadState(
+            profile_id,
+            state="error",
+            downloaded_bytes=123,
+            detail="The model download was interrupted.",
+            error_code="network",
+            can_retry=True,
+        )
+        try:
+            response = client.post(f"/setup/model_download/{profile_id}/reset")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["profile_id"] == profile_id
+            assert data["state"] == "pending"
+            assert data["can_retry"] is True
+            assert data["downloaded_bytes"] == 0
+            assert data["error_code"] is None
+        finally:
+            model_setup._STATES[profile_id] = model_setup.DownloadState(profile_id)
+
+    def test_force_query_is_passed_through(self) -> None:
+        from src import model_setup
+
+        status = model_setup.DownloadState("qwen-4b-light", state="pending")
+        with patch.object(
+            model_setup, "reset_model_download", return_value=asdict(status)
+        ) as reset:
+            response = client.post(
+                "/setup/model_download/qwen-4b-light/reset?force=true"
+            )
+
+        assert response.status_code == 200
+        reset.assert_called_once_with("qwen-4b-light", force=True)

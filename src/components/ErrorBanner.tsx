@@ -1,5 +1,10 @@
-import { openPrivacySettings, relaunchForPermissions } from "../lib/tauri";
-import { PERMISSION_ERROR_PREFIX } from "../lib/tauri";
+import { useEffect, useState } from "react";
+
+import {
+  openPrivacySettings,
+  PERMISSION_ERROR_PREFIX,
+  probeSystemAudio,
+} from "../lib/tauri";
 
 interface ErrorBannerProps {
   message: string | null;
@@ -7,11 +12,18 @@ interface ErrorBannerProps {
 }
 
 export function ErrorBanner({ message, onDismiss }: ErrorBannerProps) {
+  const [checking, setChecking] = useState(false);
+  const [actionError, setActionError] = useState("");
+
+  useEffect(() => {
+    setActionError("");
+    setChecking(false);
+  }, [message]);
+
   if (!message) return null;
 
-  // A missing capture permission is the one error the user can actually fix, and
-  // it needs two specific steps (grant, then relaunch — macOS won't apply Screen
-  // Recording until the app restarts). Give it buttons instead of prose.
+  // A missing capture permission is actionable: open the exact macOS pane, then
+  // run the real-audio check again. Give those actions alongside the message.
   const isPermission = message.startsWith(PERMISSION_ERROR_PREFIX);
   const text = isPermission
     ? message.slice(PERMISSION_ERROR_PREFIX.length).trim()
@@ -23,26 +35,44 @@ export function ErrorBanner({ message, onDismiss }: ErrorBannerProps) {
       role="alert"
     >
       <span className={`text-sm text-red-800 mr-2 ${isPermission ? "" : "truncate"}`}>
-        {text}
+        <span>{text}</span>
+        {actionError && <span className="block text-xs mt-1">{actionError}</span>}
       </span>
       <span className="flex items-center gap-2 whitespace-nowrap">
         {isPermission && (
           <>
             <button
               onClick={() => {
-                openPrivacySettings("screen").catch(() => {});
+                setActionError("");
+                openPrivacySettings("system_audio").catch((error) => {
+                  setActionError(String(error));
+                });
               }}
               className="text-xs font-medium px-2 py-1 rounded bg-red-700 text-white hover:bg-red-800 transition-colors"
             >
-              Open Settings
+              Open System Settings
             </button>
             <button
+              disabled={checking}
               onClick={() => {
-                relaunchForPermissions().catch(() => {});
+                setChecking(true);
+                setActionError("");
+                probeSystemAudio()
+                  .then((permissions) => {
+                    if (permissions.system_audio === "granted") {
+                      onDismiss();
+                    } else {
+                      setActionError(
+                        "The check still couldn't hear system audio. Unmute your Mac or enable Adversaria in System Settings, then check again.",
+                      );
+                    }
+                  })
+                  .catch((error) => setActionError(String(error)))
+                  .finally(() => setChecking(false));
               }}
               className="text-xs font-medium px-2 py-1 rounded border border-red-700 text-red-800 hover:bg-red-200 transition-colors"
             >
-              Relaunch
+              {checking ? "Listening…" : "Check again"}
             </button>
           </>
         )}

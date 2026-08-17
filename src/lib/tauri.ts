@@ -240,6 +240,18 @@ export function updateAttendees(
   return invoke("update_attendees", { id, attendees });
 }
 
+export function renameMeetingPerson(
+  id: number,
+  fromName: string,
+  toName: string,
+): Promise<Meeting> {
+  return invoke("rename_meeting_person", {
+    meetingId: id,
+    fromName,
+    toName,
+  });
+}
+
 /** Replace a meeting's tags. */
 export function updateMeetingTags(id: number, tags: Tag[]): Promise<void> {
   return invoke("update_meeting_tags", { id, tags });
@@ -490,6 +502,13 @@ export function startModelDownload(profileId: string): Promise<ModelDownloadStat
   return invoke("start_model_download", { profileId });
 }
 
+export function resetModelDownload(
+  profileId: string,
+  force: boolean,
+): Promise<ModelDownloadStatus> {
+  return invoke("reset_model_download", { profileId, force });
+}
+
 export function getModelDownloadStatus(profileId: string): Promise<ModelDownloadStatus> {
   return invoke("get_model_download_status", { profileId });
 }
@@ -653,12 +672,10 @@ export type PermissionState = "granted" | "denied" | "undetermined";
 
 export interface CapturePermissions {
   microphone: PermissionState;
-  screen_recording: PermissionState;
-  /** Screen Recording was granted but macOS needs a relaunch to honour it. */
-  needs_relaunch: boolean;
+  system_audio: PermissionState;
 }
 
-/** Current microphone + screen-recording state. */
+/** Current microphone state + persisted result of the last system-audio probe. */
 export function checkCapturePermissions(): Promise<CapturePermissions> {
   return invoke("check_capture_permissions");
 }
@@ -668,18 +685,12 @@ export function requestMicrophonePermission(): Promise<PermissionState> {
   return invoke("request_microphone_permission");
 }
 
-/** Ask for Screen Recording. macOS only shows this prompt once per install —
- *  a "denied" result means System Settings is the only remaining path. */
-export function requestScreenPermission(): Promise<PermissionState> {
-  return invoke("request_screen_permission");
+/** Play a quiet tone and prove the Core Audio process tap can hear it. */
+export function probeSystemAudio(): Promise<CapturePermissions> {
+  return invoke("probe_system_audio");
 }
 
 /** Open the exact System Settings pane for a permission. */
-export function openPrivacySettings(which: "microphone" | "screen"): Promise<void> {
+export function openPrivacySettings(which: "microphone" | "system_audio"): Promise<void> {
   return invoke("open_privacy_settings", { which });
-}
-
-/** Restart so a freshly granted Screen Recording permission takes effect. */
-export function relaunchForPermissions(): Promise<void> {
-  return invoke("relaunch_for_permissions");
 }

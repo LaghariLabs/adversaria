@@ -173,15 +173,25 @@ impl SpoolSession {
             warnings.push(format!("Microphone spool: {error}"));
         }
         let has_system = matches!(system, Ok(Some(_))) || self.root.join("system.json").exists();
-        if !has_system {
+        let has_mic = matches!(mic, Ok(Some(_))) || self.root.join("mic.json").exists();
+        if !has_system && !has_mic {
             return Err(format!(
-                "No system audio reached the encrypted spool. The recoverable spool is at {}.",
+                "Nothing was recorded — neither system audio nor the microphone produced any audio. The empty spool is at {}.",
                 self.root.display()
             ));
         }
-        self.manifest.channels.push("system".to_string());
-        if matches!(mic, Ok(Some(_))) || self.root.join("mic.json").exists() {
+        if has_system {
+            self.manifest.channels.push("system".to_string());
+        }
+        if has_mic {
             self.manifest.channels.push("mic".to_string());
+        }
+        if !has_system {
+            warnings.push(
+                "Only your microphone was captured — no system audio reached this recording. \
+                 Check the System Audio permission in Settings before your next meeting."
+                    .to_string(),
+            );
         }
         self.manifest.state = "pending".to_string();
         self.manifest.updated_at = chrono::Utc::now().to_rfc3339();
@@ -436,7 +446,7 @@ fn run_writer(
 }
 
 pub struct PreparedRecording {
-    pub system_path: String,
+    pub system_path: Option<String>,
     pub mic_path: Option<String>,
     temporary_files: Vec<PathBuf>,
 }
@@ -453,7 +463,7 @@ pub fn prepare_for_transcription(path: &str) -> Result<PreparedRecording, String
     let root = Path::new(path);
     if !root.is_dir() || root.extension().and_then(|v| v.to_str()) != Some("adversaria-spool") {
         return Ok(PreparedRecording {
-            system_path: path.to_string(),
+            system_path: Some(path.to_string()),
             mic_path: legacy_mic_path(path),
             temporary_files: Vec::new(),
         });
@@ -467,8 +477,13 @@ pub fn prepare_for_transcription(path: &str) -> Result<PreparedRecording, String
     create_private_dir(&processing)
         .map_err(|e| format!("Could not create private processing directory: {e}"))?;
     let mut temporary_files = Vec::new();
-    let system = decrypt_channel(root, &session.session_id, "system", key, &processing)?;
-    temporary_files.push(system.clone());
+    let system = if session.channels.iter().any(|c| c == "system") {
+        let path = decrypt_channel(root, &session.session_id, "system", key, &processing)?;
+        temporary_files.push(path.clone());
+        Some(path.to_string_lossy().to_string())
+    } else {
+        None
+    };
     let mic = if session.channels.iter().any(|c| c == "mic") {
         let path = decrypt_channel(root, &session.session_id, "mic", key, &processing)?;
         temporary_files.push(path.clone());
@@ -476,8 +491,11 @@ pub fn prepare_for_transcription(path: &str) -> Result<PreparedRecording, String
     } else {
         None
     };
+    if system.is_none() && mic.is_none() {
+        return Err("Recording manifest contains no transcribable audio channels.".to_string());
+    }
     Ok(PreparedRecording {
-        system_path: system.to_string_lossy().to_string(),
+        system_path: system,
         mic_path: mic,
         temporary_files,
     })
@@ -799,10 +817,21 @@ fn recording_key() -> Result<[u8; 32], String> {
     if let Some(key) = *RECORDING_KEY_CACHE.lock().unwrap() {
         return Ok(key);
     }
+    #[cfg(debug_assertions)]
+    let hex = dev_recording_key_hex()?;
+    #[cfg(not(debug_assertions))]
+    let hex = keychain_recording_key_hex()?;
+    let key = hex_decode::<32>(&hex)?;
+    *RECORDING_KEY_CACHE.lock().unwrap() = Some(key);
+    Ok(key)
+}
+
+#[cfg(not(debug_assertions))]
+fn keychain_recording_key_hex() -> Result<String, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("Recording keychain is unavailable: {e}"))?;
-    let hex = match entry.get_password() {
-        Ok(value) => value,
+    match entry.get_password() {
+        Ok(value) => Ok(value),
         Err(keyring::Error::NoEntry) => {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
@@ -810,17 +839,50 @@ fn recording_key() -> Result<[u8; 32], String> {
             entry
                 .set_password(&value)
                 .map_err(|e| format!("Could not store the recording encryption key: {e}"))?;
-            value
+            Ok(value)
         }
-        Err(e) => {
-            return Err(format!(
-                "Recording encryption key is unavailable ({e}). Unlock the OS keychain and try again; plaintext capture is never used as a fallback."
-            ))
+        Err(e) => Err(format!(
+            "Recording encryption key is unavailable ({e}). Unlock the OS keychain and try again; plaintext capture is never used as a fallback."
+        )),
+    }
+}
+
+/// Debug builds get a fresh ad-hoc code signature on every rebuild, and macOS
+/// binds keychain ACLs to the signature — so each rebuild re-prompted for the
+/// login password ("Always Allow" cannot survive a signature change; founder
+/// hit this on every dev run, 2026-08-13). Dev therefore keeps the key in a
+/// plain file in the app-data dir. Seeded FROM the keychain when it answers,
+/// so pending dev spools stay decryptable across the transition; release
+/// builds never compile this path and keep the keychain exclusively.
+#[cfg(debug_assertions)]
+fn dev_recording_key_hex() -> Result<String, String> {
+    let path = crate::config::app_data_dir().join("dev-spool-key");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
         }
-    };
-    let key = hex_decode::<32>(&hex)?;
-    *RECORDING_KEY_CACHE.lock().unwrap() = Some(key);
-    Ok(key)
+    }
+    let hex = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .unwrap_or_else(|| {
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            hex_encode(&key)
+        });
+    std::fs::write(&path, &hex).map_err(|e| {
+        format!(
+            "Could not store the dev recording key at {}: {e}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(hex)
 }
 
 fn additional_data(
@@ -1167,5 +1229,55 @@ mod tests {
         let mut more = Vec::new();
         more.extend_from_slice(&[0, 0, 0, 0, 0]); // completes nothing meaningful but exercises carry growth
         let _ = downmix_f32_to_mono(&mut carry, &more, 2);
+    }
+
+    #[test]
+    fn mic_only_capture_finishes_pending_with_a_warning() {
+        let base = test_root("mic-only");
+        let session = SpoolSession::start_with_key(&base, [67u8; 32]).unwrap();
+        session
+            .mic
+            .sender()
+            .send(Frame {
+                bytes: 0.25f32.to_le_bytes().to_vec(),
+                format: AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    bits_per_sample: 32,
+                    format_tag: 3,
+                },
+            })
+            .unwrap();
+
+        let finished = session.finish_recoverably().unwrap();
+        let manifest = read_session(&finished.path).unwrap();
+        assert_eq!(manifest.state, "pending");
+        assert_eq!(manifest.channels, ["mic"]);
+        assert_eq!(
+            finished.warning.as_deref(),
+            Some(
+                "Only your microphone was captured — no system audio reached this recording. Check the System Audio permission in Settings before your next meeting."
+            )
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fully_empty_capture_still_fails() {
+        let base = test_root("fully-empty");
+        let session = SpoolSession::start_with_key(&base, [83u8; 32]).unwrap();
+        let root = session.path().to_path_buf();
+        let error = session
+            .finish_recoverably()
+            .err()
+            .expect("an empty capture must fail");
+        assert_eq!(
+            error,
+            format!(
+                "Nothing was recorded — neither system audio nor the microphone produced any audio. The empty spool is at {}.",
+                root.display()
+            )
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
