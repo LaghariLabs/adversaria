@@ -22,8 +22,8 @@ use crate::types::{
 const SERVICE_DOWN: &str =
     "The local AI service isn't running. Use Local AI: Offline → Restart at the top of the app, then retry.";
 /// No Whisper model is cached, so nothing can transcribe yet.
-const TRANSCRIBER_MISSING: &str = "No transcription model is downloaded yet. Open Settings → AI \
-     Model and download one — this meeting will be transcribed once it's ready.";
+const TRANSCRIBER_MISSING: &str = "No transcription model is downloaded yet. Open Settings → \
+     Transcription and download one — this meeting will be transcribed once it's ready.";
 /// A model exists but is still loading into memory.
 const TRANSCRIBER_LOADING: &str = "The transcription engine is still starting up. Your meeting is \
      saved and will transcribe shortly — try again in a moment.";
@@ -31,11 +31,11 @@ const TRANSCRIBER_LOADING: &str = "The transcription engine is still starting up
 const TRANSCRIBE_FAILED: &str =
     "Transcription didn't finish. Your recording is saved — try again in a moment.";
 /// The notes (summarization) engine could not be reached or used.
-const NOTES_UNREACHABLE: &str = "The notes model isn't reachable. Check Settings → AI Model.";
+const NOTES_UNREACHABLE: &str = "The notes model isn't reachable. Check Settings → Notes.";
 /// A grounded question couldn't be answered because the notes engine is down.
 const ANSWER_UNREACHABLE: &str =
     "That question couldn't be answered — the notes model isn't reachable. \
-     Check Settings → AI Model.";
+     Check Settings → Notes.";
 /// Note templates couldn't be read from the service.
 const TEMPLATES_UNAVAILABLE: &str = "Note templates couldn't be loaded — try again in a moment.";
 /// The service answered, but not with anything we could read. A serde error
