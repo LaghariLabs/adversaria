@@ -9,6 +9,7 @@ import platform
 import re
 import sys
 from datetime import date
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import httpx
@@ -35,24 +36,258 @@ def _stated(value: object) -> str:
     text = str(value or "").strip()
     return "" if text.lower() in _NOT_STATED else text
 
+# ── context-window sizing ───────────────────────────────────────────────────
 # Ollama defaults to a 2048-token context regardless of the model's real
-# capacity, which silently truncates long meeting transcripts. Override it.
-# Modern 8B models support far more; 16384 covers ~90 minutes of speech and is
-# safe on modest hardware. Raise OLLAMA_NUM_CTX (e.g. 32768) for marathon
-# meetings on a GPU with headroom.
-DEFAULT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+# capacity, which silently truncates long meeting transcripts, so num_ctx is
+# always sent. It used to be a fixed 16,384 — which is *too small* for a long
+# meeting summarized by a verbose reasoning model (live 2026-08-10:
+# muse-glimmer:30b-mlx spent its window thinking and the note came back cut off)
+# and needlessly large for a five-minute standup. The window is now computed per
+# request from the actual prompt, so no user ever has to know this knob exists.
+
+#: Never size below this. It is what shipped, it covers ~90 minutes of speech,
+#: and it is safe on modest hardware — so adaptive sizing can only ever add.
+NUM_CTX_FLOOR = 16384
+
+#: Conservative chars-per-token divisor for estimating prompt tokens. Measured
+#: 2026-08-10 on the real tokenizer (qwen3.5:2b, prompt_eval_count over 2k-char
+#: samples): English 5.15, Arabic 3.72, code-switched Arabic/English 4.13
+#: chars/token. 3 sits under the densest of those with margin — under-estimating
+#: the prompt is what truncates a note; over-estimating only costs a little RAM.
+CHARS_PER_TOKEN = 3
+
+#: Tokens reserved on top of the prompt for the model's answer. Generous on
+#: purpose: a reasoning model spends thinking tokens *before* the note, and the
+#: live-incident note alone was ~5k tokens.
+OUTPUT_BUDGET_TOKENS = 8192
+
+#: Windows are rounded up to a multiple of this — a tidy number to log and
+#: reason about, and it stops one extra transcript line changing the window.
+NUM_CTX_STEP = 2048
+
+#: Total-RAM tier (GiB, exclusive upper bound) → the largest window we will ask
+#: a machine of that size to hold. The runner's KV cache grows with num_ctx, so
+#: this is the guard that keeps a notetaker from evicting everything else.
+_RAM_NUM_CTX_TIERS: tuple[tuple[int, int], ...] = (
+    (16, 16384),
+    (32, 24576),
+    (64, 32768),
+)
+#: Cap on a machine at or above the last tier.
+_RAM_NUM_CTX_MAX = 65536
+
+#: Debug-only pin. When ``OLLAMA_NUM_CTX`` is set, that exact window is used for
+#: every call and adaptive sizing is skipped entirely. Unset (the norm, and what
+#: every real user runs) means "size it yourself".
+NUM_CTX_PIN: int | None = (
+    int(os.environ["OLLAMA_NUM_CTX"]) if os.environ.get("OLLAMA_NUM_CTX") else None
+)
+
+#: The window a short prompt still gets — the floor, or the pin when one is set.
+DEFAULT_NUM_CTX = NUM_CTX_PIN or NUM_CTX_FLOOR
+
+#: Debug-only ceiling for the one retry after a reply is cut off mid-JSON (see
+#: _chat_ollama). Unset means the retry is bounded by the hardware tier instead
+#: of a hard-coded 32,768, so a 128 GB machine can actually use its headroom.
+NUM_CTX_RETRY_CAP: int | None = (
+    int(os.environ["OLLAMA_NUM_CTX_RETRY_CAP"])
+    if os.environ.get("OLLAMA_NUM_CTX_RETRY_CAP")
+    else None
+)
+
+#: Memoized results — RAM and a model's trained context never change mid-run.
+_hardware_cap_cache: int | None = None
+_model_max_ctx_cache: dict[str, int | None] = {}
 
 
-def _ollama_options() -> dict[str, float | int]:
+def _total_ram_bytes() -> int | None:
+    """Physical RAM in bytes, stdlib-only, or None if it can't be read.
+
+    ``psutil`` would be one line, but it is a dependency this service does not
+    have and does not need for one number.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return int(status.ullTotalPhys)
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except Exception:  # noqa: BLE001 — any failure means "unknown", never a crash
+        logger.debug("Could not read total RAM; using the conservative window.", exc_info=True)
+        return None
+
+
+def _hardware_num_ctx_cap() -> int:
+    """Largest window this machine's RAM tier allows. Falls back to the floor.
+
+    Computed once per process — RAM does not change while we run.
+    """
+    global _hardware_cap_cache
+    if _hardware_cap_cache is not None:
+        return _hardware_cap_cache
+    total = _total_ram_bytes()
+    if total is None:
+        _hardware_cap_cache = NUM_CTX_FLOOR
+        return _hardware_cap_cache
+    gib = total / (1024**3)
+    cap = _RAM_NUM_CTX_MAX
+    for threshold, tier_cap in _RAM_NUM_CTX_TIERS:
+        if gib < threshold:
+            cap = tier_cap
+            break
+    _hardware_cap_cache = cap
+    logger.info("Context sizing: %.0f GiB RAM → num_ctx cap %d", gib, cap)
+    return cap
+
+
+def _model_max_ctx(model: str, client: Any) -> int | None:
+    """The model's own trained context length via Ollama's ``/api/show``, or None.
+
+    Verified live against Ollama 0.32.7 on 2026-08-10: ``POST /api/show`` returns
+    a ``model_info`` map (``ShowResponse.modelinfo`` on the python client 0.6.2)
+    whose context key is *architecture-prefixed* — ``qwen35.context_length``:
+    262144, ``muse_glimmer.context_length``: 131072, ``llama.context_length``:
+    8192 — with the architecture itself under ``general.architecture``. The
+    suffix scan is the fallback for an architecture we can't read.
+
+    Any failure (Ollama down, old server, field absent) returns None, which drops
+    this bound from the clamp rather than failing the summary. Cached per model.
+    """
+    if model in _model_max_ctx_cache:
+        return _model_max_ctx_cache[model]
+    value: int | None = None
+    try:
+        response = client.show(model)
+        info = getattr(response, "modelinfo", None)
+        if info is None and isinstance(response, dict):
+            info = response.get("model_info")
+        if isinstance(info, dict):
+            arch = info.get("general.architecture")
+            if isinstance(arch, str):
+                candidate = info.get(f"{arch}.context_length")
+                value = candidate if isinstance(candidate, int) else None
+            if value is None:
+                value = next(
+                    (
+                        v
+                        for k, v in info.items()
+                        if k.endswith(".context_length") and isinstance(v, int)
+                    ),
+                    None,
+                )
+    except Exception:  # noqa: BLE001 — an unknown ceiling is not an error
+        logger.debug("Could not read the context length of %s", model, exc_info=True)
+        value = None
+    _model_max_ctx_cache[model] = value
+    return value
+
+
+def _prompt_chars(messages: list[dict]) -> int:
+    """Total characters the model will actually be sent."""
+    return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+def _adaptive_num_ctx(prompt_chars: int, model: str = "", client: Any = None) -> int:
+    """The context window for one completion, sized from its own prompt.
+
+    ``max(floor, min(prompt + output budget, hardware tier, model's own max))``,
+    rounded up to a multiple of ``NUM_CTX_STEP``. No setting, no env var, no
+    per-model table: a five-minute standup gets the floor and a two-hour meeting
+    on a 128 GB machine gets room for the transcript *and* a reasoning model's
+    thinking tokens. Logs the chosen window and which bound decided it.
+
+    Two env vars exist for debugging only and are never required:
+    ``OLLAMA_NUM_CTX`` pins this value exactly (adaptive sizing is skipped), and
+    ``OLLAMA_NUM_CTX_RETRY_CAP`` overrides the truncation-retry ceiling.
+    """
+    if NUM_CTX_PIN:
+        logger.info("Context sizing: pinned to num_ctx=%d by OLLAMA_NUM_CTX", NUM_CTX_PIN)
+        return NUM_CTX_PIN
+
+    prompt_tokens = -(-max(prompt_chars, 0) // CHARS_PER_TOKEN)  # ceil
+    needed = prompt_tokens + OUTPUT_BUDGET_TOKENS
+    needed = -(-needed // NUM_CTX_STEP) * NUM_CTX_STEP  # round up to the next step
+
+    bounds: dict[str, int] = {"prompt": needed, "hardware_cap": _hardware_num_ctx_cap()}
+    model_max = _model_max_ctx(model, client) if model and client is not None else None
+    if model_max:
+        bounds["model_max"] = model_max
+
+    bound, num_ctx = min(bounds.items(), key=lambda kv: kv[1])
+    if num_ctx < NUM_CTX_FLOOR:
+        bound, num_ctx = "floor", NUM_CTX_FLOOR
+    logger.info(
+        "Context sizing: adaptive: prompt≈%dk tok + %dk budget → %d (bound by %s)",
+        round(prompt_tokens / 1000),
+        round(OUTPUT_BUDGET_TOKENS / 1000),
+        num_ctx,
+        bound,
+    )
+    return num_ctx
+
+
+def _ollama_options(num_ctx: int) -> dict[str, float | int]:
     """Base ``options`` for EVERY Ollama completion call (chat + stream).
 
     ``num_ctx`` must always be present: a completion request without it makes
     Ollama load the model at its *model-default* context — qwen3.5:9b defaults
     to 262,144, observed live 2026-08-02 as a 16 GB resident runner vs ~7 GB at
-    our 16,384. Any new completion call site must build its options through
-    this helper (override temperature per-site if needed; never drop num_ctx).
+    our 16,384. It is a required argument (not a defaulted one) so a new call
+    site cannot silently inherit someone else's window: resolve it with
+    ``_adaptive_num_ctx(_prompt_chars(messages), model, client)`` first, then
+    build options here (override temperature per-site if needed).
+
+    ``num_predict`` must always be present too, and always ``-1``: without it,
+    this path's effective default cut muse-glimmer:30b-mlx at ~5k output
+    tokens while reporting ``done_reason: "stop"`` — a silent cap wearing a
+    normal stop's face (observed live 2026-08-11; the same request with -1
+    generated 10,980 tokens of complete JSON). With -1, the ONLY output bound
+    is the num_ctx we sized deliberately, and hitting it reports ``"length"``
+    honestly, which is what the truncation retry keys on.
     """
-    return {"temperature": 0.0, "num_ctx": DEFAULT_NUM_CTX}
+    return {"temperature": 0.0, "num_ctx": num_ctx, "num_predict": -1}
+
+
+def _retry_num_ctx(current: int) -> int | None:
+    """Doubled context window for the truncation retry, or None at the cap.
+
+    Doubles from whatever the first attempt actually used (not a fixed 16,384),
+    bounded by the hardware tier — or by ``OLLAMA_NUM_CTX_RETRY_CAP`` when that
+    debug override is set.
+    """
+    cap = NUM_CTX_RETRY_CAP or _hardware_num_ctx_cap()
+    doubled = min(current * 2, cap)
+    return doubled if doubled > current else None
+
+
+def _stop_reason(response: object) -> str:
+    """Ollama's ``done_reason`` for a completion ("stop" / "length"), "" if absent.
+
+    Tolerant on purpose: the field is optional in the API and absent entirely on
+    older servers, and a missing stop reason must never fail a summary.
+    """
+    try:
+        value = response.get("done_reason")
+    except (AttributeError, TypeError):
+        return ""
+    return value if isinstance(value, str) else ""
 
 
 def _is_local_ollama_url(url: str | None) -> bool:
@@ -137,19 +372,33 @@ def _is_thinking_model(model: str) -> bool:
     return any(hint in lower for hint in _THINKING_MODEL_HINTS)
 
 
-# Some reasoning models (e.g. Groq's qwen3-32b) emit a <think>…</think> block
-# before their answer when the reply isn't json-constrained. Strip it from chat
-# replies so the user sees the answer, not the chain-of-thought. Local vLLM is
-# told enable_thinking=False (no-op there), and summaries use json_object (which
-# puts reasoning in a separate field), so this only matters for cloud chat.
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+# Reasoning models emit their chain-of-thought inline before the answer, tagged
+# <think> (Ollama/Groq qwen, deepseek-r1) or <thinking> (several HF/MLX chat
+# templates), and they do it on the json-constrained summarize path too when
+# think=False isn't honoured. It must go before the reply is read or parsed.
+_THINK_BLOCK_RE = re.compile(r"<(think|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"^<think(?:ing)?>", re.IGNORECASE)
 
 
 def _strip_think(text: str) -> str:
-    """Remove ``<think>…</think>`` reasoning block(s) from a reply. No-op when absent."""
-    if "<think>" not in text.lower():
+    """Remove inline reasoning block(s) from a reply. No-op when absent.
+
+    Covers the three shapes seen in the wild: balanced blocks (any number of
+    them), and the degenerate "closing tag only" reply where the chat template
+    opened the block for the model so only ``</think>`` comes back — there,
+    everything up to the LAST closer is reasoning. An *unclosed* opening tag is
+    left alone: the answer would be inside it, and cutting to end-of-string
+    would delete the whole reply.
+    """
+    lowered = text.lower()
+    if "<think" not in lowered and "</think" not in lowered:
         return text
-    return _THINK_BLOCK_RE.sub("", text)
+    stripped = _THINK_BLOCK_RE.sub("", text)
+    closers = list(_THINK_CLOSE_RE.finditer(stripped))
+    if closers:
+        stripped = stripped[closers[-1].end() :]
+    return stripped.lstrip()
 
 
 def _strip_think_stream(deltas):
@@ -167,21 +416,202 @@ def _strip_think_stream(deltas):
         stripped = buffer.lstrip()
         if not stripped:
             continue  # only whitespace so far — can't decide yet
-        if stripped.lower().startswith("<think>"):
-            idx = buffer.lower().find("</think>")
-            if idx != -1:
-                tail = buffer[idx + len("</think>") :].lstrip()
+        if _THINK_OPEN_RE.match(stripped):
+            closer = _THINK_CLOSE_RE.search(buffer)
+            if closer:
+                tail = buffer[closer.end() :].lstrip()
                 passthrough = True
                 buffer = ""
                 if tail:
                     yield tail
             # else keep buffering until the closing tag arrives
-        elif len(stripped) >= len("<think>"):
+        elif len(stripped) >= len("<thinking>"):
             passthrough = True  # definitely not a think block — flush + pass on
             out, buffer = buffer, ""
             yield out
-    if not passthrough and buffer and not buffer.lstrip().lower().startswith("<think>"):
+    if not passthrough and buffer and not _THINK_OPEN_RE.match(buffer.lstrip()):
         yield buffer  # short reply that never reached the decision threshold
+
+
+# ── model-output robustness ladder ──────────────────────────────────────────
+# Every backend (native Ollama, OpenAI-compatible/Rapid-MLX, cloud) and every
+# model family gets the same treatment before its reply is parsed: reasoning
+# blocks out, then a fenced block found anywhere, then a balanced object embedded
+# in prose, and — when the reply was cut off — a conservative repair of the tail.
+# Live 2026-08-10: a verbose reasoning model overran num_ctx by one closing brace
+# and the raw JSON blob was shown to the user as their meeting note.
+
+_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
+_OPEN_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\r?\n?")
+
+#: Each trim drops one member the model never finished; a reply needing more
+#: than a few was not merely cut off at the tail.
+_REPAIR_MAX_TRIMS = 4
+
+
+class _JsonScan(NamedTuple):
+    """What a string-aware walk over (possibly incomplete) JSON found."""
+
+    scopes: list[str]  # "{" / "[" still open at the end, outermost first
+    in_string: bool  # the text ended inside a string literal
+    escaped: bool  # …and its last character was a backslash
+    object_end: int | None  # index just past the first balanced top-level object
+    last_boundary: int | None  # last structural "," / "{" / "[" outside a string
+
+
+def _json_scan(text: str) -> _JsonScan:
+    """Walk ``text`` as JSON, tracking string and escape state.
+
+    Shared by the prose-embedded extractor and the truncation repair: both need
+    brace depth that ignores braces inside string values ("costs {x} per seat"),
+    which a regex cannot give correctly.
+    """
+    scopes: list[str] = []
+    in_string = False
+    escaped = False
+    object_end: int | None = None
+    last_boundary: int | None = None
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            last_boundary = i
+            scopes.append(ch)
+        elif ch in "}]":
+            if scopes:
+                scopes.pop()
+            if ch == "}" and not scopes and object_end is None:
+                object_end = i + 1
+        elif ch == ",":
+            last_boundary = i
+    return _JsonScan(scopes, in_string, escaped, object_end, last_boundary)
+
+
+def _fenced_json(text: str) -> str | None:
+    """Contents of the first ```-fenced block holding a JSON object, or None.
+
+    Models fence their answer even when told not to, and not always at the start
+    ("Here are the notes:\\n```json\\n{…"), which a leading-fence-only strip
+    misses. A fence the reply was cut off inside still yields its body — whether
+    that body is salvageable is the repair step's call, not this one's.
+    """
+    for match in _FENCE_RE.finditer(text):
+        body = match.group(1).strip()
+        if body.startswith("{"):
+            return body
+    opening = _OPEN_FENCE_RE.search(text)
+    if opening:
+        body = text[opening.end() :].strip()
+        if body.startswith("{"):
+            return body
+    return None
+
+
+def _first_balanced_object(text: str) -> str | None:
+    """The first balanced top-level ``{…}`` in ``text`` that parses as an object.
+
+    For replies that wrap the JSON in prose ("Here is your summary: {…} Let me
+    know…"). Requiring it to parse is what stops a genuine prose note — which may
+    well mention a brace — from being mistaken for JSON. An object that never
+    closes means the reply was cut off, not embedded: stop and leave it to the
+    repair step rather than descending into a nested fragment.
+    """
+    pos = text.find("{")
+    while pos != -1:
+        scan = _json_scan(text[pos:])
+        if scan.object_end is None:
+            return None
+        candidate = text[pos : pos + scan.object_end]
+        try:
+            if isinstance(json.loads(candidate), dict):
+                return candidate
+        except ValueError:
+            pass
+        pos = text.find("{", pos + scan.object_end)
+    return None
+
+
+def normalize_model_output(raw: str) -> str:
+    """Reduce any model's raw reply to the text a parser should see.
+
+    The one normalization every backend path runs before its first parse
+    attempt. Each JSON-oriented step only fires when it actually finds an
+    object, so a model that answered in prose comes back unchanged and stays a
+    readable note.
+    """
+    text = _strip_think(raw).strip()
+    fenced = _fenced_json(text)
+    if fenced is not None:
+        return fenced
+    embedded = _first_balanced_object(text)
+    return embedded if embedded is not None else text
+
+
+def _looks_like_json_notes(text: str) -> bool:
+    """True when a reply was *trying* to be the notes object rather than prose.
+
+    Decides which failure the user is told about — and that a reply of this shape
+    is never handed to them raw.
+    """
+    return text.lstrip().startswith("{") or '"sections"' in text
+
+
+def _repair_truncated_json(text: str) -> dict | None:
+    """Close a JSON object the model was cut off part-way through, or None.
+
+    Tail truncation ONLY: everything emitted before the cut is kept verbatim, an
+    unterminated string is closed, a member the model never finished is dropped
+    whole (guessing its value would be inventing meeting content), and the scopes
+    still open are closed in order. The repair is accepted only if the result
+    parses to an object.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    body = text[start:]
+    for _ in range(_REPAIR_MAX_TRIMS):
+        scan = _json_scan(body)
+        if not scan.scopes and not scan.in_string:
+            return None  # nothing left open — malformed, not cut off
+        candidate = body
+        if scan.in_string:
+            if scan.escaped:
+                candidate = candidate[:-1]  # a dangling \ would escape our quote
+            candidate += '"'
+        candidate = candidate.rstrip()
+        if candidate.endswith(","):
+            candidate = candidate[:-1]
+        candidate += "".join("}" if s == "{" else "]" for s in reversed(scan.scopes))
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            if scan.last_boundary is None:
+                return None
+            body = body[: scan.last_boundary]
+            continue
+        if not isinstance(data, dict):
+            return None
+        logger.warning(
+            "model output was truncated — repaired %d unclosed scopes", len(scan.scopes)
+        )
+        return data
+    return None
+
+
+# A transcript shorter than this (characters) plausibly had nothing to summarize:
+# speech transcribes at ~900 chars/minute, so this is under two minutes of talk.
+# ONLY such a recording may be blamed for empty notes — telling the owner of a
+# 40-minute meeting that their transcript was "too short or sparse" sent them
+# hunting the wrong bug (live 2026-08-10).
+_SPARSE_TRANSCRIPT_CHARS = 1500
 
 
 # Categories the summarizer LLM may assign (content-based). Superset of the
@@ -325,6 +755,33 @@ def _language_directive(language: str | None) -> str | None:
             "heading, and every bullet — in Arabic (Modern Standard Arabic), in "
             "Arabic script. Keep product names, acronyms, and technical terms in "
             "their original form when there is no common Arabic equivalent."
+        )
+    language_names = {
+        "zh": "Simplified Chinese",
+        "chinese": "Simplified Chinese",
+        "simplified chinese": "Simplified Chinese",
+        "hi": "Hindi, in Devanagari script",
+        "hindi": "Hindi, in Devanagari script",
+        "es": "Spanish",
+        "spanish": "Spanish",
+        "fr": "French",
+        "french": "French",
+        "bn": "Bengali, in Bengali script",
+        "bengali": "Bengali, in Bengali script",
+        "pt": "Portuguese",
+        "portuguese": "Portuguese",
+        "ru": "Russian, in Cyrillic script",
+        "russian": "Russian, in Cyrillic script",
+        "ur": "Urdu, in Arabic script",
+        "urdu": "Urdu, in Arabic script",
+    }
+    language_name = language_names.get(lang)
+    if language_name:
+        return (
+            "OUTPUT LANGUAGE: Write the ENTIRE output — the title, every section "
+            f"heading, and every bullet — in {language_name}. Keep product names, "
+            "acronyms, and technical terms in their original form when there is no "
+            f"common {language_name} equivalent."
         )
     if lang in ("auto", "match"):
         return (
@@ -498,7 +955,10 @@ class OllamaSummarizer:
                 base_url=base_url,
                 api_key=api_key,
             )
-            normalized = raw.strip().lower().replace("-", "_").replace(" ", "_")
+            # A reasoning model answers this one-word question with a paragraph of
+            # thinking in front of it; unstripped, every such model silently loses
+            # auto-routing (the reply matches no category and routing fails open).
+            normalized = _strip_think(raw).strip().lower().replace("-", "_").replace(" ", "_")
             # Strip surrounding punctuation / quotes (e.g. '"interview"').
             normalized = normalized.strip('"\'.,;:!?()[]{}<> \t')
             if normalized in _LLM_CATEGORIES:
@@ -535,20 +995,55 @@ class OllamaSummarizer:
         return f"<transcript>\n{transcript.strip()}\n</transcript>"
 
     @staticmethod
-    def _loads_lenient(raw: str) -> dict | None:
-        """Parse the model's reply as a JSON object, tolerating ``` fences."""
-        text = raw.strip()
-        if text.startswith("```"):
-            # Strip a ```json ... ``` markdown fence.
-            inner = text[3:]
-            if inner[:4].lower() == "json":
-                inner = inner[4:]
-            text = inner.rsplit("```", 1)[0].strip()
+    def _loads_lenient(text: str) -> dict | None:
+        """Parse already-normalized model output (``normalize_model_output``) as a
+        JSON object, repairing a reply the context window cut off.
+
+        Returns None for a reply that was never a notes object (prose), or one
+        JSON-shaped past saving — the caller decides what the user is told.
+        """
         try:
             data = json.loads(text)
         except (ValueError, TypeError):
+            data = None
+        if data is not None:
+            return data if isinstance(data, dict) else None
+        if not _looks_like_json_notes(text):
             return None
-        return data if isinstance(data, dict) else None
+        return _repair_truncated_json(text)
+
+    @staticmethod
+    def _was_truncated(normalized: str, reply_meta: dict) -> bool:
+        """True when the reply was cut off rather than malformed: the backend said
+        so (done_reason/finish_reason), or the JSON it emitted still has scopes
+        open at the end, which only a cut can cause."""
+        return bool(reply_meta.get("truncated")) or bool(_json_scan(normalized).scopes)
+
+    @staticmethod
+    def _no_notes_message(truncated: bool, transcript: str) -> str:
+        """The note shown when the model's reply yielded nothing renderable.
+
+        The diagnosis must match what actually happened: on 2026-08-10 a reply
+        truncated at 16k on a long meeting was reported to its owner as "the
+        transcript may be too short or sparse", which is only ever true of a
+        genuinely short recording.
+        """
+        if truncated:
+            return (
+                "_The notes model's answer didn't fit its response window, so the "
+                "notes came back incomplete. Try **Re-summarize** — or pick a less "
+                "verbose model in Settings for long meetings._"
+            )
+        if len(transcript.strip()) < _SPARSE_TRANSCRIPT_CHARS:
+            return (
+                "_Couldn't extract structured notes from this recording — the "
+                "transcript may be too short or sparse. Try **Re-summarize**, or "
+                "pick the **Brainstorm → To-Dos** template for idea dumps._"
+            )
+        return (
+            "_The notes model didn't return structured notes Adversaria could "
+            "read — try **Re-summarize**, or a different model in Settings._"
+        )
 
     @staticmethod
     def _attendee_str(item: object) -> str | None:
@@ -696,8 +1191,14 @@ class OllamaSummarizer:
         json_schema: dict | None,
         base_url: str | None = None,
         api_key: str | None = None,
+        meta: dict | None = None,
     ) -> str:
         """Send a chat request to the configured backend; return raw text content.
+
+        ``meta``, when given, is filled with what the request layer learned about
+        the reply — ``{"truncated": bool, "num_ctx": int | None}`` — so a caller
+        can tell an answer the context window cut off from one the model simply
+        malformed. Only summarize() needs it; every other call site wants text.
 
         json_schema (when given) constrains the model to that JSON schema:
         Ollama uses ``format=schema``; OpenAI-compatible servers use
@@ -712,12 +1213,14 @@ class OllamaSummarizer:
         Otherwise, the default backend routing (``self.backend``) applies.
         """
         if _is_local_ollama_url(base_url):
-            return self._chat_ollama(messages, model, json_schema)
+            return self._chat_ollama(messages, model, json_schema, meta=meta)
         if base_url:
-            return self._chat_openai(messages, model, json_schema, base_url=base_url, api_key=api_key)
+            return self._chat_openai(
+                messages, model, json_schema, base_url=base_url, api_key=api_key, meta=meta
+            )
         if self.backend == "openai":
-            return self._chat_openai(messages, model, json_schema)
-        return self._chat_ollama(messages, model, json_schema)
+            return self._chat_openai(messages, model, json_schema, meta=meta)
+        return self._chat_ollama(messages, model, json_schema, meta=meta)
 
     def _ollama_client(self) -> Client:
         """The native Ollama client, created lazily on the openai backend.
@@ -729,11 +1232,53 @@ class OllamaSummarizer:
             self.client = Client(host=self.host)
         return self.client
 
-    def _chat_ollama(self, messages: list[dict], model: str, json_schema: dict | None) -> str:
+    def _chat_ollama(
+        self,
+        messages: list[dict],
+        model: str,
+        json_schema: dict | None,
+        meta: dict | None = None,
+    ) -> str:
+        """One native-Ollama completion, retried once if the window cut it off.
+
+        ``done_reason == "length"`` means the model was still writing when it ran
+        out of context — the reply is a fragment, so re-ask with a bigger window
+        instead of handing a half-written note downstream. Exactly one retry: a
+        transcript that overruns twice needs a different model, not a third try.
+
+        The first attempt is already sized to this prompt (``_adaptive_num_ctx``),
+        so the retry is the safety net for a model more verbose than the output
+        budget assumed — not the mechanism that makes long meetings work.
+        """
+        num_ctx = _adaptive_num_ctx(
+            _prompt_chars(messages), model, self._ollama_client()
+        )
+        response = self._chat_ollama_once(messages, model, json_schema, num_ctx)
+        if _stop_reason(response) == "length":
+            retry_ctx = _retry_num_ctx(num_ctx)
+            logger.warning(
+                "model hit the context window (num_ctx=%d) before finishing%s",
+                num_ctx,
+                f" — retrying once at num_ctx={retry_ctx}"
+                if retry_ctx
+                else " (already at the retry cap)",
+            )
+            if retry_ctx:
+                num_ctx = retry_ctx
+                response = self._chat_ollama_once(messages, model, json_schema, num_ctx)
+        if meta is not None:
+            meta.update(truncated=_stop_reason(response) == "length", num_ctx=num_ctx)
+        return response["message"]["content"]
+
+    def _chat_ollama_once(
+        self, messages: list[dict], model: str, json_schema: dict | None, num_ctx: int
+    ) -> Any:
+        """Issue one Ollama chat request; return the raw response (content + stop
+        reason), which only _chat_ollama unpacks."""
         chat_kwargs = dict(
             model=model,
             messages=messages,
-            options=_ollama_options(),
+            options=_ollama_options(num_ctx),
         )
         if json_schema is not None:
             chat_kwargs["format"] = json_schema
@@ -754,7 +1299,7 @@ class OllamaSummarizer:
             else:
                 logger.error("Ollama request failed: %s", exc)
                 raise RuntimeError(f"Ollama request failed: {exc}") from exc
-        return response["message"]["content"]
+        return response
 
     def _chat_openai(
         self,
@@ -763,6 +1308,7 @@ class OllamaSummarizer:
         json_schema: dict | None,
         base_url: str | None = None,
         api_key: str | None = None,
+        meta: dict | None = None,
     ) -> str:
         url = (base_url or self.base_url).rstrip("/")
         key = api_key or self.api_key or "EMPTY"
@@ -835,7 +1381,22 @@ class OllamaSummarizer:
                 break
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            truncated = choice.get("finish_reason") == "length"
+            if truncated:
+                # Reported, not retried: the OpenAI chat API has no num_ctx knob
+                # (that is why local Ollama is rerouted to the native client) and
+                # we send no max_tokens, so re-asking would repeat the same call
+                # against the same server-side limit. The reply still goes down
+                # the repair ladder, and the note says what happened.
+                logger.warning(
+                    "model hit the context window before finishing "
+                    "(finish_reason=length, host=%s) — no num_ctx to raise on this API",
+                    url,
+                )
+            if meta is not None:
+                meta.update(truncated=truncated, num_ctx=None)
+            return choice["message"]["content"]
         except Exception as exc:
             # Surface the server's error body — it names the real cause (bad
             # model, unsupported param, auth) where raise_for_status alone only
@@ -1026,7 +1587,24 @@ class OllamaSummarizer:
         user_message = self._build_user_message(transcript)
         if notes:
             user_message = f"{user_message}\n\n<user_notes>\n{notes}\n</user_notes>"
+        if directive:
+            # Same-script languages (es/fr/pt/…) lose to the English template by
+            # recency: the directive sits FIRST (system prompt) while the English
+            # template + transcript are the LAST thing the model reads — and the
+            # JSON-shape pin above even says to reuse "the section names listed
+            # above" verbatim. Arabic survived that conflict on script momentum;
+            # Spanish stayed English even on a 35B model (founder-reproduced,
+            # 2026-08-13). Repeat the directive as the final instruction and
+            # resolve the heading conflict explicitly.
+            user_message = (
+                f"{user_message}\n\n{directive}\n"
+                "This applies to the JSON too: write each section heading as the "
+                "template section's translation into the required output language "
+                "(same order, same meaning) — do NOT reuse the English section "
+                "names verbatim."
+            )
 
+        reply_meta: dict = {}
         raw_output = self._chat(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1036,15 +1614,33 @@ class OllamaSummarizer:
             json_schema=MeetingNotes.model_json_schema(),
             base_url=base_url,
             api_key=api_key,
+            meta=reply_meta,
         )
 
-        data = self._loads_lenient(raw_output)
+        normalized = normalize_model_output(raw_output)
+        data = self._loads_lenient(normalized)
         if data is None:
-            # Not JSON at all — degrade gracefully to the raw text rather than
-            # failing the whole meeting. No LLM category available here.
-            logger.warning("Model output was not JSON — using raw text.")
+            if _looks_like_json_notes(normalized):
+                # A JSON-shaped reply that never parsed is a failure of the model
+                # or its window, not a note. Dumping the blob is exactly what put
+                # raw JSON in someone's meeting note (live 2026-08-10).
+                truncated = self._was_truncated(normalized, reply_meta)
+                logger.warning(
+                    "Model output was JSON-shaped but unparseable (truncated=%s) — "
+                    "returning an honest failure, not the blob. raw=%.200r",
+                    truncated,
+                    raw_output,
+                )
+                return SummarizeResponse(
+                    summary=self._no_notes_message(truncated, transcript),
+                    template_used=template_name,
+                    category=category_hint or heuristic_category,
+                )
+            # Genuine prose — the model wrote a readable note instead of JSON.
+            # Keep it: a readable note beats an error.
+            logger.warning("Model output was not JSON — using the prose reply as the note.")
             return SummarizeResponse(
-                summary=raw_output.strip(),
+                summary=normalized.strip(),
                 template_used=template_name,
                 category=category_hint or heuristic_category,
             )
@@ -1070,10 +1666,8 @@ class OllamaSummarizer:
                 "placeholder instead of raw JSON. raw=%.200r",
                 raw_output,
             )
-            markdown = (
-                "_Couldn't extract structured notes from this recording — the "
-                "transcript may be too short or sparse. Try **Re-summarize**, or "
-                "pick the **Brainstorm → To-Dos** template for idea dumps._"
+            markdown = self._no_notes_message(
+                self._was_truncated(normalized, reply_meta), transcript
             )
         logger.info(
             "Summarization complete: template=%s attendees=%d md_chars=%d",
@@ -1358,15 +1952,20 @@ class OllamaSummarizer:
 
     def _chat_ollama_stream(self, messages, model):
         """Stream content deltas from the Ollama chat API."""
+        client = self._ollama_client()
         kwargs = dict(
             model=model,
             messages=messages,
             stream=True,
-            options=_ollama_options(),
+            # Grounded chat carries the whole transcript too, so it is sized the
+            # same way as a summarize call rather than pinned to the floor.
+            options=_ollama_options(
+                _adaptive_num_ctx(_prompt_chars(messages), model, client)
+            ),
         )
         if _is_thinking_model(model):
             kwargs["think"] = False
-        for chunk in self._ollama_client().chat(**kwargs):
+        for chunk in client.chat(**kwargs):
             piece = chunk.get("message", {}).get("content")
             if piece:
                 yield piece

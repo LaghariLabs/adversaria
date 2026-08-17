@@ -1,27 +1,30 @@
 //! macOS audio capture.
 //!
 //! Captures two streams simultaneously:
-//! - **System audio** via ScreenCaptureKit (what the user hears → "Them").
-//!   ScreenCaptureKit delivers 32-bit float PCM at 48 kHz; we interleave it and
-//!   write a float WAV. Requires the **Screen Recording** permission.
+//! - **System audio** via a Core Audio process tap (cpal loopback, backed by
+//!   `AudioHardwareCreateProcessTap`; what the user hears → "Them"). This does
+//!   not create a ScreenCaptureKit session or require Screen Recording access.
 //! - **Microphone** via cpal (what the user says → "Me"), captured on its own
 //!   thread so a missing/failing mic never aborts the meeting.
 //!
 //! Both feed the shared [`StreamState`] accumulator, so the WAV writer and the
 //! live-caption snapshot are identical to the Windows path.
+//!
+//! Phase 1 limitations: the process tap remains anchored to the default output
+//! selected at start if the device changes mid-recording (the Phase 2 watchdog
+//! is tracked in `docs/AUDIO_TAP_MIGRATION.md`), and it records every process,
+//! including this app. The app plays no meeting audio, so that is accepted for
+//! now. macOS shows its expected purple system-audio menu-bar indicator while
+//! the tap is active, matching Granola's behavior.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use screencapturekit::prelude::*;
 
 use super::{snapshot_since, RecordingPaths, StreamState, WAV_FORMAT_IEEE_FLOAT};
 use crate::recording_spool::SpoolSession;
-
-/// System audio is captured at this fixed rate (ScreenCaptureKit default).
-const SYSTEM_SAMPLE_RATE: u32 = 48_000;
 
 /// Manages the recording lifecycle on macOS.
 pub struct AudioCapture {
@@ -30,9 +33,8 @@ pub struct AudioCapture {
     mic_path: Mutex<Option<PathBuf>>,
     system: StreamState,
     mic: StreamState,
-    /// The live ScreenCaptureKit stream; held here so it stays alive between
-    /// the start and stop IPC calls, and dropped on stop to end capture.
-    system_stream: Mutex<Option<SCStream>>,
+    /// Owns the thread holding the non-Send cpal loopback stream.
+    system_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     mic_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     spool: Mutex<Option<SpoolSession>>,
 }
@@ -46,7 +48,7 @@ impl AudioCapture {
             mic_path: Mutex::new(None),
             system: StreamState::new(),
             mic: StreamState::new(),
-            system_stream: Mutex::new(None),
+            system_handle: Mutex::new(None),
             mic_handle: Mutex::new(None),
             spool: Mutex::new(None),
         }
@@ -73,12 +75,6 @@ impl AudioCapture {
 
         self.system.reset();
         self.mic.reset();
-        // System format is fixed by ScreenCaptureKit: float32 @ 48 kHz. The
-        // channel count is corrected to the real value on the first callback.
-        *self.system.sample_rate.lock().unwrap() = SYSTEM_SAMPLE_RATE;
-        *self.system.num_channels.lock().unwrap() = 2;
-        *self.system.bits_per_sample.lock().unwrap() = 32;
-        *self.system.format_tag.lock().unwrap() = WAV_FORMAT_IEEE_FLOAT;
 
         let spool = match SpoolSession::start(Path::new(output_dir)) {
             Ok(spool) => spool,
@@ -93,8 +89,8 @@ impl AudioCapture {
         *self.spool.lock().unwrap() = Some(spool);
 
         // Start system-audio capture first; it is the critical stream.
-        let stream = match start_system_capture(self.system.clone(), self.recording.clone()) {
-            Ok(stream) => stream,
+        let system_handle = match spawn_system_thread(self.recording.clone(), self.system.clone()) {
+            Ok(handle) => handle,
             Err(error) => {
                 self.recording.store(false, Ordering::SeqCst);
                 self.system.detach_writer();
@@ -105,7 +101,7 @@ impl AudioCapture {
                 return Err(error);
             }
         };
-        *self.system_stream.lock().unwrap() = Some(stream);
+        *self.system_handle.lock().unwrap() = Some(system_handle);
         *self.system_path.lock().unwrap() = Some(PathBuf::from(&spool_path));
         *self.mic_path.lock().unwrap() = None;
 
@@ -159,12 +155,11 @@ impl AudioCapture {
         if !self.is_recording() {
             return Err("Not recording".to_string());
         }
-        // Signal the mic thread to stop, then tear down the system stream.
+        // Signal both capture threads to stop, then join them symmetrically.
         self.recording.store(false, Ordering::SeqCst);
 
-        if let Some(stream) = self.system_stream.lock().unwrap().take() {
-            let _ = stream.stop_capture();
-            // `stream` drops here, releasing ScreenCaptureKit resources.
+        if let Some(handle) = self.system_handle.lock().unwrap().take() {
+            let _ = handle.join();
         }
         if let Some(handle) = self.mic_handle.lock().unwrap().take() {
             let _ = handle.join();
@@ -201,103 +196,244 @@ impl Default for AudioCapture {
 }
 
 // ---------------------------------------------------------------------------
-// System audio — ScreenCaptureKit
+// System audio — Core Audio process tap via cpal loopback
 // ---------------------------------------------------------------------------
 
-/// ScreenCaptureKit output handler: appends interleaved float32 PCM to the
-/// shared system buffer. Runs on a ScreenCaptureKit dispatch queue.
-struct AudioSink {
-    state: StreamState,
+/// Spawn the system-capture thread and wait until its cpal stream is playing.
+fn spawn_system_thread(
     recording: Arc<AtomicBool>,
-}
+    system: StreamState,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let handle = std::thread::spawn(move || {
+        if let Err(error) = run_system_capture(&recording, &system, &tx) {
+            let _ = tx.send(Err(error));
+        }
+    });
 
-impl SCStreamOutputTrait for AudioSink {
-    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
-        if of_type != SCStreamOutputType::Audio {
-            return;
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            Err(error)
         }
-        let Some(list) = sample.audio_buffer_list() else {
-            return;
-        };
-
-        // Each AudioBuffer is one (or, when interleaved, all) channel(s) of f32.
-        let planes: Vec<&[f32]> = list
-            .iter()
-            .map(|b| {
-                let bytes = b.data();
-                // SAFETY: ScreenCaptureKit delivers 4-byte-aligned f32 PCM.
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), bytes.len() / 4) }
-            })
-            .collect();
-        if planes.is_empty() {
-            return;
-        }
-
-        // Real channel count = sum across buffers (planar) or the lone buffer's
-        // channel count (interleaved). Keep the WAV header honest.
-        let channels: u16 = list.iter().map(|b| b.number_channels as u16).sum();
-        if channels > 0 {
-            *self.state.num_channels.lock().unwrap() = channels;
-        }
-
-        let mut out = Vec::new();
-        if planes.len() == 1 {
-            // Single buffer: mono or already-interleaved stereo — copy as-is.
-            for &s in planes[0] {
-                out.extend_from_slice(&s.to_le_bytes());
-            }
-        } else {
-            // Planar: one buffer per channel — interleave L,R,L,R,…
-            let frames = planes.iter().map(|p| p.len()).min().unwrap_or(0);
-            for f in 0..frames {
-                for p in &planes {
-                    out.extend_from_slice(&p[f].to_le_bytes());
-                }
-            }
-        }
-        if self.state.push(&out).is_err() {
-            self.recording.store(false, Ordering::SeqCst);
-        }
+        Err(_) => Err("System-audio capture did not start within 10 s".to_string()),
     }
 }
 
-/// Build and start a ScreenCaptureKit system-audio stream feeding `state`.
-fn start_system_capture(
-    state: StreamState,
-    recording: Arc<AtomicBool>,
-) -> Result<SCStream, String> {
-    let content = SCShareableContent::get().map_err(|e| {
-        format!(
-            "Could not access screen content for audio capture ({e:?}). Grant Screen Recording \
-             permission in System Settings → Privacy & Security → Screen & System Audio Recording, \
-             then restart the app."
-        )
-    })?;
+/// Capture the default output device through cpal's Core Audio loopback tap.
+fn run_system_capture(
+    recording: &Arc<AtomicBool>,
+    system: &StreamState,
+    startup: &std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("No output device available to capture system audio from.")?;
+    let supported = device
+        .default_input_config()
+        .or_else(|_| device.default_output_config())
+        .map_err(|e| format!("No default system-audio config: {e}"))?;
 
-    let display = content.displays().into_iter().next().ok_or_else(|| {
-        "No display available for audio capture. Grant Screen Recording permission in System \
-         Settings → Privacy & Security → Screen & System Audio Recording, then restart the app."
-            .to_string()
-    })?;
+    let sample_format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
 
-    let filter = SCContentFilter::create()
-        .with_display(&display)
-        .with_excluding_windows(&[])
-        .build();
+    // Set the native interleaved format before the first callback so every
+    // snapshot and the finished WAV receive an honest header.
+    *system.sample_rate.lock().unwrap() = config.sample_rate;
+    *system.num_channels.lock().unwrap() = config.channels;
+    *system.bits_per_sample.lock().unwrap() = 32;
+    *system.format_tag.lock().unwrap() = WAV_FORMAT_IEEE_FLOAT;
 
-    let config = SCStreamConfiguration::new()
-        .with_captures_audio(true)
-        .with_sample_rate(SYSTEM_SAMPLE_RATE as i32)
-        .with_channel_count(2)
-        .with_excludes_current_process_audio(true);
+    let err_fn = |e: cpal::Error| eprintln!("System-audio stream error: {e}");
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            config,
+            {
+                let system = system.clone();
+                let recording = recording.clone();
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut out = Vec::with_capacity(std::mem::size_of_val(data));
+                    for &sample in data {
+                        out.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    if system.push(&out).is_err() {
+                        recording.store(false, Ordering::SeqCst);
+                    }
+                }
+            },
+            err_fn,
+            None,
+        ),
+        other => {
+            return Err(format!("Unsupported system-audio sample format: {other:?}"));
+        }
+    }
+    .map_err(|e| format!("Failed to build system-audio input stream: {e}"))?;
 
-    let mut stream = SCStream::new(&filter, &config);
-    stream.add_output_handler(AudioSink { state, recording }, SCStreamOutputType::Audio);
     stream
-        .start_capture()
-        .map_err(|e| format!("Failed to start system-audio capture: {e:?}"))?;
+        .play()
+        .map_err(|e| format!("Failed to start system-audio stream: {e}"))?;
+    startup
+        .send(Ok(()))
+        .map_err(|e| format!("Failed to confirm system-audio startup: {e}"))?;
 
-    Ok(stream)
+    // Keep the non-Send cpal stream alive here until stop; dropping it destroys
+    // the process tap and cpal's private aggregate device.
+    while recording.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(stream);
+    Ok(())
+}
+
+/// Prove the system-audio tap actually works: play a near-silent tone through
+/// the default output and check the tap hears ANY nonzero sample. This is the
+/// only honest permission check — macOS offers no public API, and a denied
+/// tap fails silently (stream plays, zero callbacks). First-ever call may
+/// block on the macOS consent prompt, so the budget is generous.
+pub fn probe_system_audio() -> Result<bool, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_system_audio_probe());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(120))
+        .map_err(|_| "The system-audio check timed out after 120 seconds.".to_string())?
+}
+
+fn run_system_audio_probe() -> Result<bool, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("No output device is available for the system-audio check.")?;
+    let input_supported = device
+        .default_input_config()
+        .or_else(|_| device.default_output_config())
+        .map_err(|error| format!("No default system-audio check config: {error}"))?;
+    if input_supported.sample_format() != cpal::SampleFormat::F32 {
+        return Err(format!(
+            "Unsupported system-audio check sample format: {:?}",
+            input_supported.sample_format()
+        ));
+    }
+    let input_config: cpal::StreamConfig = input_supported.into();
+    let heard_nonzero = Arc::new(Mutex::new(false));
+    let stream_error = Arc::new(Mutex::new(None::<String>));
+
+    let input_stream = device
+        .build_input_stream(
+            input_config,
+            {
+                let heard_nonzero = heard_nonzero.clone();
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if data.iter().any(|sample| *sample != 0.0) {
+                        *heard_nonzero.lock().unwrap() = true;
+                    }
+                }
+            },
+            {
+                let stream_error = stream_error.clone();
+                move |error| {
+                    *stream_error.lock().unwrap() =
+                        Some(format!("System-audio check input stream failed: {error}"));
+                }
+            },
+            None,
+        )
+        .map_err(|error| format!("Failed to build system-audio check input stream: {error}"))?;
+
+    input_stream
+        .play()
+        .map_err(|error| format!("Failed to start system-audio check input stream: {error}"))?;
+
+    let output_supported = device
+        .default_output_config()
+        .map_err(|error| format!("No default tone output config: {error}"))?;
+    let output_sample_format = output_supported.sample_format();
+    let output_config: cpal::StreamConfig = output_supported.into();
+    let channels = usize::from(output_config.channels.max(1));
+    let phase_step = std::f32::consts::TAU * 220.0 / output_config.sample_rate as f32;
+    let output_stream = match output_sample_format {
+        cpal::SampleFormat::F32 => {
+            let mut phase = 0.0f32;
+            device.build_output_stream(
+                output_config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    for frame in data.chunks_mut(channels) {
+                        let sample = phase.sin() * 0.002;
+                        frame.fill(sample);
+                        phase = (phase + phase_step) % std::f32::consts::TAU;
+                    }
+                },
+                {
+                    let stream_error = stream_error.clone();
+                    move |error| {
+                        *stream_error.lock().unwrap() =
+                            Some(format!("System-audio check tone stream failed: {error}"));
+                    }
+                },
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let mut phase = 0.0f32;
+            device.build_output_stream(
+                output_config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    for frame in data.chunks_mut(channels) {
+                        let sample = (phase.sin() * 0.002 * i16::MAX as f32) as i16;
+                        frame.fill(sample);
+                        phase = (phase + phase_step) % std::f32::consts::TAU;
+                    }
+                },
+                {
+                    let stream_error = stream_error.clone();
+                    move |error| {
+                        *stream_error.lock().unwrap() =
+                            Some(format!("System-audio check tone stream failed: {error}"));
+                    }
+                },
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let mut phase = 0.0f32;
+            device.build_output_stream(
+                output_config,
+                move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                    for frame in data.chunks_mut(channels) {
+                        let sample = (phase.sin() * 0.002 * i16::MAX as f32 + 32768.0) as u16;
+                        frame.fill(sample);
+                        phase = (phase + phase_step) % std::f32::consts::TAU;
+                    }
+                },
+                {
+                    let stream_error = stream_error.clone();
+                    move |error| {
+                        *stream_error.lock().unwrap() =
+                            Some(format!("System-audio check tone stream failed: {error}"));
+                    }
+                },
+                None,
+            )
+        }
+        other => return Err(format!("Unsupported tone output sample format: {other:?}")),
+    }
+    .map_err(|error| format!("Failed to build system-audio check tone stream: {error}"))?;
+
+    output_stream
+        .play()
+        .map_err(|error| format!("Failed to start system-audio check tone stream: {error}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    drop(output_stream);
+    drop(input_stream);
+
+    if let Some(error) = stream_error.lock().unwrap().take() {
+        return Err(error);
+    }
+    let heard_nonzero = *heard_nonzero.lock().unwrap();
+    Ok(heard_nonzero)
 }
 
 // ---------------------------------------------------------------------------

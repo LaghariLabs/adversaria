@@ -131,7 +131,7 @@ fn sidecar_log_stdio() -> Option<(std::process::Stdio, std::process::Stdio)> {
 }
 
 /// `logs/adversaria-service.log` under app data, creating the directory.
-fn sidecar_log_path() -> Option<std::path::PathBuf> {
+pub fn sidecar_log_path() -> Option<std::path::PathBuf> {
     let dir = crate::config::app_data_dir().join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("adversaria-service.log"))
@@ -190,40 +190,52 @@ fn sidecar_spawn_failure_message(kind: std::io::ErrorKind) -> String {
     }
 }
 
+/// Where the bundled Python service executable lives, independent of whether
+/// it currently exists. The one true path both `launch_sidecar` and the
+/// diagnostics export resolve against, so a deleted/quarantined exe is
+/// self-diagnosing instead of two subtly different guesses. `None` only when
+/// the packaged resource directory itself is unavailable (always true in dev).
+pub fn sidecar_exe_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    Some(
+        resource_dir
+            .join("adversaria-service")
+            .join(if cfg!(windows) {
+                "adversaria-service.exe"
+            } else {
+                "adversaria-service"
+            }),
+    )
+}
+
 /// Start one sidecar process: pick a free port, point the HTTP client at it,
 /// and stash the child for shutdown. Returns the port, or `None` when the app
 /// isn't packaged (dev) or the process couldn't be started.
 fn launch_sidecar(app: &AppHandle) -> Option<u16> {
-    let resource_dir = match app.path().resource_dir() {
-        Ok(path) => path,
-        Err(_) => {
-            set_sidecar_launch_error(
-                app,
-                "sidecar.resource_dir_failed",
-                "The bundled local AI service location is unavailable. Reinstall Adversaria and retry.",
-            );
-            return None;
-        }
+    let Some(exe) = sidecar_exe_path(app) else {
+        set_sidecar_launch_error(
+            app,
+            "sidecar.resource_dir_failed",
+            "The bundled local AI service location is unavailable. Reinstall Adversaria and retry.",
+        );
+        return None;
     };
-    let exe = resource_dir
-        .join("adversaria-service")
-        .join(if cfg!(windows) {
-            "adversaria-service.exe"
-        } else {
-            "adversaria-service"
-        });
+    // Phase 0.4: gate the spawn itself on !debug_assertions — previously only
+    // the error report was gated, so release builds poisoned dev with a frozen
+    // sidecar that shadowed Python edits.
+    if cfg!(debug_assertions) {
+        // In dev, never spawn the frozen sidecar — use the manually-run uvicorn service
+        return None;
+    }
     if !exe.exists() {
-        // Expected in dev, where uvicorn is run from source. In a packaged
-        // release the directory is a declared Tauri resource; absence after
-        // install strongly indicates antivirus/EDR quarantine.
-        if !cfg!(debug_assertions) {
-            set_sidecar_launch_error(
-                app,
-                "sidecar.executable_missing",
-                sidecar_spawn_failure_message(std::io::ErrorKind::NotFound),
-            );
-        }
-        return None; // dev / not bundled — use the manually-run service
+        // In a packaged release the directory is a declared Tauri resource;
+        // absence after install strongly indicates antivirus/EDR quarantine.
+        set_sidecar_launch_error(
+            app,
+            "sidecar.executable_missing",
+            sidecar_spawn_failure_message(std::io::ErrorKind::NotFound),
+        );
+        return None;
     }
 
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -259,6 +271,13 @@ fn launch_sidecar(app: &AppHandle) -> Option<u16> {
         // lingering with ~1.6 GB of models loaded. Dev terminal runs don't set
         // the var and are unaffected.
         .env("ADVERSARIA_PARENT_GUARD", "1")
+        // Hand the sidecar the app-data dir instead of letting it recompute
+        // one. Both halves used to derive it independently and drifted (a
+        // Windows sidecar seeding templates into a macOS-shaped path nobody
+        // read); the Python side keeps its platform defaults only as a
+        // fallback for a hand-launched binary. This is also what puts
+        // `service-crash.txt` where `read_sidecar_crash_tail` looks for it.
+        .env("ADVERSARIA_DATA_DIR", crate::config::app_data_dir())
         .stdin(std::process::Stdio::piped());
 
     // Ensure ffmpeg (mlx-whisper shells out to it) resolves. macOS-only: the
@@ -355,11 +374,20 @@ fn ensure_sidecar_watchdog(app: AppHandle) {
             }
             fast_deaths += 1;
             if fast_deaths > SIDECAR_MAX_FAST_DEATHS {
-                set_sidecar_launch_error(
-                    &app,
-                    "sidecar.restart_exhausted",
-                    "The local AI service stopped repeatedly. Check Windows Security → Protection history or your company security software, then press Restart Local AI.",
-                );
+                // Platform-aware message (Phase 0.3)
+                let detail = if cfg!(windows) {
+                    "The local AI service stopped repeatedly. Check Windows Security → Protection history or your company security software, then press Restart Local AI."
+                } else {
+                    "The local AI service stopped repeatedly. Check logs/adversaria-service.log or service-crash.txt, then press Restart Local AI."
+                };
+                // Try to surface actual crash tail (Phase 0.3 death certificate)
+                let crash_detail = read_sidecar_crash_tail(50);
+                let full_detail = if let Some(tail) = crash_detail {
+                    format!("{detail}\n\nLast log tail:\n{tail}")
+                } else {
+                    detail.to_string()
+                };
+                set_sidecar_launch_error(&app, "sidecar.restart_exhausted", full_detail);
                 eprintln!(
                     "[sidecar] gave up after {SIDECAR_MAX_FAST_DEATHS} failed restarts — see \
                      logs/adversaria-service.log"
@@ -513,6 +541,40 @@ fn is_stale_sidecar(name: &str, parent: Option<u32>, parent_alive: bool) -> bool
     }
 }
 
+/// Read last N lines from sidecar log + service-crash.txt for death certificate (Phase 0.3).
+fn read_sidecar_crash_tail(n: usize) -> Option<String> {
+    let mut tail = String::new();
+    // Try service-crash.txt first (written by Python excepthook)
+    {
+        let crash_path = crate::config::app_data_dir().join("service-crash.txt");
+        if let Ok(content) = std::fs::read_to_string(&crash_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            if !lines.is_empty() {
+                tail.push_str("--- service-crash.txt ---\n");
+                tail.push_str(&lines[start..].join("\n"));
+                tail.push('\n');
+            }
+        }
+    }
+    // Append last N lines of adversaria-service.log
+    if let Some(log_path) = sidecar_log_path() {
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            if !lines.is_empty() {
+                tail.push_str("--- adversaria-service.log tail ---\n");
+                tail.push_str(&lines[start..].join("\n"));
+            }
+        }
+    }
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
+}
+
 /// Best-effort append of one line to the sidecar log, so a reaped orphan is
 /// explained in the same file its own output went to.
 fn append_to_sidecar_log(line: &str) {
@@ -547,18 +609,16 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
     if state.capture.is_recording() {
         return Err("Already recording".to_string());
     }
-    // Pre-flight the capture permission. macOS revokes Screen Recording when the
-    // app bundle is replaced, so an *updated* user hits this even though they
-    // granted it before — and they never see first-run setup again. Without this
-    // check the failure surfaces from deep inside ScreenCaptureKit as a raw
-    // `NoShareableContent(...)` debug string, after a capture session has already
-    // been half-started. The sentinel prefix lets the UI offer the two buttons
-    // that actually fix it instead of printing an error nobody can act on.
+    // The Core Audio process-tap permission has no public check API, so this gate
+    // trusts the last real-audio probe. A later on-disk revocation cannot be seen
+    // here; it surfaces as a recoverable mic-only meeting when capture stops.
     let perms = crate::permissions::check();
-    if perms.screen_recording != crate::permissions::PermissionState::Granted {
+    if perms.system_audio != crate::permissions::PermissionState::Granted {
         return Err(format!(
-            "{PERMISSION_ERROR_PREFIX}Adversaria needs Screen Recording permission to capture \
-             meeting audio. macOS asks again whenever the app updates."
+            "{PERMISSION_ERROR_PREFIX}Adversaria can't hear your Mac's system audio yet. \
+             Open Settings → Setup status → Permissions and run the check, \
+             or enable Adversaria under System Settings → Privacy & Security → \
+             Screen & System Audio Recording → System Audio Recording Only."
         ));
     }
     let dir = crate::config::recordings_dir()
@@ -3968,12 +4028,14 @@ pub async fn import_all_meetings() -> Result<Option<usize>, String> {
     Ok(Some(count))
 }
 
-/// Export only the rotated, redacted lifecycle log after an explicit native
-/// save dialog. This never includes meeting rows, transcript text, contact
-/// fields, API keys, or raw filesystem paths.
+/// Export the full support-diagnostics bundle (app/OS/memory facts, sidecar
+/// binary status, service log tail, service-crash.txt, redacted config.json,
+/// permission states, and the local event log) after an explicit native save
+/// dialog. This never includes meeting rows, transcript text, contact fields,
+/// API keys, or raw filesystem paths.
 #[tauri::command]
-pub async fn export_redacted_diagnostics() -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(crate::diagnostics::export)
+pub async fn export_redacted_diagnostics(app: AppHandle) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || crate::diagnostics::export(&app))
         .await
         .map_err(|e| format!("Diagnostic export task failed: {e}"))?
 }
@@ -4240,6 +4302,31 @@ pub async fn get_meeting_graph() -> Result<crate::types::GraphData, String> {
 pub async fn merge_meeting_speakers(meeting_id: i64) -> Result<Meeting, String> {
     crate::storage::merge_meeting_speakers(meeting_id)
         .map_err(|e| format!("Failed to merge speakers: {e}"))?;
+    crate::second_brain::sync_async();
+    crate::storage::get_meeting(meeting_id)
+        .map_err(|e| format!("Failed to reload meeting: {e}"))?
+        .ok_or_else(|| format!("Meeting not found: {meeting_id}"))
+}
+
+/// Rename a person across a saved meeting (speaker labels, transcript, notes,
+/// attendees, action items) — retroactive fix for a transcription that
+/// misheard a name. Returns the refreshed meeting.
+#[tauri::command]
+pub async fn rename_meeting_person(
+    meeting_id: i64,
+    from_name: String,
+    to_name: String,
+) -> Result<Meeting, String> {
+    let from_name = from_name.trim();
+    let to_name = to_name.trim();
+    if from_name.is_empty() || to_name.is_empty() {
+        return Err("Name is empty.".to_string());
+    }
+    if from_name == to_name {
+        return Err("Nothing to rename.".to_string());
+    }
+    crate::storage::rename_meeting_person(meeting_id, from_name, to_name)
+        .map_err(|e| format!("Failed to rename person: {e}"))?;
     crate::second_brain::sync_async();
     crate::storage::get_meeting(meeting_id)
         .map_err(|e| format!("Failed to reload meeting: {e}"))?
@@ -4640,6 +4727,25 @@ pub async fn start_model_download(
         return Err("The local setup service is not ready; retry in a moment.".to_string());
     }
     state.client.start_model_download(&profile_id).await
+}
+
+#[tauri::command]
+pub async fn reset_model_download(
+    state: State<'_, AppState>,
+    profile_id: String,
+    force: bool,
+) -> Result<crate::types::ModelDownloadStatus, String> {
+    if !crate::setup::downloadable_profile(&profile_id) {
+        return Err(format!("Unknown model profile: {profile_id}"));
+    }
+    if !state
+        .client
+        .wait_until_ready(std::time::Duration::from_secs(120))
+        .await
+    {
+        return Err("The local setup service is not ready; retry in a moment.".to_string());
+    }
+    state.client.reset_model_download(&profile_id, force).await
 }
 
 #[tauri::command]
@@ -5090,7 +5196,7 @@ pub async fn calendar_event_at(at: String) -> Result<Option<CalendarEvent>, Stri
 // Capture permissions — asked during setup, not at the first recording
 // ---------------------------------------------------------------------------
 
-/// Current TCC state for microphone + screen recording.
+/// Current microphone state and the persisted result of the system-audio probe.
 #[tauri::command]
 pub async fn check_capture_permissions() -> Result<crate::permissions::CapturePermissions, String> {
     Ok(crate::permissions::check())
@@ -5106,23 +5212,25 @@ pub async fn request_microphone_permission() -> Result<crate::permissions::Permi
         .map_err(|e| format!("Permission request failed: {e}"))
 }
 
-/// Ask for Screen Recording. macOS only ever shows this prompt once per
-/// install; a `denied` result means the user must use System Settings.
 #[tauri::command]
-pub async fn request_screen_permission() -> Result<crate::permissions::PermissionState, String> {
-    tauri::async_runtime::spawn_blocking(crate::permissions::request_screen_recording)
+pub async fn probe_system_audio(
+    state: State<'_, AppState>,
+) -> Result<crate::permissions::CapturePermissions, String> {
+    if state.capture.is_recording() {
+        return Err(
+            "Stop the current recording before checking the System Audio permission.".to_string(),
+        );
+    }
+    let granted = tauri::async_runtime::spawn_blocking(crate::audio::probe_system_audio)
         .await
-        .map_err(|e| format!("Permission request failed: {e}"))
+        .map_err(|error| format!("System-audio check thread failed: {error}"))??;
+    crate::permissions::persist_system_audio_probe(granted)?;
+    Ok(crate::permissions::check())
 }
 
-/// Open the exact System Settings pane for a permission. Also records that the
-/// user went to grant Screen Recording, so the UI can offer the relaunch macOS
-/// requires before the grant takes effect.
+/// Open the exact System Settings pane for a permission.
 #[tauri::command]
 pub async fn open_privacy_settings(app: AppHandle, which: String) -> Result<(), String> {
-    if which != "microphone" {
-        crate::permissions::mark_screen_granted_externally();
-    }
     let _ = app;
     // `open` handles the x-apple.systempreferences: scheme; the shell plugin's
     // scope would need a matching allowlist entry for a URL this exotic.
@@ -5139,12 +5247,6 @@ pub async fn open_privacy_settings(app: AppHandle, which: String) -> Result<(), 
             .map_err(|e| format!("Couldn't open System Settings: {e}"))?;
     }
     Ok(())
-}
-
-/// Restart the app so a freshly granted Screen Recording permission applies.
-#[tauri::command]
-pub async fn relaunch_for_permissions(app: AppHandle) -> Result<(), String> {
-    app.restart();
 }
 
 // ---------------------------------------------------------------------------
@@ -5392,6 +5494,27 @@ mod tests {
             )),
             "src/lib/tauri.ts must define PERMISSION_ERROR_PREFIX as {PERMISSION_ERROR_PREFIX:?}"
         );
+    }
+
+    /// The death certificate only reaches the user if both halves name the
+    /// same env var and the same file: Rust passes `ADVERSARIA_DATA_DIR` on
+    /// spawn and reads `<app_data_dir>/service-crash.txt` back, and the Python
+    /// entry point must resolve its crash file from that same var. The two
+    /// used to disagree (Python wrote to `ADVERSARIA_APP_DATA`, which nothing
+    /// set), so every crash report went to a temp dir Rust never opened.
+    #[test]
+    fn sidecar_crash_file_contract_matches_the_python_side() {
+        let entry = include_str!("../../python-service/run_service.py");
+        assert!(
+            entry.contains("ADVERSARIA_DATA_DIR"),
+            "run_service.py must resolve its crash dir from ADVERSARIA_DATA_DIR"
+        );
+        assert!(
+            entry.contains("service-crash.txt"),
+            "run_service.py must write the file read_sidecar_crash_tail reads"
+        );
+        // Same var drives the sidecar's prompt/template dir — one contract.
+        assert!(include_str!("../../python-service/src/config.py").contains("ADVERSARIA_DATA_DIR"));
     }
 
     use super::*;

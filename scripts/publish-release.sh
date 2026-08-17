@@ -97,34 +97,110 @@ echo "==> Publishing $TAG to $RELEASE_REPO ($ASSET_NAME, ${CHANNEL} channel → 
 # Upload both, using the STABLE filename so the website's
 # .../releases/latest/download/Adversaria-macos-arm64.dmg link keeps working
 # across releases. Uploading it by hand is how a release ships with no download.
+ALLOW_MISSING_DMG=0
+ALLOW_MACOS_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-missing-dmg) ALLOW_MISSING_DMG=1 ;;
+    --allow-macos-only) ALLOW_MACOS_ONLY=1 ;;
+  esac
+done
+
 DMG="$(dirname "$ARTIFACT")/../dmg/Adversaria-macos-arm64.dmg"
 DMG_ARGS=()
 if [ -f "$DMG" ]; then
   DMG_ARGS+=("$DMG")
 else
-  echo "==> WARNING: $DMG not found — publishing without a downloadable DMG."
-  echo "    Re-run scripts/build-dmg.sh, then: gh release upload $TAG <dmg> --repo $RELEASE_REPO"
+  if [ "$ALLOW_MISSING_DMG" = "1" ]; then
+    echo "==> WARNING: $DMG not found — publishing without a downloadable DMG (--allow-missing-dmg)."
+  else
+    echo "ERROR: $DMG not found. Re-run scripts/build-dmg.sh or pass --allow-missing-dmg to publish without it."
+    exit 1
+  fi
 fi
 
 WIN_ARGS=()
 if [ -n "$WIN_EXE" ]; then
-  # Upload under the stable name the website and the manifest both reference.
   WIN_STAGED="$(mktemp -d)/$WIN_ASSET_NAME"
   cp "$WIN_EXE" "$WIN_STAGED"
   WIN_ARGS+=("$WIN_STAGED")
   echo "==> Including Windows: $(basename "$WIN_EXE") → $WIN_ASSET_NAME (signed, windows-x86_64)"
+  # Record the Windows exe in the channel provenance NOW, while the bytes in
+  # hand are the authentic ones being uploaded. build-dmg.sh only covers the
+  # macOS artifacts, so without this the Windows asset ships with no recorded
+  # hash and scripts/verify-published.sh can never hold it to the same
+  # standard (found live: 0.3.75's provenance carries no windows entry).
+  PROV_FILE="src-tauri/target/release/bundle/provenance-${CHANNEL}.json"
+  if [ -f "$PROV_FILE" ]; then
+    python3 - "$PROV_FILE" "$WIN_STAGED" "$WIN_ASSET_NAME" <<'PY'
+import hashlib, json, sys
+prov_path, staged, asset_name = sys.argv[1], sys.argv[2], sys.argv[3]
+prov = json.load(open(prov_path))
+arts = prov.setdefault("distribution_artifacts", [])
+data = open(staged, "rb").read()
+entry = {"filename": asset_name, "bytes": len(data),
+         "sha256": hashlib.sha256(data).hexdigest()}
+arts[:] = [a for a in arts if a.get("filename") != asset_name] + [entry]
+json.dump(prov, open(prov_path, "w"), indent=2)
+print(f"==> Provenance: recorded {asset_name} ({entry['bytes']:,} B, sha256 {entry['sha256'][:16]}…)")
+PY
+  else
+    echo "==> WARNING: no provenance at $PROV_FILE — the Windows asset will publish with no recorded hash."
+  fi
 else
-  echo "==> WARNING: no Windows artifacts (ADVERSARIA_WINDOWS_DIR unset)."
-  echo "    This release will carry a macOS-ONLY manifest, so installed Windows"
-  echo "    copies will not see an update prompt for it."
+  if [ "$ALLOW_MACOS_ONLY" = "1" ]; then
+    echo "==> WARNING: no Windows artifacts (ADVERSARIA_WINDOWS_DIR unset) — publishing macOS-only (--allow-macos-only)."
+  else
+    echo "ERROR: no Windows artifacts (ADVERSARIA_WINDOWS_DIR unset). Set ADVERSARIA_WINDOWS_DIR or pass --allow-macos-only for a macOS-only release."
+    exit 1
+  fi
 fi
 
+# Create draft release first so we can verify before publishing
+echo "==> Creating draft release $TAG..."
 gh release create "$TAG" \
   --repo "$RELEASE_REPO" \
   --title "Adversaria $TAG" \
   --notes "$NOTES" \
+  --draft \
   "$ARTIFACT" "$LATEST_JSON" ${DMG_ARGS+"${DMG_ARGS[@]}"} ${WIN_ARGS+"${WIN_ARGS[@]}"}
 
-echo "✅ Published $TAG."
+# Verify uploaded assets — hard-fail on any missing asset
+echo "==> Verifying uploaded assets..."
+ASSETS_JSON="$(gh release view "$TAG" --repo "$RELEASE_REPO" --json assets --jq '.assets | map(.name) | join("\n")')"
+MISSING=0
+for expected in "$(basename "$ARTIFACT")" "$(basename "$LATEST_JSON")" ${DMG_ARGS:+"$(basename "$DMG")"} ${WIN_ARGS:+"$WIN_ASSET_NAME"}; do
+  # Handle empty DMG_ARGS/WIN_ARGS gracefully
+  [ -z "$expected" ] && continue
+  if ! echo "$ASSETS_JSON" | grep -qxF "$expected"; then
+    echo "ERROR: Expected asset missing from draft release: $expected"
+    echo "Assets on draft: $ASSETS_JSON"
+    MISSING=1
+  fi
+done
+if [ "$MISSING" = "1" ]; then
+  echo "ERROR: Draft release verification failed — deleting draft $TAG."
+  gh release delete "$TAG" --repo "$RELEASE_REPO" --yes 2>/dev/null || true
+  exit 1
+fi
+echo "==> Asset verification passed."
+
+# Undraft (publish) the release
+gh release edit "$TAG" --repo "$RELEASE_REPO" --draft=false --latest
+echo "==> Published $TAG (undrafted)."
+
+# Post-publish verifier — same logic as scripts/verify-published.sh
+VERIFY_SCRIPT="$ROOT/scripts/verify-published.sh"
+if [ -f "$VERIFY_SCRIPT" ]; then
+  echo "==> Running post-publish verifier..."
+  "$VERIFY_SCRIPT" "$TAG" "$CHANNEL" || {
+    echo "ERROR: Post-publish verification failed for $TAG."
+    exit 1
+  }
+else
+  echo "==> WARNING: scripts/verify-published.sh not found — skipping post-publish verification."
+fi
+
+echo "✅ Published and verified $TAG."
 echo "   Manifest: https://github.com/$RELEASE_REPO/releases/latest/download/${MANIFEST_NAME}"
-[ -n "$WIN_EXE" ] || echo "   Windows clients: NOT served by this release (see the warning above)."
+[ -n "$WIN_EXE" ] || echo "   Windows clients: NOT served by this release (see --allow-macos-only)."

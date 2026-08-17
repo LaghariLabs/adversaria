@@ -1,6 +1,7 @@
 """Tests for speaker-labeled transcript merging and turn building."""
 
 from src.transcriber import (
+    TURN_SPLIT_MAX_CHARS,
     build_labeled_turns,
     build_single_file_turns,
     merge_labeled_segments,
@@ -107,6 +108,47 @@ class TestBuildLabeledTurns:
         turns = build_labeled_turns(system, [])
         assert len(turns) == 1
         assert turns[0].text == "Real."
+
+    def test_same_speaker_split_on_silence_gap(self):
+        system = [
+            (0.0, 2.0, "Before the pause."),
+            (6.0, 8.0, "After the pause."),
+        ]
+        turns = build_labeled_turns(system, [])
+        assert len(turns) == 2
+        assert turns[0].speaker == "Them"
+        assert turns[0].start == 0.0
+        assert turns[0].end == 2.0
+        assert turns[1].speaker == "Them"
+        assert turns[1].start == 6.0
+        assert turns[1].end == 8.0
+
+    def test_same_speaker_split_on_length(self):
+        texts = [f"Segment {i}: " + "x" * 70 for i in range(10)]
+        system = [
+            (float(i * 2), float(i * 2) + 1.5, text)
+            for i, text in enumerate(texts)
+        ]
+        turns = build_labeled_turns(system, [])
+        assert len(turns) > 1
+        assert all(turn.speaker == "Them" for turn in turns)
+        assert all(len(turn.text) < TURN_SPLIT_MAX_CHARS + 100 for turn in turns)
+        assert " ".join(turn.text for turn in turns) == " ".join(texts)
+
+    def test_no_split_under_thresholds(self):
+        system = [(0.0, 2.0, "First."), (3.0, 5.0, "Second.")]
+        turns = build_labeled_turns(system, [])
+        assert len(turns) == 1
+
+    def test_flat_text_matches_turns_after_split(self):
+        system = [
+            (0.0, 2.0, "Before the pause."),
+            (6.0, 8.0, "After the pause."),
+        ]
+        text = merge_labeled_segments(system, [])
+        turns = build_labeled_turns(system, [])
+        rendered = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
+        assert text == rendered
 
 
 class TestBuildSingleFileTurns:

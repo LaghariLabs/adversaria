@@ -102,7 +102,28 @@ jobs:
       - name: Smoke the frozen ML service
         working-directory: python-service
         shell: pwsh
+        env:
+          # Transcribe the smoke fixture with `tiny` on CPU int8: the gate proves
+          # the frozen stack can decode and transcribe, not that a particular
+          # model is accurate, and the shipped default (large-v3-turbo, ~1.6 GB)
+          # would cost minutes of runner time per build. `tiny` is not in the
+          # curated registry, so it passes straight through to faster-whisper
+          # (src/transcriber.py::WhisperTranscriber.__init__). Setting
+          # WHISPER_MODEL also puts _init_transcriber on its env-override path,
+          # which skips the "is a curated model downloaded?" gate.
+          WHISPER_MODEL: tiny
+          WHISPER_DEVICE: cpu
+          WHISPER_COMPUTE_TYPE: int8
+          # hf_hub's tqdm bars go to stderr; silencing them keeps the CI log
+          # readable and keeps pwsh from having to reason about native stderr.
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
         run: |
+          # faster-whisper loads with `local_files_only=True` (downloads are
+          # reserved for the app's pinned model_setup pipeline), so the weights
+          # must already be in the HF cache before the service starts. ~75 MB.
+          Write-Host 'Fetching the smoke Whisper model (Systran/faster-whisper-tiny)...'
+          uv run --frozen python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-tiny')"
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch the smoke Whisper model." }
           $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
           $listener.Start()
           $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
@@ -154,6 +175,46 @@ jobs:
               } catch { $listening = $false }
               throw "Frozen service did not answer /health within $([int]$budget.TotalMinutes) minutes. TCP port open: $listening. Last error: $lastError"
             }
+
+            # Answering /health is not the same as being able to transcribe: the
+            # service binds its port while the transcriber is still loading, and
+            # /transcribe 503s ("transcriber_loading") in that window. Wait for
+            # transcriber_state=ready; `missing`/`error` are terminal, so fail on
+            # them at once instead of burning the whole budget.
+            $loadBudget = [TimeSpan]::FromMinutes(5)
+            $loadDeadline = [Diagnostics.Stopwatch]::StartNew()
+            while ($health.transcriber_state -ne 'ready' -and $loadDeadline.Elapsed -lt $loadBudget) {
+              if ($service.HasExited) {
+                throw "Frozen service exited while loading the transcriber (exit code $($service.ExitCode))."
+              }
+              if ($health.transcriber_state -eq 'missing' -or $health.transcriber_state -eq 'error') {
+                throw "Frozen service transcriber_state=$($health.transcriber_state): $($health.transcriber_detail)"
+              }
+              Start-Sleep -Seconds 5
+              try { $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 5 } catch {}
+            }
+            if ($health.transcriber_state -ne 'ready') {
+              throw "Frozen service transcriber never reached 'ready' within $([int]$loadBudget.TotalMinutes) minutes (last state: $($health.transcriber_state))."
+            }
+            Write-Host "Transcriber ready after $([int]$loadDeadline.Elapsed.TotalSeconds)s (model $($health.whisper_model))"
+
+            # The real gate: a frozen build that boots but cannot transcribe is
+            # not a release candidate. /transcribe takes JSON with an on-disk
+            # path — the service and the app are on the same machine, so audio is
+            # never uploaded (src/server.py::transcribe, src/models.py
+            # ::TranscribeRequest). It is NOT a multipart upload. ConvertTo-Json
+            # (not string interpolation) is what escapes the Windows backslashes
+            # in the path.
+            $wav = Join-Path $PWD 'tests\fixtures\sample-5s.wav'
+            if (-not (Test-Path $wav)) { throw "Smoke fixture missing from the checkout: $wav" }
+            $body = @{ audio_path = "$wav"; diarize = $false } | ConvertTo-Json -Compress
+            $result = Invoke-RestMethod -Uri "http://127.0.0.1:$port/transcribe" `
+              -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 600
+            $text = ("$($result.text)").Trim()
+            if ($text.Length -lt 10) {
+              throw "Frozen service /transcribe returned no usable text: $($result | ConvertTo-Json -Compress)"
+            }
+            Write-Host "Frozen service /transcribe: $text"
           } finally {
             if (-not $service.HasExited) { Stop-Process -Id $service.Id -Force }
             Write-Host '--- service stdout ---'
@@ -196,13 +257,17 @@ jobs:
           # collect belongs to `"v1Compatible"` and is never produced here —
           # the .sig that scripts/publish-release.sh needs for the
           # windows-x86_64 manifest entry was silently not being uploaded
-          # (2026-08-03). The .sig only exists when this repo holds the signing
-          # key, so `warn` — NOT `error`: keyless runs legitimately produce the
-          # exe alone, and the release machine can sign it afterwards with
-          # `npx tauri signer sign <exe>` using the same key the app pins.
-          # (The build step above already fails if no installer was produced.)
+          # (2026-08-03).
+          # `error`, not `warn`: publish-release.sh cannot write that manifest
+          # entry without the .sig, so a candidate missing it must fail here
+          # rather than at publish time. The tradeoff is that a keyless run —
+          # no TAURI_SIGNING_PRIVATE_KEY in secrets, which produces the exe
+          # alone — now fails this step; sign the exe with
+          # `npx tauri signer sign <exe>` and re-upload, using the same key the
+          # app pins. (The build step above already fails if no installer was
+          # produced.)
           path: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/*-setup.exe.sig
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14

@@ -5,6 +5,122 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.79] - 2026-08-17
+
+### Fixed
+- **System audio records reliably again after updating.** macOS never shows
+  its "System Audio Recording" consent to an app that already holds Screen
+  Recording, so on updated installs meetings silently captured only the
+  microphone and then failed at stop. Adversaria now proves it can hear
+  system audio by playing a brief, near-silent tone and listening for it —
+  and when macOS is in the way, tells you exactly what to enable in System
+  Settings, with a button that takes you there.
+- **A meeting with no system audio is no longer lost.** If only your
+  microphone was captured, the meeting is kept, labeled honestly with every
+  line as you, and transcribes normally — instead of erroring and stranding
+  the recording.
+- A transcription model that isn't downloaded yet no longer claims to be
+  "in use" — it now says "will be used once downloaded".
+
+### Added
+- **Permissions, visible in Settings.** Settings → Setup status now shows
+  Microphone and System audio with their real states, a one-click check,
+  and a direct jump to the right System Settings pane.
+- The setup wizard now checks the permission recording actually uses
+  (System Audio Recording) instead of requesting Screen Recording — the
+  scariest macOS prompt is gone from onboarding.
+
+### Changed
+- Only one copy of Adversaria runs at a time: launching it again focuses
+  the existing window. (Previously a stale copy could keep running through
+  an update and cause confusing permission behavior.)
+
+## [0.3.78] - 2026-08-14
+
+### Added
+- **Themes.** Settings → General → Appearance: Dark (default), Light, Cream,
+  Navy, **Laghari Labs** (the company's arcade identity — cream, ink, pixel
+  display type), or System (follows macOS). Changes preview live, every
+  surface follows — including the recording view — and tags, category
+  pills, and buttons stay legible in every theme.
+- **A third transcription engine: Cohere Transcribe 2B.** The accuracy pick
+  (14 languages) for single-language meetings — the meeting's language is
+  detected automatically. Honest ~2.7 GB download from the same picker.
+- **Fix this word.** Select a misheard term in the transcript ("cloud
+  code"), click Fix this word, type the correction ("Claude Code") — every
+  mention in the transcript and notes updates, and the term joins your
+  dictionary so future meetings hear it right. Tip: phrases beat single
+  words for names that sound like real words.
+
+### Fixed
+- **Model downloads for the new engines actually download** (they could
+  fail before a byte moved), with accurate size labels.
+- **Buttons look like one family** — consistent size, shape, and type
+  across the app, with visible keyboard focus.
+- **Model names in Settings** no longer dwarf their rows.
+
+## [0.3.77] - 2026-08-14
+
+### Added
+- **A second on-device transcription engine: Qwen3-ASR.** Pick it in
+  Settings → Transcription like any model (0.6B ~1.2 GB or 1.7B ~3.4 GB) —
+  52 languages including Arabic, automatic language detection, very fast on
+  Apple Silicon, and it uses your dictionary to spell names and terms right.
+  Whisper remains the default; nothing changes unless you switch.
+- **Notes in the world's top languages.** Settings → General (and each
+  meeting's regenerate control) now offers English, العربية, 中文, हिन्दी,
+  Español, Français, বাংলা, Português, Русский, اردو — or "Match spoken".
+- **Rename a person everywhere.** Click an attendee's name to fix a misheard
+  spelling; the correction flows through the transcript, notes, and to-dos,
+  and the right spelling is added to your dictionary for future meetings.
+- **Copy the transcript.** The Transcript tab has a Copy button producing
+  clean "[00:00] Name: …" lines.
+- **Re-download a broken model.** If a downloaded model ever gets corrupted
+  on disk, its row in Settings → Transcription can now delete and re-fetch
+  it.
+
+### Fixed
+- **Recording no longer disturbs protected video.** System audio is now
+  captured with a Core Audio process tap instead of a screen-capture
+  session, so DRM-protected players (course sites, streaming) keep playing
+  while you record. macOS shows its purple system-audio indicator while
+  recording — that's expected. Capture no longer *requires* the Screen
+  Recording permission (the old prompt disappears fully in an upcoming
+  release).
+- **Transcripts read like conversations again.** Long stretches by one
+  speaker are split into readable paragraphs (new recordings and your
+  existing meetings alike) instead of one wall of text.
+- **Notes actually come out in the language you pick.** Choosing Español or
+  another Latin-script language no longer falls back to English headings.
+- **Summary sections sit in cards** instead of floating on the page
+  background.
+- **Field diagnostics reach the log file**, so support can actually see
+  what happened.
+
+## [0.3.76] - 2026-08-11
+
+### Added
+- **A dead local AI service now explains itself.** If the on-device service
+  can't start, the app shows the actual reason — instead of a bare "Local AI
+  is not reachable" — so you (or a support reply) can fix it in one step.
+- **Diagnostics you can trust.** Settings → Export diagnostics now produces a
+  genuinely useful, privacy-redacted report: real memory facts, service
+  status and log tail, permission states — and never your transcripts,
+  titles, audio, or keys.
+
+### Fixed
+- **Notes now work with whatever model you choose — Qwen, Gemma, or any new
+  reasoning model.** The app sizes the model's working memory to your meeting
+  and your machine automatically, no settings involved; models that think
+  before answering are handled; and if a model returns a cut-off or oddly
+  wrapped answer, the app repairs it into a proper note instead of showing
+  raw text. Error messages now say what actually went wrong.
+- **A stuck model download can recover.** Interrupted downloads no longer
+  wedge; the download can reset and retry cleanly.
+- **Honest offline states in Settings.** When the local AI service is down,
+  the transcription section says so and explains what to do — download
+  buttons no longer silently do nothing.
+
 ## [0.3.75] - 2026-08-07
 
 ### Added

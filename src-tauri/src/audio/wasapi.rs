@@ -322,8 +322,8 @@ fn capture_wasapi(
         // system stream relative to the mic one. Left uncorrected the two
         // spooled streams drift apart, and because `build_labeled_turns`
         // interleaves them by timestamp, every later "Them" turn is placed
-        // earlier than it was actually spoken. ScreenCaptureKit pads silence
-        // for us on macOS, which is why this has no counterpart there.
+        // earlier than it was actually spoken. The Core Audio process tap pads
+        // silence for us on macOS, which is why this has no counterpart there.
         //
         // So for loopback only, top the stream up with the silence the device
         // declined to give us, keeping it aligned to wall clock.

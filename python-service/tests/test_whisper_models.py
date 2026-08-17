@@ -48,8 +48,12 @@ def test_backend_default_key(backend: str) -> None:
 
 
 def test_registry_weights_match_the_backend(backend: str) -> None:
-    """MLX and CTranslate2 weights are not interchangeable in either direction."""
-    repos = [entry["repo"] for entry in active_whisper_models().values()]
+    """Backend-specific weights stay compatible; sherpa models are neutral."""
+    repos = [
+        entry["repo"]
+        for entry in active_whisper_models().values()
+        if entry.get("engine", "whisper") != "cohere"
+    ]
     if backend == "mlx":
         assert all(repo.startswith("mlx-community/") for repo in repos)
     else:
@@ -77,7 +81,7 @@ def test_list_whisper_models_schema(backend: str) -> None:
     models = list_whisper_models()
     assert len(models) >= 2
     for entry in models:
-        assert set(entry.keys()) == {"key", "label", "size", "downloaded"}
+        assert set(entry.keys()) == {"key", "label", "size", "engine", "downloaded"}
         assert isinstance(entry["downloaded"], bool)
         assert entry["key"] in active_whisper_models()
 

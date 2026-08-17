@@ -146,6 +146,34 @@ describe("Welcome", () => {
     expect(downloadsStarted).toEqual([]);
   });
 
+  it("probes system audio and shows the denied recovery actions", async () => {
+    let probed = 0;
+    mockIPC((command) => {
+      if (command === "get_config") return appConfig();
+      if (command === "get_registration_state") return registration("submitted");
+      if (command === "get_setup_status") return setup();
+      if (command === "get_onboarding_state") return onboarding(["registration"]);
+      if (command === "check_capture_permissions") {
+        return { microphone: "granted", system_audio: "undetermined" };
+      }
+      if (command === "probe_system_audio") {
+        probed += 1;
+        return { microphone: "granted", system_audio: "denied" };
+      }
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(<Welcome />);
+    await user.click(await screen.findByRole("button", { name: "Check system audio" }));
+
+    await waitFor(() => expect(probed).toBe(1));
+    expect(screen.getByText(/macOS didn't let Adversaria hear system audio/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open System Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue anyway" })).toBeInTheDocument();
+  });
+
   it("finishes from the final screen with NO model chosen and persists the reminder toggle", async () => {
     let current: OnboardingState = onboarding(["registration", "permissions"]);
     let savedReminder: boolean | null = null;

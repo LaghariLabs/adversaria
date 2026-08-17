@@ -38,7 +38,27 @@ pub mod tray;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                match window.is_visible() {
+                    Ok(false) => {
+                        if let Err(error) = window.show() {
+                            eprintln!("[single-instance] couldn't show main window: {error}");
+                        }
+                    }
+                    Ok(true) => {}
+                    Err(error) => {
+                        eprintln!("[single-instance] couldn't inspect main window: {error}")
+                    }
+                }
+                if let Err(error) = window.set_focus() {
+                    eprintln!("[single-instance] couldn't focus main window: {error}");
+                }
+            } else {
+                eprintln!("[single-instance] main window is not available");
+            }
+        }));
     #[cfg(feature = "wdio")]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
@@ -253,6 +273,7 @@ pub fn run() {
             commands::import_all_meetings,
             commands::get_meeting_graph,
             commands::merge_meeting_speakers,
+            commands::rename_meeting_person,
             commands::update_meeting_link,
             commands::export_second_brain,
             commands::get_meetings,
@@ -279,6 +300,7 @@ pub fn run() {
             commands::get_engine_install_plan,
             commands::install_local_engine,
             commands::start_model_download,
+            commands::reset_model_download,
             commands::get_model_download_status,
             commands::get_managed_llm_status,
             commands::start_managed_llm,
@@ -302,9 +324,8 @@ pub fn run() {
             commands::calendar_macos_enable,
             commands::check_capture_permissions,
             commands::request_microphone_permission,
-            commands::request_screen_permission,
+            commands::probe_system_audio,
             commands::open_privacy_settings,
-            commands::relaunch_for_permissions,
             commands::calendar_macos_status,
             commands::get_meeting_stats,
             commands::get_person,
