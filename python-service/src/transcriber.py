@@ -66,6 +66,24 @@ _MLX_WHISPER_MODELS: dict[str, dict] = {
         "label": "Large v3 Turbo (4-bit) — smallest & fastest",
         "size": "~0.5 GB",
     },
+    "qwen3-asr-0.6b": {
+        "repo": "mlx-community/Qwen3-ASR-0.6B-bf16",
+        "label": "Qwen3-ASR 0.6B — 52 languages incl. Arabic, auto-detects, fastest",
+        "size": "~1.2 GB",
+        "engine": "qwen3-asr",
+    },
+    "qwen3-asr-1.7b": {
+        "repo": "mlx-community/Qwen3-ASR-1.7B-bf16",
+        "label": "Qwen3-ASR 1.7B — 52 languages, best quality",
+        "size": "~3.4 GB",
+        "engine": "qwen3-asr",
+    },
+    "cohere-transcribe-2b": {
+        "repo": "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+        "label": "Cohere Transcribe 2B — highest accuracy, 14 languages, single-language meetings",
+        "size": "~2.7 GB",
+        "engine": "cohere",
+    },
 }
 
 #: CTranslate2 (faster-whisper) weights — Windows, Linux, and Intel Macs.
@@ -83,12 +101,22 @@ _CT2_WHISPER_MODELS: dict[str, dict] = {
         "label": "Large v3 Turbo — faster, near-large quality",
         "size": "~1.6 GB",
     },
+    "cohere-transcribe-2b": {
+        "repo": "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+        "label": "Cohere Transcribe 2B — highest accuracy, 14 languages, single-language meetings",
+        "size": "~2.7 GB",
+        "engine": "cohere",
+    },
 }
 
 #: Keys the CT2 registry does not carry, mapped to their nearest equivalent so a
 #: config written on a Mac resolves to a sensible model instead of silently
 #: snapping back to the (much larger) default.
-_CT2_KEY_ALIASES: dict[str, str] = {"large-v3-turbo-q4": "large-v3-turbo"}
+_CT2_KEY_ALIASES: dict[str, str] = {
+    "large-v3-turbo-q4": "large-v3-turbo",
+    "qwen3-asr-0.6b": "large-v3-turbo",
+    "qwen3-asr-1.7b": "large-v3-turbo",
+}
 
 DEFAULT_WHISPER_MODEL = "large-v3"
 
@@ -143,6 +171,12 @@ def whisper_repo_for(key: str | None) -> str:
     return entry["repo"]
 
 
+def whisper_engine_for(key: str | None) -> str:
+    """Return the request-time engine for a model key on this backend."""
+    entry = active_whisper_models().get((key or "").strip(), {})
+    return entry.get("engine", "whisper")
+
+
 def _hf_cache_root() -> Path:
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -158,7 +192,26 @@ def _hf_cache_root() -> Path:
 #: Weight files that prove a whisper snapshot is actually usable, per backend:
 #: CT2 ships `model.bin`, MLX ships `weights.npz` (older) or `.safetensors`.
 _WEIGHT_NAMES = ("model.bin", "weights.npz")
-_WEIGHT_SUFFIXES = (".safetensors", ".gguf")
+_WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".onnx", ".data")
+
+# The encoder graph stores its tensors in the adjacent .data file. Requiring
+# the complete export prevents a partially downloaded HF snapshot (for example,
+# only the small encoder graph) from being advertised as ready.
+_COHERE_MODEL_FILES = (
+    "encoder.int8.onnx",
+    "encoder.int8.onnx.data",
+    "decoder.int8.onnx",
+    "tokens.txt",
+)
+
+
+def _repo_engine(repo: str) -> str:
+    """Return the registered engine for *repo*, or ``whisper`` if unknown."""
+    for registry in (_MLX_WHISPER_MODELS, _CT2_WHISPER_MODELS):
+        for entry in registry.values():
+            if entry["repo"] == repo:
+                return entry.get("engine", "whisper")
+    return "whisper"
 
 
 def whisper_model_is_cached(repo: str) -> bool:
@@ -178,6 +231,10 @@ def whisper_model_is_cached(repo: str) -> bool:
     for revision in snap.iterdir():
         if not revision.is_dir():
             continue
+        if _repo_engine(repo) == "cohere":
+            if all((revision / name).is_file() for name in _COHERE_MODEL_FILES):
+                return True
+            continue
         for file in revision.iterdir():
             if file.name in _WEIGHT_NAMES or file.name.endswith(_WEIGHT_SUFFIXES):
                 return True
@@ -191,6 +248,7 @@ def list_whisper_models() -> list[dict]:
             "key": key,
             "label": entry["label"],
             "size": entry["size"],
+            "engine": entry.get("engine", "whisper"),
             "downloaded": whisper_model_is_cached(entry["repo"]),
         }
         for key, entry in active_whisper_models().items()
@@ -204,6 +262,13 @@ def download_whisper_model(key: str) -> None:
     snapshot_download(whisper_repo_for(key))
 
 
+# A silence this long between same-speaker segments is a paragraph break.
+TURN_SPLIT_GAP_SECONDS = 3.0
+# Flush a same-speaker turn at the next segment boundary once it reaches this
+# size — a 20-minute monologue must not render as one wall-of-text paragraph.
+TURN_SPLIT_MAX_CHARS = 600
+
+
 def build_labeled_turns(
     system_segments: list[Segment],
     mic_segments: list[Segment],
@@ -215,7 +280,8 @@ def build_labeled_turns(
     structured :class:`TranscriptTurn` objects instead of flat text.  Each
     turn's ``start`` is the first joined segment's start, ``end`` is the max
     end across the joined segments, ``speaker`` is the label, and ``text`` is
-    the whitespace-joined segment text.
+    the whitespace-joined segment text. Long same-speaker runs split at silence
+    gaps or the next segment boundary after reaching the size limit.
     """
     if system_labels is not None:
         labeled: list[tuple[float, float, str, str]] = [
@@ -236,7 +302,10 @@ def build_labeled_turns(
         cleaned = text.strip()
         if not cleaned:
             continue
-        if speaker != current_speaker:
+        same = speaker == current_speaker
+        split_gap = same and current_parts and (start - current_end) > TURN_SPLIT_GAP_SECONDS
+        split_len = same and current_parts and len(" ".join(current_parts)) >= TURN_SPLIT_MAX_CHARS
+        if not same or split_gap or split_len:
             if current_parts:
                 turns.append(
                     TranscriptTurn(
@@ -929,7 +998,7 @@ def _write_wav_chunks(
 
 
 def transcribe_cloud(
-    audio_path: str,
+    audio_path: str | None,
     mic_audio_path: str | None,
     base_url: str,
     api_key: str,
@@ -988,17 +1057,61 @@ def transcribe_cloud(
                 segs.extend((start + offset, end + offset, txt) for start, end, txt in _upload(cpath))
         return segs, len(samples) / _CLOUD_TARGET_RATE
 
-    system_segments, duration = _channel(audio_path)
+    system_segments: list[Segment] = []
+    system_duration = 0.0
+    if audio_path:
+        system_segments, system_duration = _channel(audio_path)
     mic_segments: list[Segment] = []
-    if mic_audio_path and Path(mic_audio_path).exists():
-        try:
-            mic_segments, _ = _channel(mic_audio_path)
-        except Exception as exc:  # mic is best-effort, never break the meeting
-            logger.warning("Cloud mic transcription failed (%s); system audio only.", exc)
+    mic_duration = 0.0
+    if mic_audio_path:
+        if not Path(mic_audio_path).exists() and audio_path is None:
+            raise FileNotFoundError(f"Audio file not found: {mic_audio_path}")
+        if Path(mic_audio_path).exists():
+            try:
+                mic_segments, mic_duration = _channel(mic_audio_path)
+            except Exception as exc:
+                if audio_path is None:
+                    raise
+                # The mic is best-effort when system audio remains available.
+                logger.warning("Cloud mic transcription failed (%s); system audio only.", exc)
 
     turns = build_labeled_turns(system_segments, mic_segments)
     text = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
-    return TranscribeResponse(text=text, language="", duration_seconds=duration, turns=turns)
+    return TranscribeResponse(
+        text=text,
+        language="",
+        duration_seconds=max(system_duration, mic_duration),
+        turns=turns,
+    )
+
+
+def label_mic_only(result: TranscribeResponse) -> TranscribeResponse:
+    """Turn an ordinary single-file transcription into the mic side of a meeting."""
+    turns = [
+        TranscriptTurn(
+            speaker="Me",
+            text=turn.text,
+            start=turn.start,
+            end=turn.end,
+        )
+        for turn in result.turns
+    ]
+    if not turns and result.text.strip():
+        turns = [
+            TranscriptTurn(
+                speaker="Me",
+                text=result.text.strip(),
+                start=0.0,
+                end=result.duration_seconds,
+            )
+        ]
+    return TranscribeResponse(
+        text="\n".join(f"{turn.speaker}: {turn.text}" for turn in turns),
+        language=result.language,
+        duration_seconds=result.duration_seconds,
+        category_hint=result.category_hint,
+        turns=turns,
+    )
 
 
 def relabel_me(text: str, me_label: str | None) -> str:
@@ -1576,6 +1689,296 @@ class MlxWhisperTranscriber:
             "Transcribing dual audio (MLX): system=%s mic=%s", audio_path, mic_audio_path
         )
         return _merge_dual(self._collect_segments, audio_path, mic_audio_path, diarize, initial_prompt=self.initial_prompt)
+
+
+# Qwen3-ASR emits no segment timestamps in the MLX runtime (spike 2026-08-12),
+# so timestamps are derived by transcribing fixed windows and stamping each
+# window's offset — the same technique transcribe_cloud uses for chunk offsets.
+# Coarser turns than Whisper's, but the Me/Them interleave stays correct.
+QWEN_WINDOW_SECONDS = 30.0
+
+
+def decode_first_asr_window(path: str) -> Path:
+    """Decode at most the first ASR window to a temporary mono 16 kHz WAV.
+
+    Used by Cohere routing for a cheap Whisper language-detection pass. The
+    caller owns the returned file and must unlink it.
+    """
+    samples = _decode_to_mono16k(path)
+    samples = samples[: int(QWEN_WINDOW_SECONDS * _CLOUD_TARGET_RATE)]
+    if samples.size == 0:
+        raise ValueError(f"Could not decode audio from {path} for language detection.")
+
+    import wave
+
+    fd, name = tempfile.mkstemp(suffix=".wav", prefix="mnt_language_")
+    os.close(fd)
+    with wave.open(name, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(_CLOUD_TARGET_RATE)
+        wav.writeframes(samples.tobytes())
+    return Path(name)
+
+
+class Qwen3AsrTranscriber:
+    """Transcribes audio with Qwen3-ASR on the Apple-Silicon GPU."""
+
+    def __init__(self, model_repo: str) -> None:
+        # Imported lazily so the module loads on platforms without it; this
+        # backend is only constructed on Apple Silicon.
+        import qwen3_asr_mlx  # noqa: F401
+
+        self.model_repo = model_repo
+        self.model_size = model_repo
+        self.device = "mlx"
+        self.initial_prompt: str | None = None
+        self._model = None
+
+    def _load_model(self):
+        """Load this repo once; request routing reuses the cached instance."""
+        if self._model is None:
+            from qwen3_asr_mlx import Qwen3ASR
+
+            self._model = Qwen3ASR.from_pretrained(self.model_repo)
+        return self._model
+
+    def _collect_segments(self, audio_path: str) -> tuple[list[Segment], _TranscriptInfo]:
+        """Transcribe fixed windows and derive coarse timestamps from offsets."""
+        import numpy as np
+
+        samples = _decode_to_mono16k(audio_path)
+        if samples.size == 0:
+            return [], _TranscriptInfo(language="", duration=0.0)
+
+        audio = samples.astype(np.float32) / 32768.0
+        duration = len(samples) / _CLOUD_TARGET_RATE
+        window_samples = int(QWEN_WINDOW_SECONDS * _CLOUD_TARGET_RATE)
+        model = self._load_model()
+        segments: list[Segment] = []
+        language = ""
+        window_count = 0
+
+        for start in range(0, len(audio), window_samples):
+            window_count += 1
+            window_audio = audio[start : start + window_samples]
+            if self.initial_prompt:
+                result = model.transcribe(window_audio, context=self.initial_prompt)
+            else:
+                result = model.transcribe(window_audio)
+            if not language and result.language:
+                language = result.language
+            text = result.text.strip()
+            if not text:
+                continue
+            offset = start / _CLOUD_TARGET_RATE
+            segments.append(
+                (
+                    offset,
+                    min(offset + QWEN_WINDOW_SECONDS, duration),
+                    text,
+                )
+            )
+
+        info = _TranscriptInfo(language=language, duration=duration)
+        logger.info(
+            "Qwen3-ASR transcription complete: language=%s duration=%.1fs "
+            "segments=%d windows=%d",
+            info.language,
+            info.duration,
+            len(segments),
+            window_count,
+        )
+        return segments, info
+
+    def transcribe(self, audio_path: str) -> TranscribeResponse:
+        """Transcribe a single audio file from disk."""
+        if not Path(audio_path).exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        logger.info("Transcribing audio file (Qwen3-ASR): %s", audio_path)
+        segments, info = self._collect_segments(audio_path)
+        text = " ".join(t for _, _, t in segments).strip()
+        turns = build_single_file_turns(segments)
+        return TranscribeResponse(
+            text=text, language=info.language, duration_seconds=info.duration, turns=turns
+        )
+
+    def transcribe_dual(
+        self, audio_path: str, mic_audio_path: str, diarize: bool = True
+    ) -> TranscribeResponse:
+        """Transcribe a system-audio file and a mic file into a labeled transcript."""
+        logger.info(
+            "Transcribing dual audio (Qwen3-ASR): system=%s mic=%s",
+            audio_path,
+            mic_audio_path,
+        )
+        return _merge_dual(
+            self._collect_segments,
+            audio_path,
+            mic_audio_path,
+            diarize,
+            initial_prompt=self.initial_prompt,
+        )
+
+
+_QWEN_TRANSCRIBERS: dict[str, "Qwen3AsrTranscriber"] = {}
+
+
+def get_qwen_transcriber(repo: str) -> "Qwen3AsrTranscriber":
+    """Cached per-repo instance. Raises RuntimeError if the snapshot is not
+    in the HF cache — downloads are sanctioned exclusively through the pinned
+    model_setup pipeline; from_pretrained would silently fetch gigabytes."""
+    if not whisper_model_is_cached(repo):
+        raise RuntimeError(f"Qwen3-ASR model {repo} is not downloaded")
+    transcriber = _QWEN_TRANSCRIBERS.get(repo)
+    if transcriber is None:
+        transcriber = Qwen3AsrTranscriber(repo)
+        _QWEN_TRANSCRIBERS[repo] = transcriber
+    return transcriber
+
+
+class CohereTranscriber:
+    """Transcribes fixed audio windows with sherpa-onnx Cohere Transcribe."""
+
+    def __init__(self, model_repo: str) -> None:
+        # Lazy and platform-neutral: sherpa-onnx is also used this way by the
+        # diarizer, including on the Windows/faster-whisper service path.
+        import sherpa_onnx
+
+        self._sherpa_onnx = sherpa_onnx
+        self.model_repo = model_repo
+        self.model_size = model_repo
+        self.device = "cpu"
+        self.language: str = "en"
+        # The Cohere factory has no context parameter; correction is post-hoc.
+        self.initial_prompt: str | None = None
+
+    def _snapshot_path(self) -> Path:
+        """Return a complete local HF snapshot without attempting a download."""
+        snapshots = (
+            _hf_cache_root()
+            / ("models--" + self.model_repo.replace("/", "--"))
+            / "snapshots"
+        )
+        if snapshots.is_dir():
+            for revision in snapshots.iterdir():
+                if revision.is_dir() and all(
+                    (revision / name).is_file() for name in _COHERE_MODEL_FILES
+                ):
+                    return revision
+        raise RuntimeError(
+            f"Cohere Transcribe model {self.model_repo} is incomplete or not downloaded"
+        )
+
+    def _load_recognizer(self):
+        """Construct once per repo/language because sherpa binds the language."""
+        key = (self.model_repo, self.language)
+        recognizer = _COHERE_RECOGNIZERS.get(key)
+        if recognizer is None:
+            snapshot = self._snapshot_path()
+            recognizer = self._sherpa_onnx.OfflineRecognizer.from_cohere_transcribe(
+                encoder=str(snapshot / "encoder.int8.onnx"),
+                decoder=str(snapshot / "decoder.int8.onnx"),
+                tokens=str(snapshot / "tokens.txt"),
+                language=self.language,
+                num_threads=max(1, min(4, os.cpu_count() or 1)),
+            )
+            _COHERE_RECOGNIZERS[key] = recognizer
+        return recognizer
+
+    def _collect_segments(self, audio_path: str) -> tuple[list[Segment], _TranscriptInfo]:
+        """Transcribe fixed windows and derive coarse timestamps from offsets."""
+        import numpy as np
+
+        samples = _decode_to_mono16k(audio_path)
+        if samples.size == 0:
+            return [], _TranscriptInfo(language="", duration=0.0)
+
+        audio = samples.astype(np.float32) / 32768.0
+        duration = len(samples) / _CLOUD_TARGET_RATE
+        window_samples = int(QWEN_WINDOW_SECONDS * _CLOUD_TARGET_RATE)
+        recognizer = self._load_recognizer()
+        segments: list[Segment] = []
+        window_count = 0
+
+        for start in range(0, len(audio), window_samples):
+            window_count += 1
+            stream = recognizer.create_stream()
+            stream.accept_waveform(
+                _CLOUD_TARGET_RATE, audio[start : start + window_samples]
+            )
+            recognizer.decode_stream(stream)
+            text = stream.result.text.strip()
+            if not text:
+                continue
+            offset = start / _CLOUD_TARGET_RATE
+            segments.append(
+                (
+                    offset,
+                    min(offset + QWEN_WINDOW_SECONDS, duration),
+                    text,
+                )
+            )
+
+        info = _TranscriptInfo(language=self.language, duration=duration)
+        logger.info(
+            "Cohere transcription complete: language=%s duration=%.1fs "
+            "segments=%d windows=%d",
+            info.language,
+            info.duration,
+            len(segments),
+            window_count,
+        )
+        return segments, info
+
+    def transcribe(self, audio_path: str) -> TranscribeResponse:
+        """Transcribe a single audio file from disk."""
+        if not Path(audio_path).exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        logger.info("Transcribing audio file (Cohere): %s", audio_path)
+        segments, info = self._collect_segments(audio_path)
+        segments = strip_glossary_echo(segments, self.initial_prompt)
+        segments = apply_vocabulary_corrections(segments, self.initial_prompt)
+        text = " ".join(t for _, _, t in segments).strip()
+        turns = build_single_file_turns(segments)
+        return TranscribeResponse(
+            text=text,
+            language=info.language,
+            duration_seconds=info.duration,
+            turns=turns,
+        )
+
+    def transcribe_dual(
+        self, audio_path: str, mic_audio_path: str, diarize: bool = True
+    ) -> TranscribeResponse:
+        """Transcribe a system-audio file and a mic file into labeled turns."""
+        logger.info(
+            "Transcribing dual audio (Cohere): system=%s mic=%s",
+            audio_path,
+            mic_audio_path,
+        )
+        return _merge_dual(
+            self._collect_segments,
+            audio_path,
+            mic_audio_path,
+            diarize,
+            initial_prompt=self.initial_prompt,
+        )
+
+
+_COHERE_TRANSCRIBERS: dict[str, "CohereTranscriber"] = {}
+_COHERE_RECOGNIZERS: dict[tuple[str, str], object] = {}
+
+
+def get_cohere_transcriber(repo: str) -> "CohereTranscriber":
+    """Return a cached per-repo Cohere transcriber for a complete snapshot."""
+    if not whisper_model_is_cached(repo):
+        raise RuntimeError(f"Cohere Transcribe model {repo} is not downloaded")
+    transcriber = _COHERE_TRANSCRIBERS.get(repo)
+    if transcriber is None:
+        transcriber = CohereTranscriber(repo)
+        _COHERE_TRANSCRIBERS[repo] = transcriber
+    return transcriber
 
 
 def create_transcriber(model_key: str | None = None):

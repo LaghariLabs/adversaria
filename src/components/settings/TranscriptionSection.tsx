@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { open } from "@tauri-apps/plugin-shell";
 import { TriangleAlert } from "lucide-react";
 
@@ -6,6 +7,7 @@ import { classifyTranscriptionProvider } from "../../types";
 import type { ServiceHealth } from "../../hooks/useServiceHealth";
 import type { SettingsModels } from "../../hooks/useSettingsModels";
 import { aggregatePercent, formatGb, isInFlight, whisperModelId } from "../../lib/modelDownloads";
+import { resetModelDownload } from "../../lib/tauri";
 
 interface TranscriptionSectionProps {
   active: boolean;
@@ -31,12 +33,33 @@ export function TranscriptionSection({
   health,
   models,
 }: TranscriptionSectionProps) {
-  const { whisperModels, whisperMsg, setWhisperMsg, downloads, beginDownload, activateWhisperModel } =
+  const { setup, whisperModels, whisperMsg, setWhisperMsg, downloads, beginDownload, activateWhisperModel } =
     models;
+  const [redownloadArmed, setRedownloadArmed] = useState<string | null>(null);
 
   const downloadWhisper = async (key: string) => {
     setWhisperMsg("");
     await beginDownload(whisperModelId(key), setWhisperMsg);
+  };
+
+  const redownloadWhisper = async (key: string) => {
+    const id = whisperModelId(key);
+    if (redownloadArmed !== id) {
+      setRedownloadArmed(id);
+      window.setTimeout(
+        () => setRedownloadArmed((current) => (current === id ? null : current)),
+        5000,
+      );
+      return;
+    }
+    setRedownloadArmed(null);
+    setWhisperMsg("");
+    try {
+      await resetModelDownload(id, true);
+      await beginDownload(id, setWhisperMsg);
+    } catch (e) {
+      setWhisperMsg(String(e));
+    }
   };
 
   // The picker follows the SAVED provider, not "is a URL filled in" — a
@@ -212,13 +235,31 @@ export function TranscriptionSection({
         </>
       ) : (
         <div className="settings-form-group">
+          {active && health.healthStatus === "unreachable" && (
+            <div className="settings-note err">
+              <TriangleAlert size={14} aria-hidden="true" /> Local AI is offline — the app can&apos;t reach its on-device service.
+              {health.serviceRestartMessage ? ` ${health.serviceRestartMessage}` : ""}
+              <br />
+              <button className="btn-ghost" onClick={() => health.restartService()} disabled={health.serviceRestarting}>
+                {health.serviceRestarting ? "Restarting…" : "Restart Local AI"}
+              </button>
+              {" "}
+              {setup?.platform === "windows"
+                ? "If it was just installed, Windows Security may have quarantined it — check Protection history, allow adversaria-service.exe, then restart."
+                : "Check logs/adversaria-service.log via Settings, then restart."}
+            </div>
+          )}
+          {health.health?.transcriber_state === "error" && health.health?.transcriber_detail && (
+            <div className="settings-note err">{health.health.transcriber_detail}</div>
+          )}
           {transcriptionChip && (
             <p className={`settings-msg ${transcriptionChip.tone}`}>{transcriptionChip.text}</p>
           )}
           {whisperModels.length === 0 ? (
             <div className="settings-note info">
-              The list of transcription models isn't available yet — it appears once
+              The list of transcription models isn&apos;t available yet — it appears once
               the on-device service is running.
+              {health.healthStatus === "unreachable" && " Fix Local AI first."}
             </div>
           ) : (
             <div className="settings-model-list">
@@ -228,16 +269,22 @@ export function TranscriptionSection({
                 const running = status ? isInFlight(status) : false;
                 const percent = status ? aggregatePercent([status]) : null;
                 const isActive = model.key === config.whisper_model;
+                const downloaded = model.downloaded || status?.state === "ready";
                 return (
                   <div
                     key={model.key}
                     className={`settings-model-row${isActive ? " active" : ""}`}
                   >
                     <div className="settings-model-info">
-                      <span>{model.label}</span>
+                      <span className="settings-model-name">
+                        {model.label.split(" \u2014 ")[0]}
+                        {model.label.includes(" \u2014 ") && (
+                          <em>{" \u2014 "}{model.label.split(" \u2014 ").slice(1).join(" \u2014 ")}</em>
+                        )}
+                      </span>
                       <small>
-                        {model.downloaded ? "On this computer" : `${model.size} download`}
-                        {isActive ? " · in use" : ""}
+                        {downloaded ? "On this computer" : `${model.size} download`}
+                        {isActive ? (downloaded ? " · in use" : " · will be used once downloaded") : ""}
                       </small>
                       {running && status && (
                         <>
@@ -257,36 +304,67 @@ export function TranscriptionSection({
                         </>
                       )}
                       {status?.state === "error" && <small>{status.detail}</small>}
+                      {downloaded && redownloadArmed === id && (
+                        <small>
+                          Click again to delete and re-download — use when the model seems corrupt
+                        </small>
+                      )}
                     </div>
                     <div className="settings-model-action">
                       {running && status ? (
                         <span className="settings-model-dl">
                           {percent === null ? "Downloading…" : `Downloading ${percent}%`}
                         </span>
-                      ) : !model.downloaded ? (
+                      ) : !downloaded ? (
                         <button
                           type="button"
                           className="btn-ghost"
                           onClick={() => downloadWhisper(model.key)}
+                          disabled={health.healthStatus === "unreachable"}
+                          title={health.healthStatus === "unreachable" ? "Local AI offline — restart it first" : undefined}
                         >
                           {status?.state === "error" ? "Retry" : "Download"}
                         </button>
-                      ) : isActive ? (
-                        <span className="settings-model-inuse">In use</span>
                       ) : (
-                        <button
-                          type="button"
-                          className="btn-ghost"
-                          onClick={() => activateWhisperModel(model.key)}
-                        >
-                          Use this one
-                        </button>
+                        <>
+                          {isActive ? (
+                            <span className="settings-model-inuse">In use</span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn-ghost"
+                              onClick={() => activateWhisperModel(model.key)}
+                            >
+                              Use this one
+                            </button>
+                          )}
+                          {" "}
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            onClick={() => redownloadWhisper(model.key)}
+                            disabled={health.healthStatus === "unreachable"}
+                            title={
+                              health.healthStatus === "unreachable"
+                                ? "Local AI offline — restart it first"
+                                : "Delete the cached model and download it again"
+                            }
+                          >
+                            {redownloadArmed === id ? "Confirm re-download" : "Re-download"}
+                          </button>
+                        </>
                       )}
                     </div>
                   </div>
                 );
               })}
             </div>
+          )}
+          {health.healthStatus === "unreachable" && (
+            <p className="settings-help">
+              The local AI service isn&apos;t running — downloads need it. Start Adversaria&apos;s
+              service (it launches with the app) or restart the app.
+            </p>
           )}
           {whisperMsg && <p className="settings-msg err">{whisperMsg}</p>}
           <p className="settings-help">

@@ -1,16 +1,25 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-shell";
 
-import type { AppConfig } from "../../types";
+import type { AppConfig, AppTheme } from "../../types";
 import { exportRedactedDiagnostics } from "../../lib/tauri";
 import { DATE_FORMAT_OPTIONS, setDateFormat, formatDateTime } from "../../lib/dateFormat";
 
 /** Where beta sign-up + feedback emails are addressed. */
 const FEEDBACK_EMAIL = "mhlaghari@gmail.com";
+const THEME_PREVIEW_EVENT = "adversaria-theme-preview";
 
 const LANGUAGES: { value: string; label: string }[] = [
   { value: "en", label: "English" },
   { value: "ar", label: "العربية (Arabic)" },
+  { value: "zh", label: "中文" },
+  { value: "hi", label: "हिन्दी" },
+  { value: "es", label: "Español" },
+  { value: "fr", label: "Français" },
+  { value: "bn", label: "বাংলা" },
+  { value: "pt", label: "Português" },
+  { value: "ru", label: "Русский" },
+  { value: "ur", label: "اردو" },
   { value: "auto", label: "Match spoken language" },
 ];
 
@@ -140,6 +149,36 @@ export function GeneralSection({
         </p>
       </div>
 
+      {/* Appearance */}
+      <div className="settings-form-group">
+        <label className="settings-label" htmlFor="settings-theme">Appearance</label>
+        <select
+          id="settings-theme"
+          value={
+            config.theme === "light" ||
+            config.theme === "cream" ||
+            config.theme === "navy" ||
+            config.theme === "laghari" ||
+            config.theme === "system"
+              ? config.theme
+              : "dark"
+          }
+          onChange={(e) => {
+            const theme = e.target.value as AppTheme;
+            update({ theme });
+            window.dispatchEvent(new CustomEvent<string>(THEME_PREVIEW_EVENT, { detail: theme }));
+          }}
+          className="settings-select"
+        >
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+          <option value="cream">Cream</option>
+          <option value="navy">Navy</option>
+          <option value="laghari">Laghari Labs</option>
+          <option value="system">System</option>
+        </select>
+      </div>
+
       {/* ---- The meeting list ---- */}
       <h3 className="settings-card-title" style={{ marginTop: 18 }}>The meeting list</h3>
 
@@ -195,9 +234,10 @@ export function GeneralSection({
       <div className="settings-form-group">
         <h3 className="settings-card-title">Support diagnostics</h3>
         <p className="settings-card-desc">
-          Export a small local lifecycle log only when you choose. Email addresses,
-          filesystem paths, secrets, and meeting content are redacted; nothing is
-          uploaded automatically.
+          Export a diagnostics bundle only when you choose — app/OS/memory facts,
+          the local AI service's status and log tail, and your local event log.
+          Email addresses, filesystem paths, secrets, and meeting content are
+          redacted; nothing is uploaded automatically.
         </p>
         <button className="btn-secondary" disabled={diagBusy} onClick={handleDiagnosticExport}>
           Export redacted diagnostics…

@@ -48,18 +48,31 @@ from .transcriber import (
     WhisperTranscriber,
     active_whisper_models,
     create_transcriber,
+    decode_first_asr_window,
     decode_import_file,
     default_whisper_key,
     download_whisper_model,
+    get_cohere_transcriber,
+    get_qwen_transcriber,
     list_whisper_models,
+    label_mic_only,
     relabel_me,
     relabel_turns,
     transcribe_cloud,
     whisper_model_is_cached,
+    whisper_engine_for,
     whisper_repo_for,
 )
 from .config import save_prompt, delete_prompt
 from .embedder import OllamaEmbedder
+
+# uvicorn's --log-level flag configures only uvicorn's OWN loggers; the root
+# logger stays at WARNING, which silently swallowed every diagnostic
+# `logger.info` from src.* in the field — frozen sidecar and dev alike
+# (incl. the adaptive num_ctx line that exists precisely so a field problem
+# can be diagnosed without telemetry). basicConfig is a no-op when a root
+# handler already exists, so callers that configure logging are left alone.
+logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +203,8 @@ def _init_transcriber(wait: bool = False) -> None:
             cached = [
                 key
                 for key, entry in models.items()
-                if whisper_model_is_cached(entry["repo"])
+                if whisper_engine_for(key) == "whisper"
+                and whisper_model_is_cached(entry["repo"])
             ]
             if not cached:
                 _set_transcriber_state(
@@ -314,6 +328,19 @@ async def lifespan(app: FastAPI):
     global _transcriber, _live_transcriber, _summarizer, _embedder
     logger.info("Starting ML service lifespan...")
     logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_POLL_FILTER)
+    # Identify this process in the log the app ships with a diagnostics bundle.
+    # It deliberately does NOT go in service-crash.txt: that file is the death
+    # certificate and holds crash evidence only — writing a "starting" line
+    # there truncated the very traceback the app was about to show the user.
+    # The crash hook itself lives at the frozen entry point (run_service.py),
+    # where it also covers import-time deaths that never reach this lifespan.
+    logger.info(
+        "ML service %s starting: pid %d, exe %s, argv %s",
+        app.version,
+        os.getpid(),
+        sys.executable,
+        sys.argv,
+    )
     install_parent_guard()
     on_download_ready(_on_model_download_ready)
     threading.Thread(
@@ -546,6 +573,39 @@ def _require_transcriber() -> WhisperTranscriber | MlxWhisperTranscriber:
     raise HTTPException(status_code=503, detail={"code": code, "message": message})
 
 
+_COHERE_LANGUAGES = frozenset(
+    {"en", "fr", "de", "it", "es", "pt", "el", "nl", "pl", "zh", "ja", "ko", "vi", "ar"}
+)
+
+
+def _detect_cohere_language(
+    resident: WhisperTranscriber | MlxWhisperTranscriber | None,
+    audio_path: str,
+) -> str:
+    """Detect Cohere's required language from the first 30 seconds via Whisper."""
+    detected = "en"
+    via = "fallback"
+    if resident is None:
+        logger.info("Cohere language detection unavailable; using fallback en.")
+    else:
+        first_window = None
+        try:
+            first_window = decode_first_asr_window(audio_path)
+            language = (resident.transcribe(str(first_window)).language or "").strip()
+            if language:
+                detected = language.lower().replace("_", "-").split("-", 1)[0]
+                via = "whisper"
+            else:
+                logger.info("Cohere language detection returned empty; using fallback en.")
+        except Exception:
+            logger.info("Cohere language detection failed; using fallback en.")
+        finally:
+            if first_window is not None:
+                first_window.unlink(missing_ok=True)
+    logger.info("Cohere language: detected=%s via=%s", detected, via)
+    return detected
+
+
 @app.post("/transcribe", response_model=TranscribeResponse)
 def transcribe(request: TranscribeRequest) -> TranscribeResponse:
     """Transcribe an audio file on disk using faster-whisper.
@@ -556,15 +616,25 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
     state (initial_prompt, model_repo) and one GPU can't run two Whisper
     jobs anyway.
     """
-    if not request.audio_path.strip():
+    audio_path = request.audio_path.strip() if request.audio_path is not None else None
+    mic_audio_path = (
+        request.mic_audio_path.strip() if request.mic_audio_path is not None else None
+    )
+    if request.audio_path is not None and not audio_path:
         raise HTTPException(status_code=400, detail="audio_path is required")
+    if request.mic_audio_path is not None and not mic_audio_path:
+        raise HTTPException(status_code=400, detail="mic_audio_path is required")
 
     # Single-file import path: decode in-process, then transcribe as plain
     # single-track (no mic, no dual merge).
     if request.single_file:
+        if audio_path is None:
+            raise HTTPException(
+                status_code=400, detail="audio_path is required for a single-file import"
+            )
         t = _require_transcriber()
         try:
-            tmp_wav = decode_import_file(request.audio_path)
+            tmp_wav = decode_import_file(audio_path)
             try:
                 with _WHISPER_LOCK:
                     result = t.transcribe(str(tmp_wav))
@@ -589,8 +659,8 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
         try:
             logger.info("Transcribing via cloud endpoint: %s", cloud_url)
             result = transcribe_cloud(
-                request.audio_path,
-                request.mic_audio_path,
+                audio_path,
+                mic_audio_path,
                 base_url=cloud_url,
                 api_key=(request.transcription_api_key or "").strip(),
                 model=(request.transcription_model or "whisper-large-v3").strip(),
@@ -606,12 +676,63 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
                 status_code=502, detail=f"Cloud transcription failed: {exc}"
             ) from exc
 
-    t = _require_transcriber()
+    requested_engine = whisper_engine_for(request.whisper_model)
+    if request.whisper_model and requested_engine == "cohere":
+        try:
+            resident = _require_transcriber()
+        except HTTPException as exc:
+            if exc.status_code != 503:
+                raise
+            resident = None
+    else:
+        resident = _require_transcriber()
 
     # The per-request mutation of the shared transcriber (vocabulary prompt,
     # model repo) is only safe while no other request runs — hold the lock for
     # the whole mutate → transcribe → restore span.
     with _WHISPER_LOCK:
+        t = resident
+        if request.whisper_model and requested_engine == "qwen3-asr":
+            try:
+                t = get_qwen_transcriber(whisper_repo_for(request.whisper_model))
+            except RuntimeError:
+                logger.warning(
+                    "Whisper model %s is not downloaded; using %s instead.",
+                    request.whisper_model,
+                    resident.model_size,
+                )
+        elif request.whisper_model and requested_engine == "cohere":
+            detected = _detect_cohere_language(resident, audio_path or mic_audio_path)
+            if detected not in _COHERE_LANGUAGES:
+                logger.info(
+                    "Cohere does not support detected language %s; using resident "
+                    "Whisper for the whole job.",
+                    detected,
+                )
+                t = resident
+            else:
+                try:
+                    t = get_cohere_transcriber(
+                        whisper_repo_for(request.whisper_model)
+                    )
+                    t.language = detected
+                except RuntimeError:
+                    if resident is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="The selected Cohere Transcribe model is not downloaded.",
+                        )
+                    logger.warning(
+                        "Whisper model %s is not downloaded; using %s instead.",
+                        request.whisper_model,
+                        resident.model_size,
+                    )
+                    t = resident
+        if t is None:
+            raise HTTPException(
+                status_code=503,
+                detail="A resident Whisper model is required for this language.",
+            )
         vocab = (request.vocabulary or "").strip()
         t.initial_prompt = f"Glossary: {vocab}" if vocab else None
         # On-device model selection. The two backends need different handling:
@@ -621,7 +742,7 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
         # Before this split the picker was a silent no-op on Windows — the
         # assignment below landed on an attribute faster-whisper never reads.
         original_repo = getattr(t, "model_repo", None)
-        if request.whisper_model:
+        if request.whisper_model and requested_engine == "whisper":
             repo = whisper_repo_for(request.whisper_model)
             if isinstance(t, MlxWhisperTranscriber):
                 # mlx-whisper downloads its repo at call time — never let a
@@ -637,13 +758,15 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
             else:
                 t.ensure_model_repo(repo)
         try:
-            logger.info("Transcribing audio file: %s", request.audio_path)
-            if request.mic_audio_path:
+            logger.info("Transcribing audio file: %s", audio_path or mic_audio_path)
+            if audio_path is None:
+                result = label_mic_only(t.transcribe(mic_audio_path))
+            elif mic_audio_path:
                 result = t.transcribe_dual(
-                    request.audio_path, request.mic_audio_path, diarize=request.diarize
+                    audio_path, mic_audio_path, diarize=request.diarize
                 )
             else:
-                result = t.transcribe(request.audio_path)
+                result = t.transcribe(audio_path)
             result.text = relabel_me(result.text, request.me_label)
             result.turns = relabel_turns(result.turns, request.me_label)
             return result
@@ -680,6 +803,17 @@ def setup_model_download(request: ModelDownloadRequest) -> ModelDownloadStatus:
     """Start or resume one app-owned, immutable model snapshot."""
     try:
         return ModelDownloadStatus(**start_model_download(request.profile_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/setup/model_download/{profile_id}/reset", response_model=ModelDownloadStatus)
+def setup_model_download_reset(profile_id: str, force: bool = False) -> ModelDownloadStatus:
+    """Clear stuck incomplete blobs and reset status so user can retry (Phase 1.3)."""
+    try:
+        from .model_setup import reset_model_download
+
+        return ModelDownloadStatus(**reset_model_download(profile_id, force=force))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

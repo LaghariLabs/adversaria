@@ -5,8 +5,7 @@
   These usage-description strings are required for the TCC permission prompts:
   - NSMicrophoneUsageDescription is mandatory; without it macOS kills the app
     when it first touches the microphone.
-  - NSScreenCaptureUsageDescription is shown for the Screen Recording grant that
-    ScreenCaptureKit (system-audio capture) requires.
+  - NSAudioCaptureUsageDescription explains the Core Audio process-tap grant.
   - NSCalendarsFullAccessUsageDescription (macOS 14+) and the legacy
     NSCalendarsUsageDescription are required for EventKit calendar access.
 -->
@@ -14,8 +13,8 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Meeting Note Taker records your microphone locally to transcribe meetings on-device. Audio never leaves your Mac.</string>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>Meeting Note Taker captures system audio locally so it can transcribe what other participants say. Audio never leaves your Mac.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Adversaria records the audio of your meetings (the sound this Mac plays) to transcribe them on this device. Nothing leaves your Mac.</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>Adversaria reads your calendar events to suggest meeting attendees. This stays on your Mac.</string>
     <key>NSCalendarsUsageDescription</key>

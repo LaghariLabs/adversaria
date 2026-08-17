@@ -180,7 +180,8 @@ fn service_error(body: &str, fallback: &str) -> String {
 /// Owned parameters for the final-transcription HTTP boundary.
 #[derive(serde::Serialize)]
 pub struct TranscribeParams {
-    pub audio_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mic_audio_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +415,30 @@ impl HttpClient {
             .map_err(|_| "The local setup service is not ready; retry in a moment.".to_string())?;
         if !resp.status().is_success() {
             return Err("The selected local model could not be started.".to_string());
+        }
+        resp.json::<ModelDownloadStatus>()
+            .await
+            .map_err(|_| "The local setup service returned an invalid response.".to_string())
+    }
+
+    /// Reset one pinned model download, optionally deleting its cached weights.
+    pub async fn reset_model_download(
+        &self,
+        profile_id: &str,
+        force: bool,
+    ) -> Result<ModelDownloadStatus, String> {
+        let base_url = self.base_url.read().unwrap().clone();
+        let resp = self
+            .client
+            .post(format!(
+                "{base_url}/setup/model_download/{profile_id}/reset"
+            ))
+            .query(&[("force", force)])
+            .send()
+            .await
+            .map_err(|_| "The local setup service is not ready; retry in a moment.".to_string())?;
+        if !resp.status().is_success() {
+            return Err("The selected local model could not be reset.".to_string());
         }
         resp.json::<ModelDownloadStatus>()
             .await

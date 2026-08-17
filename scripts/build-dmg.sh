@@ -106,6 +106,178 @@ sign_file --entitlements entitlements.plist \
   rapid-runtime/dist/rapid-mlx/rapid-mlx
 codesign --verify --strict --verbose=1 dist/adversaria-service/adversaria-service
 codesign --verify --strict --verbose=1 rapid-runtime/dist/rapid-mlx/rapid-mlx
+
+echo "==> [3.5/7] Smoking the frozen sidecars (hygienic env)…"
+# A successful PyInstaller run proves only that files were collected. The two
+# sidecars get DIFFERENT smokes because they are different kinds of program:
+#   * adversaria-service IS an HTTP server (src/server.py's main() takes
+#     --host/--port and serves /health), so it gets the full boot → /health →
+#     /transcribe gate.
+#   * rapid-mlx is a CLI (rapid-runtime/run_rapid.py delegates to
+#     vllm_mlx.cli:main, an argparse app with serve/bench/chat/… subcommands).
+#     It does NOT accept `--host/--port` and would exit instantly; it gets a
+#     launch-integrity check instead (see below).
+SMOKE_TMP="$(mktemp -d)"
+# Persistent, gitignored HF cache for the smoke's tiny Whisper weights: the
+# first build downloads ~75 MB into it, every later build reuses it offline.
+# The shipped default (large-v3, ~3 GB) would make this gate unaffordable.
+SMOKE_CACHE="${ADVERSARIA_SMOKE_CACHE:-$ROOT/.smoke-cache}"
+mkdir -p "$SMOKE_CACHE"
+SMOKE_FIXTURE="$ROOT/python-service/tests/fixtures/sample-5s.wav"
+SMOKE_WHISPER_REPO="mlx-community/whisper-tiny"
+if [ "${ADVERSARIA_SKIP_TRANSCRIBE_SMOKE:-0}" = "0" ]; then
+  # Seed the smoke cache before the gate rather than inside it. mlx-whisper
+  # fetches its repo at call time, so on a cold cache the download happens
+  # *inside* the /transcribe request — measured at ~20 minutes on the release
+  # Mac, which is indistinguishable from a hung transcription. Doing it here,
+  # with the build machine's own venv, makes a slow first fetch visible
+  # progress; on a warm cache it is a sub-second no-op.
+  echo "  -- Seeding the smoke Whisper cache ($SMOKE_WHISPER_REPO → $SMOKE_CACHE)…"
+  HF_HOME="$SMOKE_CACHE" HF_HUB_DISABLE_XET=1 \
+    uv run python -c 'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1])' \
+    "$SMOKE_WHISPER_REPO"
+fi
+SMOKE_OUT="$SMOKE_TMP/adversaria-service.stdout.log"
+SMOKE_ERR="$SMOKE_TMP/adversaria-service.stderr.log"
+SMOKE_HOME="$(mktemp -d)"
+SMOKE_DATA="$SMOKE_TMP/app-data"
+mkdir -p "$SMOKE_DATA"
+SMOKE_PID=""
+
+smoke_fail() {
+  echo "ERROR: $1" >&2
+  echo "--- adversaria-service stdout ---" >&2
+  cat "$SMOKE_OUT" >&2 2>/dev/null || true
+  echo "--- adversaria-service stderr ---" >&2
+  cat "$SMOKE_ERR" >&2 2>/dev/null || true
+  if [ -n "$SMOKE_PID" ]; then
+    kill "$SMOKE_PID" 2>/dev/null || true
+    wait "$SMOKE_PID" 2>/dev/null || true
+  fi
+  rm -rf "$SMOKE_HOME"
+  echo "(smoke scratch dir kept for debugging: $SMOKE_TMP)" >&2
+  exit 1
+}
+
+SMOKE_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+echo "  -- adversaria-service: boot → /health → /transcribe on 127.0.0.1:${SMOKE_PORT}"
+# Hygienic env. PATH is deliberately /usr/bin:/bin — NO Homebrew: a Homebrew
+# `ffmpeg` on the build machine would mask a bundling gap, and that exact bug
+# shipped once (docs/TODO.md, "ffmpeg dependency"). Since 0.3.50 the service
+# decodes in-process via PyAV, so it must pass without any Homebrew on PATH.
+# ADVERSARIA_DATA_DIR (NOT ADVERSARIA_APP_DATA) is the app-data override the
+# service actually reads — see python-service/src/config.py.
+env -i HOME="$SMOKE_HOME" PATH="/usr/bin:/bin" \
+  ADVERSARIA_DATA_DIR="$SMOKE_DATA" \
+  HF_HOME="$SMOKE_CACHE" \
+  HF_HUB_DISABLE_XET=1 \
+  MLX_WHISPER_MODEL="$SMOKE_WHISPER_REPO" \
+  "$ROOT/python-service/dist/adversaria-service/adversaria-service" \
+  --host 127.0.0.1 --port "$SMOKE_PORT" >"$SMOKE_OUT" 2>"$SMOKE_ERR" &
+SMOKE_PID=$!
+
+# Wait for transcriber_state=ready, not merely for /health to answer: the
+# service binds its port while the transcriber is still loading, and a
+# /transcribe issued in that window 503s ("transcriber_loading") — which is
+# what made the first version of this gate fail against a healthy build.
+# `missing`/`error` are terminal, so fail on them immediately instead of
+# burning the whole budget.
+SMOKE_READY=0
+SMOKE_BOUND=0
+for _ in $(seq 1 150); do
+  if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+    smoke_fail "adversaria-service exited before answering /health."
+  fi
+  if curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" -m 5 -o "$SMOKE_TMP/health.json" 2>/dev/null; then
+    SMOKE_BOUND=1
+    SMOKE_STATE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("transcriber_state") or "")' "$SMOKE_TMP/health.json")"
+    case "$SMOKE_STATE" in
+      ready)
+        SMOKE_READY=1
+        echo "     /health OK: $(cat "$SMOKE_TMP/health.json")"
+        break
+        ;;
+      missing|error)
+        smoke_fail "adversaria-service came up with transcriber_state=$SMOKE_STATE: $(cat "$SMOKE_TMP/health.json")"
+        ;;
+    esac
+  fi
+  sleep 2
+done
+if [ "$SMOKE_READY" != "1" ]; then
+  smoke_fail "adversaria-service never reached transcriber_state=ready within 300s (port bound: $SMOKE_BOUND)."
+fi
+
+if [ "${ADVERSARIA_SKIP_TRANSCRIBE_SMOKE:-0}" != "0" ]; then
+  echo "  !! ADVERSARIA_SKIP_TRANSCRIBE_SMOKE=1 — THE /transcribe GATE IS SKIPPED."
+  echo "  !! This build has NOT been proven able to transcribe. Only use this for a"
+  echo "  !! deliberately offline build, and never for a release you intend to ship."
+else
+  [ -f "$SMOKE_FIXTURE" ] || smoke_fail "smoke fixture missing: $SMOKE_FIXTURE"
+  # /transcribe takes JSON with an on-disk path — the service and the app are on
+  # the same machine, so audio is never uploaded (see src/server.py::transcribe
+  # and src/models.py::TranscribeRequest). It is NOT a multipart upload.
+  # ~2 s against a warm cache on an M-series Mac; 300 s is pure headroom.
+  SMOKE_BODY="$(python3 -c 'import json,sys; print(json.dumps({"audio_path": sys.argv[1], "diarize": False}))' "$SMOKE_FIXTURE")"
+  curl -fsS -X POST "http://127.0.0.1:$SMOKE_PORT/transcribe" \
+    -H 'Content-Type: application/json' -d "$SMOKE_BODY" \
+    -m 300 -o "$SMOKE_TMP/transcribe.json" \
+    || smoke_fail "/transcribe failed on the frozen service."
+  python3 - "$SMOKE_TMP/transcribe.json" <<'PY' || smoke_fail "/transcribe returned no usable text."
+import json, sys
+
+data = json.load(open(sys.argv[1]))
+text = (data.get("text") or "").strip()
+print(f"     /transcribe OK -> {text[:120]!r}")
+sys.exit(0 if len(text) >= 10 else 1)
+PY
+fi
+kill "$SMOKE_PID" 2>/dev/null || true
+wait "$SMOKE_PID" 2>/dev/null || true
+SMOKE_PID=""
+rm -rf "$SMOKE_HOME"
+
+echo "  -- rapid-mlx: launch-integrity check…"
+# What this PROVES: the signed, frozen binary is allowed to execute (codesign /
+# entitlements / Gatekeeper did not kill it), its PyInstaller bootloader starts
+# the embedded CPython, and run_rapid.py's `from vllm_mlx.cli import main`
+# resolves from inside the bundle — that import is unconditional and happens
+# BEFORE argparse ever sees `--version`, so exit 0 here is real evidence.
+# What it does NOT prove: that mlx.core / Metal loads, or that a model can be
+# served. `vllm_mlx/__init__.py` is deliberately lazy ("All imports are lazy to
+# allow usage on non-Apple Silicon platforms"), so every heavy import happens
+# inside a subcommand handler; the only invocation that would exercise them is
+# actually serving a model, which needs multi-GB weights a release build must
+# not download. `rapid-mlx doctor` is no better — its package rows come from
+# importlib.metadata, not real imports, and it exits 1 by design when the
+# binary is not on $PATH. Verified against the frozen binary 2026-08-07.
+RAPID_LOG="$SMOKE_TMP/rapid-mlx.log"
+RAPID_HOME="$(mktemp -d)"
+env -i HOME="$RAPID_HOME" PATH="/usr/bin:/bin" \
+  "$ROOT/python-service/rapid-runtime/dist/rapid-mlx/rapid-mlx" --version \
+  >"$RAPID_LOG" 2>&1 &
+RAPID_PID=$!
+( sleep 120; kill -9 "$RAPID_PID" 2>/dev/null || true ) &
+RAPID_WATCHDOG=$!
+RAPID_RC=0
+wait "$RAPID_PID" || RAPID_RC=$?
+kill "$RAPID_WATCHDOG" 2>/dev/null || true
+wait "$RAPID_WATCHDOG" 2>/dev/null || true
+rm -rf "$RAPID_HOME"
+# Gate on the OUTPUT as well as the exit code: a bundle that printed a dyld or
+# import error and still exited 0 must not pass.
+if [ "$RAPID_RC" != "0" ] \
+   || ! grep -q '^rapid-mlx ' "$RAPID_LOG" \
+   || grep -Eq 'ImportError|ModuleNotFoundError|dyld|Symbol not found|Library not loaded|Killed' "$RAPID_LOG"; then
+  echo "ERROR: rapid-mlx failed its launch-integrity check (exit $RAPID_RC). Output:" >&2
+  cat "$RAPID_LOG" >&2 || true
+  echo "(smoke scratch dir kept for debugging: $SMOKE_TMP)" >&2
+  exit 1
+fi
+echo "     launch OK: $(cat "$RAPID_LOG")"
+
+rm -rf "$SMOKE_TMP"
+echo "  Frozen sidecar smoke PASSED."
 cd "$ROOT"
 
 # Updater signing. When the minisign private key exists, export the Tauri signing
@@ -321,6 +493,17 @@ if [ "${ADVERSARIA_INSTALL:-0}" != "0" ]; then
   ditto "$APP" /Applications/Adversaria.app
   open -a Adversaria || true
   echo "   Installed v$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Adversaria.app/Contents/Info.plist 2>/dev/null) to /Applications and relaunched."
+fi
+
+# Clean up frozen debug artifacts that poison dev (Phase 0.4)
+if [ -d "$ROOT/src-tauri/target/debug" ]; then
+  if ls "$ROOT/src-tauri/target/debug"/adversaria-service* >/dev/null 2>&1; then
+    echo "==> Cleaning debug sidecar artifacts (de-poison dev)..."
+    # -r: the --onedir freeze makes these DIRECTORIES; plain rm failed on them
+    # and its exit code became the whole build's exit AFTER a fully successful
+    # notarized artifact (0.3.77 cut, 2026-08-14).
+    rm -rf "$ROOT/src-tauri/target/debug"/adversaria-service*
+  fi
 fi
 
 echo ""

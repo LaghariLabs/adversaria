@@ -1105,6 +1105,105 @@ pub fn merge_meeting_speakers(id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rename a person everywhere a saved meeting references them — speaker
+/// labels, transcript text, notes, attendees, and action items. The audio is
+/// deleted after transcription, so a misheard name can never be re-derived;
+/// editing the stored text is the only fix.
+pub fn rename_meeting_person(id: i64, from: &str, to: &str) -> anyhow::Result<()> {
+    let conn = connect()?;
+    rename_meeting_person_on(&conn, id, from, to)
+}
+
+fn rename_meeting_person_on(
+    conn: &Connection,
+    id: i64,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<()> {
+    let (transcript, transcript_turns_raw, summary, attendees_raw): (
+        String,
+        String,
+        String,
+        String,
+    ) = conn.query_row(
+        "SELECT transcript, transcript_turns, summary, attendees
+         FROM meetings WHERE id = ?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let person_re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(from)))?;
+    let from_lower = from.to_lowercase();
+
+    let mut transcript_turns = decode_transcript_turns(&transcript_turns_raw);
+    for turn in &mut transcript_turns {
+        if turn.speaker.to_lowercase() == from_lower {
+            turn.speaker = to.to_string();
+        }
+        turn.text = person_re
+            .replace_all(&turn.text, regex::NoExpand(to))
+            .into_owned();
+    }
+    let transcript = person_re
+        .replace_all(&transcript, regex::NoExpand(to))
+        .into_owned();
+    let summary = person_re
+        .replace_all(&summary, regex::NoExpand(to))
+        .into_owned();
+
+    let mut seen_attendees = std::collections::HashSet::new();
+    let attendees: Vec<String> = decode_attendees(&attendees_raw)
+        .into_iter()
+        .map(|attendee| {
+            if attendee.to_lowercase() == from_lower {
+                to.to_string()
+            } else {
+                attendee
+            }
+        })
+        .filter(|attendee| seen_attendees.insert(attendee.to_lowercase()))
+        .collect();
+
+    let updated = conn.execute(
+        "UPDATE meetings
+         SET transcript = ?1, transcript_turns = ?2, summary = ?3, attendees = ?4
+         WHERE id = ?5",
+        params![
+            transcript,
+            encode_transcript_turns(&transcript_turns),
+            summary,
+            encode_attendees(&attendees),
+            id,
+        ],
+    )?;
+    anyhow::ensure!(updated == 1, "Meeting not found: {id}");
+
+    let action_items: Vec<(i64, String, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, text, assignee FROM action_items WHERE meeting_id = ?1")?;
+        let rows = stmt.query_map(params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (action_id, text, assignee) in action_items {
+        let renamed_text = person_re
+            .replace_all(&text, regex::NoExpand(to))
+            .into_owned();
+        let renamed_assignee = if assignee.to_lowercase() == from_lower {
+            to.to_string()
+        } else {
+            assignee.clone()
+        };
+        if renamed_text != text || renamed_assignee != assignee {
+            conn.execute(
+                "UPDATE action_items SET text = ?1, assignee = ?2 WHERE id = ?3",
+                params![renamed_text, renamed_assignee, action_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Fill a previously "pending" recording (saved when transcription couldn't run)
 /// with its transcription + summary results, and clear the stored audio path —
 /// the caller deletes the WAV on success. Title / transcript / turns / duration /
@@ -2626,6 +2725,215 @@ mod encryption_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn person_rename_conn(
+        transcript: &str,
+        turns: &[crate::types::TranscriptTurn],
+        summary: &str,
+        attendees: &[String],
+        action_text: &str,
+        action_assignee: &str,
+    ) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meetings (
+                 id INTEGER PRIMARY KEY,
+                 transcript TEXT NOT NULL,
+                 transcript_turns TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 attendees TEXT NOT NULL
+             );
+             CREATE TABLE action_items (
+                 id INTEGER PRIMARY KEY,
+                 meeting_id INTEGER NOT NULL,
+                 text TEXT NOT NULL,
+                 assignee TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meetings (id, transcript, transcript_turns, summary, attendees)
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            params![
+                transcript,
+                encode_transcript_turns(turns),
+                summary,
+                encode_attendees(attendees)
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO action_items (id, meeting_id, text, assignee)
+             VALUES (10, 1, ?1, ?2)",
+            params![action_text, action_assignee],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn renamed_meeting(
+        conn: &Connection,
+    ) -> (
+        String,
+        Vec<crate::types::TranscriptTurn>,
+        String,
+        Vec<String>,
+    ) {
+        conn.query_row(
+            "SELECT transcript, transcript_turns, summary, attendees FROM meetings WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    decode_transcript_turns(&row.get::<_, String>(1)?),
+                    row.get(2)?,
+                    decode_attendees(&row.get::<_, String>(3)?),
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rename_person_rewrites_every_saved_meeting_reference() {
+        let turns = vec![crate::types::TranscriptTurn {
+            speaker: "Dhanesh".into(),
+            text: "Ask dhanesh to review the plan.".into(),
+            start: Some(1.0),
+            end: Some(3.0),
+        }];
+        let conn = person_rename_conn(
+            "Dhanesh: Flat text asks DHANESH to review.",
+            &turns,
+            "Dhanesh owns the notes; ping dhanesh tomorrow.",
+            &["Alice".into(), "DHANESH".into()],
+            "Dhanesh will send the notes to dhanesh.",
+            "dHaNeSh",
+        );
+
+        rename_meeting_person_on(&conn, 1, "dhanesh", "Danish").unwrap();
+
+        let (transcript, turns, summary, attendees) = renamed_meeting(&conn);
+        assert_eq!(transcript, "Danish: Flat text asks Danish to review.");
+        assert_eq!(turns[0].speaker, "Danish");
+        assert_eq!(turns[0].text, "Ask Danish to review the plan.");
+        assert_eq!(summary, "Danish owns the notes; ping Danish tomorrow.");
+        assert_eq!(attendees, vec!["Alice", "Danish"]);
+        let action: (String, String) = conn
+            .query_row(
+                "SELECT text, assignee FROM action_items WHERE id = 10",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action.0, "Danish will send the notes to Danish.");
+        assert_eq!(action.1, "Danish");
+    }
+
+    #[test]
+    fn rename_person_holds_word_boundaries() {
+        let turns = vec![crate::types::TranscriptTurn {
+            speaker: "Danish".into(),
+            text: "Danish approved it.".into(),
+            start: None,
+            end: None,
+        }];
+        let conn = person_rename_conn(
+            "Danish: Danish approved it.",
+            &turns,
+            "Danish owns it.",
+            &["Danish".into()],
+            "Ask Danish to approve.",
+            "Danish",
+        );
+
+        rename_meeting_person_on(&conn, 1, "Dan", "Daniel").unwrap();
+
+        let (transcript, turns, summary, attendees) = renamed_meeting(&conn);
+        assert_eq!(transcript, "Danish: Danish approved it.");
+        assert_eq!(turns[0].speaker, "Danish");
+        assert_eq!(turns[0].text, "Danish approved it.");
+        assert_eq!(summary, "Danish owns it.");
+        assert_eq!(attendees, vec!["Danish"]);
+        let action: (String, String) = conn
+            .query_row(
+                "SELECT text, assignee FROM action_items WHERE id = 10",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, ("Ask Danish to approve.".into(), "Danish".into()));
+    }
+
+    #[test]
+    fn rename_person_matches_source_case_insensitively() {
+        let turns = vec![crate::types::TranscriptTurn {
+            speaker: "Dhanesh".into(),
+            text: "dhanesh met Dhanesh.".into(),
+            start: None,
+            end: None,
+        }];
+        let conn = person_rename_conn("dhanesh met Dhanesh.", &turns, "", &[], "", "");
+
+        rename_meeting_person_on(&conn, 1, "dhanesh", "Danish").unwrap();
+
+        let (transcript, turns, _, _) = renamed_meeting(&conn);
+        assert_eq!(transcript, "Danish met Danish.");
+        assert_eq!(turns[0].speaker, "Danish");
+        assert_eq!(turns[0].text, "Danish met Danish.");
+    }
+
+    #[test]
+    fn rename_person_inserts_dollar_signs_literally() {
+        let turns = vec![crate::types::TranscriptTurn {
+            speaker: "dhanesh".into(),
+            text: "dhanesh owns this.".into(),
+            start: None,
+            end: None,
+        }];
+        let conn = person_rename_conn(
+            "dhanesh owns this.",
+            &turns,
+            "Ask dhanesh.",
+            &["dhanesh".into()],
+            "Notify dhanesh.",
+            "dhanesh",
+        );
+
+        rename_meeting_person_on(&conn, 1, "dhanesh", "Da$h").unwrap();
+
+        let (transcript, turns, summary, attendees) = renamed_meeting(&conn);
+        assert_eq!(transcript, "Da$h owns this.");
+        assert_eq!(turns[0].speaker, "Da$h");
+        assert_eq!(turns[0].text, "Da$h owns this.");
+        assert_eq!(summary, "Ask Da$h.");
+        assert_eq!(attendees, vec!["Da$h"]);
+        let action: (String, String) = conn
+            .query_row(
+                "SELECT text, assignee FROM action_items WHERE id = 10",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, ("Notify Da$h.".into(), "Da$h".into()));
+    }
+
+    #[test]
+    fn rename_person_dedupes_attendee_collisions_in_order() {
+        let conn = person_rename_conn(
+            "",
+            &[],
+            "",
+            &["Alice".into(), "dhanesh".into(), "Danish".into()],
+            "",
+            "",
+        );
+
+        rename_meeting_person_on(&conn, 1, "dhanesh", "Danish").unwrap();
+
+        let (_, _, _, attendees) = renamed_meeting(&conn);
+        assert_eq!(attendees, vec!["Alice", "Danish"]);
+    }
 
     #[test]
     fn parse_exact_format() {
