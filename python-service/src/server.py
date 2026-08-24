@@ -424,7 +424,7 @@ def health() -> HealthResponse:
     if _transcriber is not None and ollama_available:
         status = "ok"
 
-    embedder_state, embedder_detail = _embedding_health()
+    embedder_state, embedder_detail = _embedding_health(ollama_available)
 
     return HealthResponse(
         status=status,
@@ -437,10 +437,21 @@ def health() -> HealthResponse:
     )
 
 
-def _embedding_health() -> tuple[str, str]:
+def _embedding_health(ollama_available: bool) -> tuple[str, str]:
     """Check only Ollama's model catalogue; never load the embedding model."""
     if _embedder is None:
         return "unavailable", "The semantic-search service is not initialized."
+    if (
+        not ollama_available
+        and _summarizer is not None
+        and _summarizer.backend == "ollama"
+        and _summarizer.host.rstrip("/") == _OLLAMA_HOST.rstrip("/")
+    ):
+        # backend_available() just probed this exact host and found it down.
+        # Don't probe it a second time: on Windows the stacked connect
+        # timeouts pushed /health past the 5 s budget the release smoke
+        # gives it (0.3.81 CI failure, run 32684423145).
+        return "unavailable", "The local engine is not reachable."
     try:
         response = httpx.get(f"{_OLLAMA_HOST}/api/tags", timeout=2.0)
         response.raise_for_status()

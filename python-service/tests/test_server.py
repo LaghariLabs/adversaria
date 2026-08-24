@@ -191,6 +191,29 @@ class TestHealthEndpoint:
         finally:
             _server_mod._embedder = previous
 
+    def test_health_skips_embedder_probe_when_same_host_is_down(
+        self, monkeypatch
+    ) -> None:
+        """Engine down at the shared host: no second probe (Windows CI 5s budget)."""
+        previous_embedder = _server_mod._embedder
+        previous_summarizer = _server_mod._summarizer
+        summarizer = MagicMock()
+        summarizer.backend = "ollama"
+        summarizer.host = _server_mod._OLLAMA_HOST
+        summarizer.backend_available.return_value = False
+        never_called = MagicMock(side_effect=AssertionError("second probe fired"))
+        monkeypatch.setattr(_server_mod.httpx, "get", never_called)
+        _server_mod._embedder = MagicMock()
+        _server_mod._summarizer = summarizer
+        try:
+            result = client.get("/health")
+            assert result.status_code == 200
+            assert result.json()["embedder_state"] == "unavailable"
+            never_called.assert_not_called()
+        finally:
+            _server_mod._embedder = previous_embedder
+            _server_mod._summarizer = previous_summarizer
+
     def test_managed_llm_host_marks_sidecar_port_as_ollama(self) -> None:
         from src.summarizer import _is_local_ollama_url
 
