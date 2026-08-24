@@ -1,6 +1,6 @@
 [package]
 name = "meeting-note-taker"
-version = "0.3.80"
+version = "0.3.81"
 authors = ["Mohammad Hamza Laghari <hamza@lagharilabs.com>"]
 edition = "2021"
 

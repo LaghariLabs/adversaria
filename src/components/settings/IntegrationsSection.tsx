@@ -2,7 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-shell";
 import { TriangleAlert } from "lucide-react";
 
-import type { AppConfig, CalendarAccount, CalendarConfig } from "../../types";
+import type {
+  AppConfig,
+  CalendarAccount,
+  CalendarConfig,
+  ContextIndexStatus,
+  ContextSources,
+} from "../../types";
 import {
   calendarConnect,
   calendarDisconnect,
@@ -11,6 +17,11 @@ import {
   calendarSetCredentials,
   calendarStatus,
   exportSecondBrain,
+  getContextIndexStatus,
+  getContextSources,
+  pickWorkspaceFolder,
+  reindexContextSources,
+  setContextSources as saveContextSources,
 } from "../../lib/tauri";
 import { formatDateTime } from "../../lib/dateFormat";
 
@@ -40,6 +51,21 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
   const [ekEnabled, setEkEnabled] = useState(config.calendar.macos_eventkit_enabled);
   const [ekEnabling, setEkEnabling] = useState(false);
   const [ekMsg, setEkMsg] = useState<string | null>(null);
+
+  // --- Automatic workspace context ---
+  const [contextSources, setContextSources] = useState<ContextSources>({
+    vault_path: "",
+    projects_root: "",
+  });
+  const [contextStatus, setContextStatus] = useState<ContextIndexStatus>({
+    vault_docs: 0,
+    project_docs: 0,
+    changed: 0,
+    embedding_errors: 0,
+    last_synced_at: "",
+  });
+  const [contextBusy, setContextBusy] = useState(false);
+  const [contextMsg, setContextMsg] = useState<string | null>(null);
 
   // Status messages auto-dismiss on cadences users have learned (2s for a
   // credential save or disconnect, 3s for "Connected!", 4s for Apple Calendar).
@@ -89,6 +115,69 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
       void refreshCalendarState();
     }
   }, [active, refreshCalendarState]);
+
+  const refreshContextState = useCallback(async () => {
+    try {
+      const [sources, status] = await Promise.all([
+        getContextSources(),
+        getContextIndexStatus(),
+      ]);
+      if (sources) setContextSources(sources);
+      if (status) setContextStatus(status);
+      setContextMsg(null);
+    } catch (error) {
+      setContextMsg(`Couldn't load context sources: ${String(error)}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (active) void refreshContextState();
+  }, [active, refreshContextState]);
+
+  const persistContextSources = async (next: ContextSources) => {
+    setContextBusy(true);
+    setContextMsg(null);
+    try {
+      await saveContextSources(next.vault_path, next.projects_root);
+      setContextSources(next);
+    } catch (error) {
+      setContextMsg(`Couldn't save context sources: ${String(error)}`);
+    } finally {
+      setContextBusy(false);
+    }
+  };
+
+  const chooseContextSource = async (source: "vault" | "projects") => {
+    setContextBusy(true);
+    setContextMsg(null);
+    try {
+      const path = await pickWorkspaceFolder();
+      if (!path) return;
+      const next =
+        source === "vault"
+          ? { ...contextSources, vault_path: path }
+          : { ...contextSources, projects_root: path };
+      await saveContextSources(next.vault_path, next.projects_root);
+      setContextSources(next);
+    } catch (error) {
+      setContextMsg(`Couldn't choose that folder: ${String(error)}`);
+    } finally {
+      setContextBusy(false);
+    }
+  };
+
+  const reindexContext = async () => {
+    setContextBusy(true);
+    setContextMsg(null);
+    try {
+      const status = await reindexContextSources();
+      if (status) setContextStatus(status);
+    } catch (error) {
+      setContextMsg(`Couldn't reindex context sources: ${String(error)}`);
+    } finally {
+      setContextBusy(false);
+    }
+  };
 
   const handleGoogleCredsSave = async () => {
     if (!googleClientId.trim()) {
@@ -222,6 +311,99 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
         Calendars that fill in who was in the room, and a folder your notes are
         mirrored into.
       </p>
+
+      {/* // Dev-only until ADR-016 ships to users (gate mirrors App.tsx). */}
+      {import.meta.env.DEV && (
+        <>
+          <h3 className="settings-card-title" style={{ marginTop: 18 }}>
+            Workspace context sources
+          </h3>
+          <p className="settings-card-desc">
+            What the workspace agent may read automatically. Matched notes and project
+            folders are listed on every run&apos;s receipt.
+          </p>
+          <div className="settings-subcard">
+            <div className="settings-context-source-row">
+              <div className="settings-context-source-copy">
+                <strong>Obsidian vault</strong>
+                <span title={contextSources.vault_path || undefined}>
+                  {contextSources.vault_path || "Not set"}
+                </span>
+              </div>
+              <div className="settings-context-source-actions">
+                <button
+                  className="btn-ghost"
+                  type="button"
+                  disabled={contextBusy}
+                  aria-label="Choose Obsidian vault folder"
+                  onClick={() => void chooseContextSource("vault")}
+                >
+                  Choose…
+                </button>
+                <button
+                  className="btn-ghost"
+                  type="button"
+                  disabled={contextBusy || !contextSources.vault_path}
+                  aria-label="Clear Obsidian vault folder"
+                  onClick={() =>
+                    void persistContextSources({ ...contextSources, vault_path: "" })
+                  }
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+            <div className="settings-context-source-row">
+              <div className="settings-context-source-copy">
+                <strong>Projects folder</strong>
+                <span title={contextSources.projects_root || undefined}>
+                  {contextSources.projects_root || "Not set"}
+                </span>
+              </div>
+              <div className="settings-context-source-actions">
+                <button
+                  className="btn-ghost"
+                  type="button"
+                  disabled={contextBusy}
+                  aria-label="Choose projects folder"
+                  onClick={() => void chooseContextSource("projects")}
+                >
+                  Choose…
+                </button>
+                <button
+                  className="btn-ghost"
+                  type="button"
+                  disabled={contextBusy || !contextSources.projects_root}
+                  aria-label="Clear projects folder"
+                  onClick={() =>
+                    void persistContextSources({ ...contextSources, projects_root: "" })
+                  }
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+            <div className="settings-context-index-row">
+              <p className="settings-help" aria-live="polite">
+                Indexed: {contextStatus.vault_docs} vault notes · {contextStatus.project_docs}{" "}
+                projects · last synced{" "}
+                {contextStatus.last_synced_at
+                  ? formatDateTime(contextStatus.last_synced_at)
+                  : "never"}
+              </p>
+              <button
+                className="btn-secondary"
+                type="button"
+                disabled={contextBusy}
+                onClick={() => void reindexContext()}
+              >
+                {contextBusy ? "Working…" : "Reindex now"}
+              </button>
+            </div>
+            {contextMsg && <p className="settings-msg err">{contextMsg}</p>}
+          </div>
+        </>
+      )}
 
       {/* ---- Calendar ---- */}
       <h3 className="settings-card-title" style={{ marginTop: 18 }}>Calendar</h3>

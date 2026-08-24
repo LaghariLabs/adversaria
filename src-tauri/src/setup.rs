@@ -26,6 +26,7 @@ const RUNTIME_PRIVACY_ARGS: &[&str] = &[
 ];
 
 static MANAGED_CREDENTIALS: OnceLock<RwLock<Option<(String, String)>>> = OnceLock::new();
+static MANAGED_OLLAMA_HOST: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 pub struct ManagedLlmProcess {
     child: std::process::Child,
@@ -41,8 +42,23 @@ pub fn managed_credentials() -> Option<(String, String)> {
         .clone()
 }
 
+pub fn managed_ollama_host() -> Option<String> {
+    MANAGED_OLLAMA_HOST
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap()
+        .clone()
+}
+
 fn set_managed_credentials(value: Option<(String, String)>) {
     *MANAGED_CREDENTIALS
+        .get_or_init(|| RwLock::new(None))
+        .write()
+        .unwrap() = value;
+}
+
+fn set_managed_ollama_host(value: Option<String>) {
+    *MANAGED_OLLAMA_HOST
         .get_or_init(|| RwLock::new(None))
         .write()
         .unwrap() = value;
@@ -59,6 +75,9 @@ fn set_managed_credentials(value: Option<(String, String)>) {
 /// Returns `String` rather than `&'static str` because an Ollama tag is
 /// discovered at runtime from whatever the user has pulled.
 pub fn profile_alias(profile_id: &str) -> Option<String> {
+    if let Some(selected) = crate::ollama_engine::tier(profile_id) {
+        return Some(selected.tag.to_string());
+    }
     // An `ollama:` id carries its own alias — the tag after the prefix is exactly
     // what the summarizer asks Ollama for.
     if let Some(tag) = profile_id.strip_prefix("ollama:") {
@@ -80,6 +99,9 @@ pub fn profile_alias(profile_id: &str) -> Option<String> {
 /// the Python service to "download" one would fail. `profile_alias` now accepts
 /// them, so this can no longer lean on it alone.
 pub fn downloadable_profile(profile_id: &str) -> bool {
+    if cfg!(debug_assertions) && crate::ollama_engine::tier(profile_id).is_some() {
+        return true;
+    }
     if profile_id.starts_with("ollama:") {
         return false;
     }
@@ -268,6 +290,45 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
         .ok()
         .map(|path| path.join("rapid-mlx").join("rapid-mlx"))
         .is_some_and(|path| path.is_file());
+    let ollama_sidecar_available =
+        cfg!(debug_assertions) && crate::ollama_engine::binary_path(app).is_some();
+    let ollama_plan = ollama_sidecar_available
+        .then(|| crate::ollama_engine::install_plan(app, memory_gb, disk_gb));
+    let live_ollama_version = if ollama_sidecar_available {
+        crate::ollama_engine::version().await.ok()
+    } else {
+        None
+    };
+    let ollama_version = live_ollama_version.or_else(|| {
+        ollama_plan.as_ref().and_then(|plan| {
+            (plan.engine_version != "unknown").then(|| plan.engine_version.clone())
+        })
+    });
+    let version_for_tags = ollama_version.as_deref().unwrap_or("unknown");
+    let recommended_ollama = crate::ollama_engine::recommended_tier(memory_gb, disk_gb);
+    let mut managed_ollama_profiles = Vec::new();
+    if ollama_sidecar_available {
+        for selected in crate::ollama_engine::TIERS {
+            let tag = crate::ollama_engine::effective_tag(selected, memory_gb, version_for_tags);
+            let installed = crate::ollama_engine::has_tag(tag)
+                .await
+                .unwrap_or_else(|_| crate::ollama_engine::tag_installed(tag));
+            managed_ollama_profiles.push(ModelProfile {
+                id: selected.profile_id.to_string(),
+                display_name: selected.display_name.to_string(),
+                model_alias: tag.to_string(),
+                model_repo: format!("ollama.com/library/{tag}"),
+                model_revision: String::new(),
+                runtime: "ollama".to_string(),
+                minimum_memory_gb: selected.minimum_memory_gb,
+                required_disk_gb: selected.required_disk_gb,
+                quality_label: selected.quality_label.to_string(),
+                quality_note: selected.quality_note.to_string(),
+                installed,
+                recommended: selected.profile_id == recommended_ollama.profile_id,
+            });
+        }
+    }
 
     // Which engine's profiles to offer is a question about the PLATFORM, not
     // about whether this particular build bundled the runtime.
@@ -287,13 +348,14 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
         // path, so they carry the recommendation (behind the consent screen).
         // An already-working Ollama install keeps its recommendation until the
         // user opts into the managed engine.
-        let prefer_managed = engine_installed || !ollama.iter().any(|profile| profile.recommended);
-        if prefer_managed {
+        let prefer_managed = !ollama_sidecar_available
+            && (engine_installed || !ollama.iter().any(|profile| profile.recommended));
+        if prefer_managed || ollama_sidecar_available {
             for profile in &mut ollama {
                 profile.recommended = false;
             }
         }
-        let mut profiles: Vec<ModelProfile> = crate::llama_engine::GGUF_PINS
+        let legacy_profiles: Vec<ModelProfile> = crate::llama_engine::GGUF_PINS
             .iter()
             .map(|pin| ModelProfile {
                 id: pin.profile_id.to_string(),
@@ -307,15 +369,23 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
                 quality_label: pin.quality_label.to_string(),
                 quality_note: pin.quality_note.to_string(),
                 installed: crate::llama_engine::gguf_installed(pin),
-                recommended: prefer_managed && pin.profile_id == pinned.profile_id,
+                recommended: !ollama_sidecar_available
+                    && prefer_managed
+                    && pin.profile_id == pinned.profile_id,
             })
             .collect();
+        let mut profiles = managed_ollama_profiles;
+        profiles.extend(legacy_profiles);
         profiles.append(&mut ollama);
-        let recommended_profile = profiles
-            .iter()
-            .find(|profile| profile.recommended)
-            .map(|profile| profile.id.clone())
-            .unwrap_or_default();
+        let recommended_profile = if ollama_sidecar_available {
+            recommended_ollama.profile_id.to_string()
+        } else {
+            profiles
+                .iter()
+                .find(|profile| profile.recommended)
+                .map(|profile| profile.id.clone())
+                .unwrap_or_default()
+        };
         return SetupStatus {
             schema_version: 1,
             platform: std::env::consts::OS.to_string(),
@@ -327,6 +397,8 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
             profiles,
             gpu_name: crate::llama_engine::detect_gpu(),
             managed_engine_installed: engine_installed,
+            ollama_sidecar_available,
+            ollama_version,
         };
     }
 
@@ -339,7 +411,7 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
     for profile in &mut detected_ollama {
         profile.recommended = false;
     }
-    let mut profiles = vec![
+    let legacy_profiles = vec![
         ModelProfile {
             id: "qwen-27b-quality".to_string(),
             display_name: "Qwen 3.6 27B — best meeting quality".to_string(),
@@ -353,7 +425,7 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
             quality_note: "Best supported local meeting-output profile; slower and larger."
                 .to_string(),
             installed: snapshot_installed(HIGH_REPO, HIGH_REVISION),
-            recommended: high_recommended,
+            recommended: !ollama_sidecar_available && high_recommended,
         },
         ModelProfile {
             id: "qwen-9b-balanced".to_string(),
@@ -369,7 +441,7 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
                 "Strong meeting notes at a fraction of the size; good default for 16 GB Macs."
                     .to_string(),
             installed: snapshot_installed(MID_REPO, MID_REVISION),
-            recommended: mid_recommended,
+            recommended: !ollama_sidecar_available && mid_recommended,
         },
         ModelProfile {
             id: "qwen-4b-light".to_string(),
@@ -385,9 +457,12 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
                 "Fits smaller Macs, but may omit nuance in long or complex meeting notes."
                     .to_string(),
             installed: snapshot_installed(LIGHT_REPO, LIGHT_REVISION),
-            recommended: !high_recommended && !mid_recommended,
+            recommended: !ollama_sidecar_available && !high_recommended && !mid_recommended,
         },
     ];
+    let mut profiles = managed_ollama_profiles;
+    profiles.extend(legacy_profiles);
+    profiles.append(&mut detected_ollama);
     SetupStatus {
         schema_version: 1,
         platform: std::env::consts::OS.to_string(),
@@ -395,7 +470,9 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
         total_memory_bytes,
         available_disk_bytes,
         rapid_runtime_bundled: runtime,
-        recommended_profile: if high_recommended {
+        recommended_profile: if ollama_sidecar_available {
+            recommended_ollama.profile_id
+        } else if high_recommended {
             "qwen-27b-quality"
         } else if mid_recommended {
             "qwen-9b-balanced"
@@ -403,14 +480,13 @@ pub async fn setup_status(app: &AppHandle) -> SetupStatus {
             "qwen-4b-light"
         }
         .to_string(),
-        profiles: {
-            profiles.append(&mut detected_ollama);
-            profiles
-        },
+        profiles,
         // Apple Silicon's engine is the bundled Rapid-MLX; the managed
         // llama.cpp fields only mean something off this platform.
         gpu_name: None,
         managed_engine_installed: false,
+        ollama_sidecar_available,
+        ollama_version,
     }
 }
 
@@ -449,6 +525,17 @@ fn random_api_key() -> String {
 }
 
 pub fn status(process: &std::sync::Mutex<Option<ManagedLlmProcess>>) -> ManagedLlmStatus {
+    if managed_ollama_host().is_some() {
+        let profile_id = crate::storage::get_onboarding_state()
+            .ok()
+            .map(|state| state.selected_model_profile)
+            .filter(|profile| crate::ollama_engine::tier(profile).is_some());
+        return ManagedLlmStatus {
+            state: "running".to_string(),
+            profile_id,
+            detail: "Local meeting model is ready through the managed engine.".to_string(),
+        };
+    }
     let mut guard = process.lock().unwrap();
     let Some(managed) = guard.as_mut() else {
         return ManagedLlmStatus {
@@ -484,9 +571,9 @@ pub fn status(process: &std::sync::Mutex<Option<ManagedLlmProcess>>) -> ManagedL
 /// to manage — "starting" it is a reachability check. Both errors are written to
 /// be actionable, because this is the first place a user without Ollama (or
 /// without that model pulled) finds out.
-async fn ollama_ready(tag: &str) -> Result<ManagedLlmStatus, String> {
+async fn ollama_ready(tag: &str, ollama_host: &str) -> Result<ManagedLlmStatus, String> {
     let tags = reqwest::Client::new()
-        .get(format!("{OLLAMA_URL}/api/tags"))
+        .get(format!("{ollama_host}/api/tags"))
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -519,6 +606,25 @@ pub async fn start(
     process: &std::sync::Mutex<Option<ManagedLlmProcess>>,
     profile_id: &str,
 ) -> Result<ManagedLlmStatus, String> {
+    if let Some(selected) = crate::ollama_engine::tier(profile_id) {
+        let state = app.state::<crate::commands::AppState>();
+        crate::ollama_engine::start(app, &state.ollama).await?;
+        let system = System::new_all();
+        let memory_gb = system.total_memory() / 1_000_000_000;
+        let version = crate::ollama_engine::version().await?;
+        let tag = crate::ollama_engine::effective_tag(selected, memory_gb, &version);
+        if !crate::ollama_engine::has_tag(tag).await? {
+            return Err("The model isn't downloaded yet.".to_string());
+        }
+        let ollama_host = crate::ollama_engine::host();
+        set_managed_credentials(Some((format!("{ollama_host}/v1"), String::new())));
+        set_managed_ollama_host(Some(ollama_host));
+        return Ok(ManagedLlmStatus {
+            state: "running".to_string(),
+            profile_id: Some(profile_id.to_string()),
+            detail: format!("Local meeting notes run through the managed engine ({tag})."),
+        });
+    }
     // Where Rapid-MLX cannot run, "local" means Ollama — for ANY profile id, not
     // just an `ollama:`-prefixed one.
     //
@@ -533,7 +639,8 @@ pub async fn start(
     // Without this, picking a detected Ollama model on a Mac fell through to
     // the Rapid-MLX path and failed with "Unknown model profile: ollama:…".
     if let Some(tag) = profile_id.strip_prefix("ollama:") {
-        return ollama_ready(tag).await;
+        set_managed_ollama_host(None);
+        return ollama_ready(tag, OLLAMA_URL).await;
     }
     // A stale id resolves to the configured Ollama tag instead.
     if !rapid_mlx_supported() {
@@ -551,8 +658,10 @@ pub async fn start(
             .strip_prefix("ollama:")
             .map(str::to_string)
             .unwrap_or_else(|| crate::config::load_config().ollama_model);
-        return ollama_ready(&tag).await;
+        set_managed_ollama_host(None);
+        return ollama_ready(&tag, OLLAMA_URL).await;
     }
+    set_managed_ollama_host(None);
     if process.lock().unwrap().is_some() {
         return Ok(status(process));
     }
@@ -738,6 +847,7 @@ async fn start_llama_server(
 
 pub fn stop(process: &std::sync::Mutex<Option<ManagedLlmProcess>>) {
     set_managed_credentials(None);
+    set_managed_ollama_host(None);
     if let Some(mut managed) = process.lock().unwrap().take() {
         crate::diagnostics::record("local_model.stopped", &managed.profile_id);
         let _ = managed.child.kill();

@@ -1,6 +1,10 @@
 //! Shared types — mirrors the Python + TypeScript contracts.
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ---- API shapes ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +71,13 @@ pub struct HealthResponse {
     /// missing). `None` when the transcriber is ready or the service is older.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcriber_detail: Option<String>,
+    /// Semantic-search readiness reported by the service:
+    /// `ready` | `missing` | `unavailable`. Absent on older services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedder_state: Option<String>,
+    /// Human detail for the semantic-search engine state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedder_detail: Option<String>,
 }
 
 // ---- Meeting ----
@@ -97,6 +108,26 @@ pub struct TranscriptTurn {
 pub struct ChunkRow {
     pub meeting_id: i64,
     pub kind: String,
+    pub text: String,
+    pub embedding: Vec<f32>,
+}
+
+/// One document discovered in an automatic workspace context source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextDoc {
+    pub id: i64,
+    pub source: String,
+    pub path: String,
+    pub title: String,
+    pub body: String,
+    pub fingerprint: String,
+    pub updated_at: String,
+}
+
+/// One embedded passage from a vault note or project card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextChunkRow {
+    pub doc_id: i64,
     pub text: String,
     pub embedding: Vec<f32>,
 }
@@ -368,6 +399,12 @@ pub struct SetupStatus {
     /// platforms). Gates the transparent-install consent card in the wizard.
     #[serde(default)]
     pub managed_engine_installed: bool,
+    /// Whether this build can launch the app-managed Ollama sidecar.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ollama_sidecar_available: bool,
+    /// Version reported by the managed Ollama binary or running sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +574,14 @@ pub struct AppConfig {
     /// deliberate, opt-in egress.
     #[serde(default)]
     pub second_brain_enabled: bool,
+    /// Obsidian vault searched automatically for workspace runs. Empty disables
+    /// the source (legacy configs derive it from `second_brain_path` at load).
+    #[serde(default)]
+    pub context_vault_path: String,
+    /// Parent folder whose immediate subdirectories are indexed as projects.
+    /// Empty disables automatic project matching.
+    #[serde(default)]
+    pub context_projects_root: String,
     /// OS notification shortly before a calendar meeting starts. Asked once on
     /// the wizard's Ready screen and editable in Settings › General. Off by
     /// default so existing users never get a surprise notification.
@@ -564,6 +609,9 @@ pub struct AppConfig {
     /// Model). False = not yet shown; set true on finish OR skip.
     #[serde(default)]
     pub tour_completed: bool,
+    /// Global Pause: when true no workspace task starts by itself.
+    #[serde(default)]
+    pub agents_paused: bool,
 }
 
 /// Default on-device Whisper model for a fresh config. Windows gets the turbo
@@ -725,4 +773,163 @@ pub struct CalendarAttendee {
     pub email: String,
     pub response_status: String, // accepted/declined/tentative/needsAction
     pub organizer: bool,
+}
+
+// ---- Workspaces ----
+
+/// User-selected roots that feed the automatic workspace context index.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ContextSources {
+    pub vault_path: String,
+    pub projects_root: String,
+}
+
+/// Aggregate state surfaced in Settings for the local context index.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ContextIndexStatus {
+    pub vault_docs: i64,
+    pub project_docs: i64,
+    pub changed: i64,
+    pub embedding_errors: i64,
+    pub last_synced_at: String,
+}
+
+/// A long-lived project container for meeting work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: i64,
+    pub name: String,
+    pub engine: String,
+    pub network_allowed: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A workspace plus the counts shown on its home-screen card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub workspace: Workspace,
+    pub queued_task_count: i64,
+    pub needs_you_count: i64,
+    pub running_task_count: i64,
+    pub awaiting_review_count: i64,
+    pub approved_task_count: i64,
+    pub total_task_count: i64,
+    pub meeting_count: i64,
+    pub folder_count: i64,
+}
+
+/// Which workspace a meeting's to-dos flow into. `workspace_id == None`
+/// means the user said "not a project"; no row at all means undecided.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingWorkspaceBinding {
+    pub meeting_id: i64,
+    pub workspace_id: Option<i64>,
+    /// Resolved at read time; empty when unbound.
+    pub workspace_name: String,
+}
+
+/// The workspace the graph proposes for a meeting, with the evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSuggestion {
+    pub workspace_id: i64,
+    pub workspace_name: String,
+    pub related_meeting_count: i64,
+    pub shared_attendee_count: i64,
+}
+
+/// One meeting, folder, or file made available to a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceContextItem {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub kind: String,
+    pub value: String,
+    pub label: String,
+    pub created_at: String,
+}
+
+/// A reusable skill or agent role available to workspaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceAddon {
+    pub id: i64,
+    /// "skill" | "agent"
+    pub kind: String,
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    /// Markdown instructions injected into the brief.
+    pub instructions: String,
+    pub builtin: bool,
+    pub created_at: String,
+}
+
+/// A queued unit of work inside a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceTask {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub title: String,
+    pub details: String,
+    pub status: String,
+    pub source_meeting_id: Option<i64>,
+    /// Resolved at read time; empty when the task has no source meeting.
+    pub source_meeting_title: String,
+    /// The to-do this task was pushed from, when it came from the board.
+    pub action_item_id: Option<i64>,
+    /// 1 for the first run; incremented by every rejection.
+    pub attempt: i64,
+    /// One line per rejection, oldest first. Appended to the brief on re-run.
+    pub rejection_notes: Vec<String>,
+    pub agent_eligible: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One execution attempt for a workspace task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkspaceRun {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub task_id: i64,
+    pub engine: String,
+    pub status: String,
+    pub log: String,
+    pub error: String,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+/// A file produced by a workspace run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkspaceArtifact {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub run_id: i64,
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+}
+
+/// Runtime availability information for one workspace execution engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkspaceEngine {
+    pub id: String,
+    pub label: String,
+    pub available: bool,
+    pub version: String,
+    pub detail: String,
+}
+
+/// The complete data needed by the workspace detail screen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceDetail {
+    pub workspace: Workspace,
+    pub context_items: Vec<WorkspaceContextItem>,
+    pub addons: Vec<WorkspaceAddon>,
+    pub tasks: Vec<WorkspaceTask>,
+    pub artifacts: Vec<WorkspaceArtifact>,
 }

@@ -192,6 +192,27 @@ class ChatRequest(BaseModel):
     )
 
 
+class DraftRequest(BaseModel):
+    brief: str = Field(..., description="Task brief with all context the writer may use")
+    instruction: str = Field(..., description="What to produce from the brief")
+    model: str | None = Field(
+        default=None,
+        description="Model override; falls back to the summarizer's default",
+    )
+    llm_base_url: str | None = Field(
+        default=None,
+        description=(
+            "OpenAI-compatible base URL for cloud chat. When non-empty, the "
+            "summarizer uses the OpenAI path with this URL + api_key regardless "
+            "of its default backend. Empty/None = use the service's local default."
+        ),
+    )
+    llm_api_key: str | None = Field(
+        default=None,
+        description="API key for the cloud LLM provider (only used when llm_base_url is set).",
+    )
+
+
 class EmbedRequest(BaseModel):
     texts: list[str] = Field(..., description="Batch of texts to embed")
     model: str | None = Field(
@@ -199,6 +220,14 @@ class EmbedRequest(BaseModel):
         description="Embedding model override; defaults to the service's "
         "EMBED_MODEL env var or bge-m3",
     )
+    ollama_host: str | None = Field(
+        default=None,
+        description="Per-request local Ollama host; defaults to the host configured by Rust.",
+    )
+
+
+class LlmHostRequest(BaseModel):
+    ollama_host: str = Field(..., description="Loopback Ollama host owned by the desktop app")
 
 
 class EmbedResponse(BaseModel):
@@ -405,3 +434,5 @@ class HealthResponse(BaseModel):
     # Settings instead of showing a dead service (SETUP_REDESIGN_SPEC V3).
     transcriber_state: str = "ready"
     transcriber_detail: str | None = None
+    embedder_state: str | None = None
+    embedder_detail: str | None = None

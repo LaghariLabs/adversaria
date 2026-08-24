@@ -45,9 +45,40 @@ pub fn recordings_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Root directory for all workspace run data. Created on demand.
+pub fn workspaces_root() -> anyhow::Result<PathBuf> {
+    let dir = app_data_dir().join("workspaces");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Directory where one workspace run writes its deliverables. Created on demand.
+pub fn workspace_run_dir(workspace_id: i64, run_id: i64) -> anyhow::Result<PathBuf> {
+    let dir = workspaces_root()?
+        .join(workspace_id.to_string())
+        .join(format!("run-{run_id}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Load `AppConfig` from disk, falling back to defaults if the file
 /// does not exist or is unreadable.
 pub fn load_config() -> AppConfig {
+    let mut config = load_config_without_context_default();
+    apply_context_source_default(&mut config);
+    config
+}
+
+fn apply_context_source_default(config: &mut AppConfig) {
+    if config.context_vault_path.trim().is_empty() && !config.second_brain_path.trim().is_empty() {
+        config.context_vault_path = config.second_brain_path.clone();
+    }
+}
+
+/// Read the persisted config without applying the second-brain-derived context
+/// default. Writers use this so an unrelated config save does not persist a
+/// value that was meant to exist only in the returned runtime snapshot.
+fn load_config_without_context_default() -> AppConfig {
     let path = config_path();
     if path.exists() {
         std::fs::read_to_string(&path)
@@ -144,7 +175,7 @@ static CONFIG_UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// load/load/save/save, and the second save silently reverts the first.
 pub fn update_config_with(mutate: impl FnOnce(&mut AppConfig)) -> anyhow::Result<AppConfig> {
     let _guard = CONFIG_UPDATE.lock().unwrap();
-    let mut config = load_config();
+    let mut config = load_config_without_context_default();
     mutate(&mut config);
     save_config(&config)?;
     Ok(config)
@@ -195,6 +226,8 @@ impl Default for AppConfig {
             meeting_alert_style: "notch_drop".to_string(),
             second_brain_path: String::new(),
             second_brain_enabled: false,
+            context_vault_path: String::new(),
+            context_projects_root: String::new(),
             meeting_reminder_enabled: false,
             meeting_reminder_minutes: 5,
             // On by default: the digest already fires for every existing user
@@ -203,6 +236,7 @@ impl Default for AppConfig {
             todo_digest_enabled: true,
             todo_digest_hour: 9,
             tour_completed: false,
+            agents_paused: false,
         }
     }
 }
@@ -229,6 +263,24 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.summary_language, "en");
         assert_eq!(config.theme, "dark");
+    }
+
+    #[test]
+    fn vault_context_defaults_to_second_brain_without_overriding_an_explicit_path() {
+        let mut legacy = AppConfig {
+            second_brain_path: "/vault/wiki/meetings".to_string(),
+            ..AppConfig::default()
+        };
+        apply_context_source_default(&mut legacy);
+        assert_eq!(legacy.context_vault_path, "/vault/wiki/meetings");
+
+        let mut explicit = AppConfig {
+            second_brain_path: "/vault/wiki/meetings".to_string(),
+            context_vault_path: "/vault".to_string(),
+            ..AppConfig::default()
+        };
+        apply_context_source_default(&mut explicit);
+        assert_eq!(explicit.context_vault_path, "/vault");
     }
 
     #[test]

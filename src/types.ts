@@ -33,6 +33,7 @@ export interface TemplateInfo {
 
 /** On-device transcription engine state, reported by `/health` (SPEC V3). */
 export type TranscriberState = "loading" | "ready" | "missing" | "error";
+export type EmbedderState = "ready" | "missing" | "unavailable";
 
 export interface HealthResponse {
   status: string;
@@ -42,6 +43,10 @@ export interface HealthResponse {
   transcriber_state?: TranscriberState;
   /** Human sentence explaining a non-ready `transcriber_state`. */
   transcriber_detail?: string | null;
+  /** Semantic-search model state; absent on older service builds. */
+  embedder_state?: EmbedderState;
+  /** Human sentence explaining the semantic-search state. */
+  embedder_detail?: string | null;
 }
 
 // ---- Meeting (stored in SQLite, exposed via IPC) ----
@@ -369,6 +374,29 @@ export interface SetupStatus {
   gpu_name?: string | null;
   /** Managed llama.cpp engine installed (non-Apple-Silicon platforms). */
   managed_engine_installed?: boolean;
+  /** This build can launch the app-managed Ollama sidecar. */
+  ollama_sidecar_available?: boolean;
+  /** Managed Ollama version, when it can be resolved. */
+  ollama_version?: string | null;
+}
+
+/** Exact managed Ollama engine/model choice disclosed before download. */
+export interface OllamaInstallPlan {
+  schema_version: number;
+  engine_name: string;
+  engine_version: string;
+  binary_path: string;
+  bundled: boolean;
+  models_dir: string;
+  tier_profile_id: string;
+  tier_display_name: string;
+  chat_tag: string;
+  chat_size_bytes: number;
+  embed_tag: string;
+  embed_size_bytes: number;
+  chat_installed: boolean;
+  embed_installed: boolean;
+  mlx: boolean;
 }
 
 /** Everything the transparent Windows engine install would do — shown on the
@@ -395,14 +423,22 @@ export interface EngineInstallPlan {
 }
 
 export interface ManagedLlmStatus {
-  state: "stopped" | "starting" | "ready" | "error";
+  state: "stopped" | "starting" | "ready" | "running" | "error";
   profile_id: string | null;
   detail: string;
 }
 
 export interface ModelDownloadStatus {
   profile_id: string;
-  state: "idle" | "preparing" | "downloading" | "verifying" | "ready" | "error";
+  state:
+    | "idle"
+    | "queued"
+    | "preparing"
+    | "downloading"
+    | "verifying"
+    | "ready"
+    | "failed"
+    | "error";
   downloaded_bytes: number;
   total_bytes: number;
   detail: string;
@@ -471,4 +507,146 @@ export interface MeetingStats {
   total_speech_seconds: number | null;
   owner: string | null;
   speakers: SpeakerStats[];
+}
+
+// ---- Workspaces ----
+
+/** Filesystem roots searched automatically for every workspace run. */
+export interface ContextSources {
+  vault_path: string;
+  projects_root: string;
+}
+
+/** Aggregate status of the local vault/project context index. */
+export interface ContextIndexStatus {
+  vault_docs: number;
+  project_docs: number;
+  changed: number;
+  embedding_errors: number;
+  last_synced_at: string;
+}
+
+/** A long-lived project container for meeting work. */
+export interface Workspace {
+  id: number;
+  name: string;
+  engine: string;
+  network_allowed: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A workspace plus the counts shown on its home-screen card. */
+export interface WorkspaceSummary {
+  workspace: Workspace;
+  queued_task_count: number;
+  needs_you_count: number;
+  running_task_count: number;
+  awaiting_review_count: number;
+  approved_task_count: number;
+  total_task_count: number;
+  meeting_count: number;
+  folder_count: number;
+}
+
+/** Which workspace a meeting's to-dos flow into. `workspace_id === null` = "not a project"; no row = undecided. */
+export interface MeetingWorkspaceBinding {
+  meeting_id: number;
+  workspace_id: number | null;
+  workspace_name: string;
+}
+
+/** The workspace the graph proposes for a meeting, with the evidence. */
+export interface WorkspaceSuggestion {
+  workspace_id: number;
+  workspace_name: string;
+  related_meeting_count: number;
+  shared_attendee_count: number;
+}
+
+/** One meeting, folder, or file made available to a workspace. */
+export interface WorkspaceContextItem {
+  id: number;
+  workspace_id: number;
+  kind: string;
+  value: string;
+  label: string;
+  created_at: string;
+}
+
+/** A queued unit of work inside a workspace. */
+export interface WorkspaceTask {
+  id: number;
+  workspace_id: number;
+  title: string;
+  details: string;
+  status: string;
+  source_meeting_id: number | null;
+  /** Resolved at read time; empty when the task has no source meeting. */
+  source_meeting_title: string;
+  /** The to-do this task was pushed from, when it came from the board. */
+  action_item_id: number | null;
+  /** 1 for the first run; incremented by every rejection. */
+  attempt: number;
+  /** One line per rejection, oldest first. Appended to the brief on re-run. */
+  rejection_notes: string[];
+  /** Whether the autopilot may pick up this task. Manual Run is always available. */
+  agent_eligible: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One execution attempt for a workspace task. */
+export interface WorkspaceRun {
+  id: number;
+  workspace_id: number;
+  task_id: number;
+  engine: string;
+  status: string;
+  log: string;
+  error: string;
+  started_at: string;
+  finished_at: string;
+}
+
+/** A file produced by a workspace run. */
+export interface WorkspaceArtifact {
+  id: number;
+  workspace_id: number;
+  run_id: number;
+  name: string;
+  path: string;
+  created_at: string;
+}
+
+/** Runtime availability information for a workspace execution engine. */
+export interface WorkspaceEngine {
+  id: string;
+  label: string;
+  available: boolean;
+  version: string;
+  detail: string;
+}
+
+/** A reusable skill or agent role available to workspaces. */
+export interface WorkspaceAddon {
+  id: number;
+  /** "skill" | "agent" */
+  kind: string;
+  slug: string;
+  name: string;
+  description: string;
+  /** Markdown instructions injected into the brief. */
+  instructions: string;
+  builtin: boolean;
+  created_at: string;
+}
+
+/** The complete data needed by the workspace detail screen. */
+export interface WorkspaceDetail {
+  workspace: Workspace;
+  context_items: WorkspaceContextItem[];
+  addons: WorkspaceAddon[];
+  tasks: WorkspaceTask[];
+  artifacts: WorkspaceArtifact[];
 }

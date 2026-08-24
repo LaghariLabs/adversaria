@@ -58,13 +58,23 @@ const AskAllView = lazy(() =>
 const GraphView = lazy(() =>
   import("./components/GraphView").then((module) => ({ default: module.GraphView })),
 );
+const WorkspacesView = lazy(() =>
+  import("./components/WorkspacesView").then((m) => ({ default: m.WorkspacesView })),
+);
 
 const SILENCE_PROMPT_MS = 5 * 60 * 1000;
 const SILENCE_STOP_MS = 10 * 60 * 1000;
 const SILENCE_CHECK_MS = 15 * 1000;
 const THEME_PREVIEW_EVENT = "adversaria-theme-preview";
 
-type View = "meetings" | "settings" | "todos" | "weekly" | "ask" | "graph";
+type View =
+  | "meetings"
+  | "settings"
+  | "todos"
+  | "weekly"
+  | "ask"
+  | "graph"
+  | "workspaces";
 
 function App() {
   const [view, setView] = useState<View>("meetings");
@@ -732,6 +742,9 @@ function App() {
               ["weekly", "Weekly"],
               ["ask", "Ask"],
               ["graph", "Graph"],
+              // Workspaces is dev-only until the feature earns its release:
+              // the code ships dormant, the tab never renders for users.
+              ...(import.meta.env.DEV ? [["workspaces", "Workspaces"]] : []),
               ["settings", "Settings"],
             ] as [View, string][]
           ).map(([v, label]) => (
@@ -1049,6 +1062,8 @@ function App() {
               <AskAllView onOpenMeeting={handleOpenFromTodos} />
             ) : view === "graph" ? (
               <GraphView meetings={meetings} onSelectMeeting={handleOpenFromTodos} />
+            ) : view === "workspaces" ? (
+              <WorkspacesView onOpenMeeting={handleOpenFromTodos} />
             ) : isRecordingActive && !selectedMeeting ? (
               companionActive ? (
                 <RecordingCompanion

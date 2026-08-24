@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 # Mock heavy dependencies before importing the server module
@@ -162,6 +163,47 @@ class TestHealthEndpoint:
         response = client.get("/health")
         data = response.json()
         assert data["status"] in ("ok", "degraded")
+
+    @pytest.mark.parametrize(
+        ("payload", "error", "expected"),
+        [
+            ({"models": [{"name": "bge-m3:latest"}]}, None, "ready"),
+            ({"models": [{"name": "qwen3.5:4b"}]}, None, "missing"),
+            (None, RuntimeError("connection refused"), "unavailable"),
+        ],
+    )
+    def test_health_reports_embedder_state(
+        self, monkeypatch, payload, error, expected
+    ) -> None:
+        previous = _server_mod._embedder
+        _server_mod._embedder = MagicMock()
+        response = MagicMock()
+        if error is not None:
+            monkeypatch.setattr(_server_mod.httpx, "get", MagicMock(side_effect=error))
+        else:
+            response.json.return_value = payload
+            response.raise_for_status.return_value = None
+            monkeypatch.setattr(_server_mod.httpx, "get", MagicMock(return_value=response))
+        try:
+            result = client.get("/health")
+            assert result.status_code == 200
+            assert result.json()["embedder_state"] == expected
+        finally:
+            _server_mod._embedder = previous
+
+    def test_managed_llm_host_marks_sidecar_port_as_ollama(self) -> None:
+        from src.summarizer import _is_local_ollama_url
+
+        response = client.post(
+            "/setup/llm_host",
+            json={"ollama_host": "http://127.0.0.1:27434"},
+        )
+
+        assert response.status_code == 200
+        assert _is_local_ollama_url("http://127.0.0.1:27434/v1")
+        assert _is_local_ollama_url("http://127.0.0.1:11434/v1")
+        assert not _is_local_ollama_url("https://api.openai.com/v1")
+        assert not _is_local_ollama_url("http://127.0.0.1:8000/v1")
 
 
 class TestTranscribeEndpoint:
@@ -435,6 +477,52 @@ class TestChatStream:
             assert "[DONE]" not in body
         finally:
             _fake_summarizer_instance.chat_stream = None  # reset
+
+
+class TestDraftStream:
+    """Tests for POST /draft_stream SSE document streaming with retry."""
+
+    def test_streams_tokens_then_done(self) -> None:
+        def _stream(**kwargs):
+            return iter(["# Draft", "\n\nBody"])
+
+        _fake_summarizer_instance.draft_stream = _stream
+        try:
+            resp = client.post(
+                "/draft_stream",
+                json={"brief": "# Task\n\nWrite a memo", "instruction": "Draft it."},
+            )
+            body = resp.text
+            assert '{"t": "# Draft"}' in body
+            assert '{"t": "\\n\\nBody"}' in body
+            assert "[DONE]" in body
+        finally:
+            _fake_summarizer_instance.draft_stream = None
+
+    def test_double_empty_sends_error_frame(self) -> None:
+        calls = []
+
+        def _stream(**kwargs):
+            calls.append(1)
+            return iter([])
+
+        _fake_summarizer_instance.draft_stream = _stream
+        try:
+            resp = client.post(
+                "/draft_stream",
+                json={"brief": "# Task\n\nWrite a memo", "instruction": "Draft it."},
+            )
+            body = resp.text
+            assert "empty draft" in body
+            assert "error" in body
+            assert "[DONE]" not in body
+            assert len(calls) == 2
+        finally:
+            _fake_summarizer_instance.draft_stream = None
+
+    def test_missing_brief_returns_422(self) -> None:
+        resp = client.post("/draft_stream", json={"instruction": "Draft it."})
+        assert resp.status_code == 422
 
 
 class TestTranscribeChunk:

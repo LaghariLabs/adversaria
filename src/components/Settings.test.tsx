@@ -162,6 +162,58 @@ describe("Settings", () => {
       );
     }
   });
+
+  it("configures workspace context folders and renders index counts", async () => {
+    const initial = appConfig();
+    let contextSources = {
+      vault_path: "/Users/hamza/laghari-vault",
+      projects_root: "/Users/hamza/MyProjects",
+    };
+    let savedPayload: unknown;
+    mockIPC((command, payload) => {
+      if (command === "get_config") return initial;
+      if (command === "list_templates") return [{ name: "general", description: "" }];
+      if (command === "list_whisper_models") return [];
+      if (command === "plugin:app|version") return "0.3.80";
+      if (command === "calendar_status") return initial.calendar;
+      if (command === "calendar_has_credentials") return false;
+      if (command === "get_context_sources") return contextSources;
+      if (command === "get_context_index_status") {
+        return {
+          vault_docs: 547,
+          project_docs: 56,
+          changed: 0,
+          embedding_errors: 0,
+          last_synced_at: "2026-08-22T18:00:00Z",
+        };
+      }
+      if (command === "pick_workspace_folder") return "/Users/hamza/new-vault";
+      if (command === "set_context_sources") {
+        savedPayload = payload;
+        const args = payload as { vaultPath: string; projectsRoot: string };
+        contextSources = {
+          vault_path: args.vaultPath,
+          projects_root: args.projectsRoot,
+        };
+        return null;
+      }
+      return null;
+    });
+    const user = userEvent.setup();
+    render(<Settings />);
+
+    await user.click(await screen.findByRole("button", { name: "Integrations settings" }));
+    expect(await screen.findByText(/Indexed: 547 vault notes · 56 projects/)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Choose Obsidian vault folder" }));
+    await waitFor(() =>
+      expect(savedPayload).toEqual({
+        vaultPath: "/Users/hamza/new-vault",
+        projectsRoot: "/Users/hamza/MyProjects",
+      }),
+    );
+    expect(await screen.findByText("/Users/hamza/new-vault")).toBeVisible();
+  });
 });
 
 describe("Setup status ledger — unknown is not a problem", () => {
@@ -219,6 +271,79 @@ describe("Setup status ledger — unknown is not a problem", () => {
     });
     const card = container.querySelector(".settings-section-card.active-card");
     expect(card?.textContent).not.toContain("No model downloaded yet");
+  });
+});
+
+describe("Setup status semantic search", () => {
+  const mockSemanticIpc = (
+    embedderState: "ready" | "missing" | "unavailable",
+    onEnsure = vi.fn(),
+  ) =>
+    mockIPC((command) => {
+      if (command === "get_config") return appConfig();
+      if (command === "list_templates") return [{ name: "general", description: "" }];
+      if (command === "list_whisper_models") return [];
+      if (command === "check_service_health") {
+        return {
+          status: "ok",
+          whisper_model: "large-v3",
+          ollama_available: true,
+          transcriber_state: "ready",
+          embedder_state: embedderState,
+          embedder_detail: "",
+        };
+      }
+      if (command === "ensure_embedding_model") {
+        onEnsure();
+        return {
+          profile_id: "bge-m3",
+          state: "queued",
+          downloaded_bytes: 0,
+          total_bytes: 0,
+          detail: "Queued for download.",
+          error_code: null,
+          verified: false,
+          can_retry: false,
+        };
+      }
+      if (command === "get_embedding_model_status") {
+        return {
+          profile_id: "bge-m3",
+          state: "downloading",
+          downloaded_bytes: 100,
+          total_bytes: 1_200_000_000,
+          detail: "Downloading.",
+          error_code: null,
+          verified: false,
+          can_retry: false,
+        };
+      }
+      if (command === "plugin:app|version") return "0.3.80";
+      return null;
+    });
+
+  it.each([
+    ["ready", "✓ Ready (bge-m3)"],
+    ["missing", "Not downloaded"],
+    ["unavailable", "Local engine not running"],
+  ] as const)("renders the %s state", async (state, copy) => {
+    mockSemanticIpc(state);
+    render(<Settings initialTab="setup" />);
+
+    const row = await screen.findByLabelText("Semantic search");
+    expect(within(row).getByText(copy)).toBeInTheDocument();
+  });
+
+  it("downloads bge-m3 from the missing state", async () => {
+    const ensured = vi.fn();
+    mockSemanticIpc("missing", ensured);
+    const user = userEvent.setup();
+    render(<Settings initialTab="setup" />);
+
+    const row = await screen.findByLabelText("Semantic search");
+    await user.click(within(row).getByRole("button", { name: "Download (1.2 GB)" }));
+
+    await waitFor(() => expect(ensured).toHaveBeenCalledOnce());
   });
 });
 
