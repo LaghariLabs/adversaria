@@ -1,9 +1,17 @@
 import { useEffect, useState } from "react";
 
-import type { AppConfig, RegistrationState, SetupStatus, WhisperModelInfo } from "../../types";
+import type {
+  AppConfig,
+  ModelDownloadStatus,
+  RegistrationState,
+  SetupStatus,
+  WhisperModelInfo,
+} from "../../types";
 import type { ServiceHealth } from "../../hooks/useServiceHealth";
 import {
   checkCapturePermissions,
+  ensureEmbeddingModel,
+  getEmbeddingModelStatus,
   openPrivacySettings,
   probeSystemAudio,
   requestMicrophonePermission,
@@ -89,6 +97,8 @@ export function SetupStatusSection({
   const [permissions, setPermissions] = useState<CapturePermissions | null>(null);
   const [permissionBusy, setPermissionBusy] = useState<"" | "microphone" | "system_audio">("");
   const [permissionError, setPermissionError] = useState("");
+  const [embeddingDownload, setEmbeddingDownload] = useState<ModelDownloadStatus | null>(null);
+  const [embeddingError, setEmbeddingError] = useState("");
 
   useEffect(() => {
     let alive = true;
@@ -103,6 +113,46 @@ export function SetupStatusSection({
       alive = false;
     };
   }, []);
+
+  const embeddingInFlight = embeddingDownload
+    ? ["queued", "preparing", "downloading", "verifying"].includes(
+        embeddingDownload.state,
+      )
+    : false;
+
+  useEffect(() => {
+    if (!embeddingInFlight) return;
+    let alive = true;
+    const poll = () => {
+      getEmbeddingModelStatus()
+        .then((status) => {
+          if (!alive) return;
+          setEmbeddingDownload(status);
+          if (status.state === "ready") void health.checkHealth();
+        })
+        .catch((error) => {
+          if (alive) setEmbeddingError(String(error));
+        });
+    };
+    const timer = window.setInterval(poll, 1_000);
+    poll();
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [embeddingInFlight, health.checkHealth]);
+
+  const downloadEmbedding = async () => {
+    if (embeddingInFlight) return;
+    setEmbeddingError("");
+    try {
+      const status = await ensureEmbeddingModel();
+      setEmbeddingDownload(status);
+      if (status.state === "ready") await health.checkHealth();
+    } catch (error) {
+      setEmbeddingError(String(error));
+    }
+  };
 
   const requestMicrophone = async () => {
     setPermissionBusy("microphone");
@@ -321,6 +371,10 @@ export function SetupStatusSection({
     : "Audio and transcript never leave this computer";
   const microphonePermission = permissionChip(permissions?.microphone);
   const systemAudioPermission = permissionChip(permissions?.system_audio);
+  const embedderState = health.health?.embedder_state;
+  const embeddingFailed = ["failed", "error"].includes(embeddingDownload?.state ?? "");
+  const semanticReady = embeddingDownload?.state === "ready" || embedderState === "ready";
+  const semanticPlace = setup?.platform === "macos" ? "this Mac" : "this computer";
 
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`}>
@@ -352,6 +406,67 @@ export function SetupStatusSection({
           </button>
         ))}
       </div>
+
+      {/* // Dev-only until ADR-016 ships to users (gate mirrors App.tsx). */}
+      {import.meta.env.DEV && (
+        embedderState ? <div className="settings-subcard" aria-label="Semantic search" style={{ marginTop: 12 }}>
+          <div className="settings-row" style={{ justifyContent: "space-between", gap: 16 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <strong>Semantic search</strong>
+              <p className="settings-help" style={{ margin: "2px 0 0" }}>
+                Finds related meetings and notes by meaning, not just words. Stays on {semanticPlace}.
+              </p>
+            </div>
+            <div className="settings-model-action" style={{ flexShrink: 0 }}>
+              {semanticReady ? (
+                <span className="settings-msg ok" role="status">✓ Ready (bge-m3)</span>
+              ) : embeddingInFlight && embeddingDownload ? (
+                <span className="settings-model-dl" role="status">
+                  {embeddingDownload.total_bytes > 0
+                    ? `${(embeddingDownload.downloaded_bytes / 1_000_000_000).toFixed(1)} of ${(embeddingDownload.total_bytes / 1_000_000_000).toFixed(1)} GB`
+                    : "Preparing…"}
+                </span>
+              ) : (
+                <>
+                  <span className={embeddingFailed ? "settings-msg err" : "settings-msg warn"}>
+                    {embeddingFailed
+                      ? "Download failed"
+                      : embedderState === "missing"
+                        ? "Not downloaded"
+                        : "Local engine not running"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void downloadEmbedding()}
+                    disabled={embeddingInFlight}
+                  >
+                    {embeddingFailed || embedderState === "unavailable"
+                      ? "Retry"
+                      : "Download (1.2 GB)"}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+          {embeddingInFlight && embeddingDownload && (
+            embeddingDownload.total_bytes > 0 ? (
+              <progress
+                aria-label="Semantic search model download progress"
+                value={embeddingDownload.downloaded_bytes}
+                max={embeddingDownload.total_bytes}
+              />
+            ) : (
+              <progress aria-label="Semantic search model download progress" />
+            )
+          )}
+          {(embeddingError || (embeddingFailed && embeddingDownload?.detail)) && (
+            <p className="settings-help" role="alert">
+              {embeddingError || embeddingDownload?.detail}
+            </p>
+          )}
+        </div> : null
+      )}
 
       <div className="settings-route">
         <span className="settings-route-label">Where your data goes</span>

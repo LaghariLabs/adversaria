@@ -163,6 +163,7 @@ mod tests {
              );",
         )
         .unwrap();
+        crate::storage::create_workspace_tables(&conn).unwrap();
         conn
     }
 

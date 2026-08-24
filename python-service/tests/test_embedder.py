@@ -61,6 +61,21 @@ class TestOllamaEmbedderEmbed:
         assert model == "other-model"
         assert vectors == [[0.5, 0.6]]
 
+    def test_embed_host_override_uses_cached_client_for_that_host(
+        self, embedder: OllamaEmbedder
+    ) -> None:
+        """A request-scoped managed host is passed to the Ollama client factory."""
+        _fake_ollama.Client.reset_mock()
+        _fake_client_instance.embed.return_value = {"embeddings": [[0.7, 0.8]]}
+
+        vectors, model = embedder.embed(
+            ["managed"], host="http://127.0.0.1:27434/v1"
+        )
+
+        _fake_ollama.Client.assert_called_once_with(host="http://127.0.0.1:27434")
+        assert vectors == [[0.7, 0.8]]
+        assert model == DEFAULT_EMBED_MODEL
+
     def test_embed_client_error_raises_with_pull_hint(
         self, embedder: OllamaEmbedder
     ) -> None:
@@ -117,6 +132,26 @@ class TestEmbedEndpoint:
         assert len(data["embeddings"]) == 2
         assert data["model"] == "bge-m3"
         assert data["dim"] == 4
+
+    def test_embed_forwards_managed_ollama_host(self, client, mock_embed) -> None:
+        """Rust may override the default host per embedding request."""
+        import src.server as srv
+        srv._embedder = mock_embed
+
+        resp = client.post(
+            "/embed",
+            json={
+                "texts": ["hello", "world"],
+                "ollama_host": "http://127.0.0.1:27434",
+            },
+        )
+
+        assert resp.status_code == 200
+        mock_embed.embed.assert_called_once_with(
+            ["hello", "world"],
+            None,
+            host="http://127.0.0.1:27434",
+        )
 
     def test_embed_empty_texts(self, client, mock_embed) -> None:
         """POST /embed with empty texts list returns 400."""

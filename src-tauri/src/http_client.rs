@@ -177,6 +177,45 @@ fn service_error(body: &str, fallback: &str) -> String {
     }
 }
 
+async fn read_token_stream(
+    mut resp: reqwest::Response,
+    mut on_token: impl FnMut(&str),
+) -> Result<String, String> {
+    // Buffer raw bytes and decode only COMPLETE SSE frames (split on a blank
+    // line) — so a multibyte char (e.g. Arabic) straddling a chunk boundary
+    // is never decoded mid-character.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut answer = String::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| ANSWER_UNREACHABLE.to_string())?
+    {
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let frame: Vec<u8> = buf.drain(..pos + 2).collect();
+            for line in String::from_utf8_lossy(&frame).lines() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(t) = v.get("t").and_then(|x| x.as_str()) {
+                        on_token(t);
+                        answer.push_str(t);
+                    } else if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+                        return Err(service_error(e, ANSWER_UNREACHABLE));
+                    }
+                }
+            }
+        }
+    }
+    Ok(answer)
+}
+
 /// Owned parameters for the final-transcription HTTP boundary.
 #[derive(serde::Serialize)]
 pub struct TranscribeParams {
@@ -674,7 +713,7 @@ impl HttpClient {
         model: Option<&str>,
         llm_base_url: Option<&str>,
         llm_api_key: Option<&str>,
-        mut on_token: impl FnMut(&str),
+        on_token: impl FnMut(&str),
     ) -> Result<String, String> {
         #[derive(serde::Serialize)]
         struct ChatRequest {
@@ -689,7 +728,7 @@ impl HttpClient {
         }
 
         let base_url = self.base_url.read().unwrap().clone();
-        let mut resp = self
+        let resp = self
             .client
             .post(format!("{}/chat_stream", base_url))
             .json(&ChatRequest {
@@ -708,39 +747,52 @@ impl HttpClient {
             return Err(service_error(&body, ANSWER_UNREACHABLE));
         }
 
-        // Buffer raw bytes and decode only COMPLETE SSE frames (split on a blank
-        // line) — so a multibyte char (e.g. Arabic) straddling a chunk boundary
-        // is never decoded mid-character.
-        let mut buf: Vec<u8> = Vec::new();
-        let mut answer = String::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|_| ANSWER_UNREACHABLE.to_string())?
-        {
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-                let frame: Vec<u8> = buf.drain(..pos + 2).collect();
-                for line in String::from_utf8_lossy(&frame).lines() {
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(t) = v.get("t").and_then(|x| x.as_str()) {
-                            on_token(t);
-                            answer.push_str(t);
-                        } else if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
-                            return Err(service_error(e, ANSWER_UNREACHABLE));
-                        }
-                    }
-                }
-            }
+        read_token_stream(resp, on_token).await
+    }
+
+    /// Stream a workspace deliverable drafted from a self-contained task brief.
+    pub async fn draft_stream(
+        &self,
+        brief: &str,
+        instruction: &str,
+        model: Option<&str>,
+        llm_base_url: Option<&str>,
+        llm_api_key: Option<&str>,
+        on_token: impl FnMut(&str),
+    ) -> Result<String, String> {
+        #[derive(serde::Serialize)]
+        struct DraftRequest {
+            brief: String,
+            instruction: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            model: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            llm_base_url: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            llm_api_key: Option<String>,
         }
-        Ok(answer)
+
+        let base_url = self.base_url.read().unwrap().clone();
+        let resp = self
+            .client
+            .post(format!("{}/draft_stream", base_url))
+            .json(&DraftRequest {
+                brief: brief.to_string(),
+                instruction: instruction.to_string(),
+                model: model.map(str::to_string),
+                llm_base_url: llm_base_url.map(str::to_string),
+                llm_api_key: llm_api_key.map(str::to_string),
+            })
+            .send()
+            .await
+            .map_err(|_| SERVICE_DOWN.to_string())?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(service_error(&body, ANSWER_UNREACHABLE));
+        }
+
+        read_token_stream(resp, on_token).await
     }
 
     /// Fetch the list of available prompt templates from the service.

@@ -22,7 +22,7 @@ sys.modules["ollama"] = _fake_ollama
 import src.summarizer  # noqa: E402
 importlib.reload(src.summarizer)
 
-from src.summarizer import OllamaSummarizer  # noqa: E402
+from src.summarizer import DRAFT_SYSTEM_PROMPT, OllamaSummarizer  # noqa: E402
 from src.models import SummarizeResponse, TemplateInfo  # noqa: E402
 
 
@@ -334,7 +334,25 @@ class TestSummarize:
             transcript="Me: hello.", template_name="general", output_language="ar"
         )
         system_prompt = summarizer.client.chat.call_args[1]["messages"][0]["content"]
+        user_prompt = summarizer.client.chat.call_args[1]["messages"][-1]["content"]
         assert "Arabic" in system_prompt
+        assert "translation into the required output language" in user_prompt
+
+    def test_english_language_keeps_template_headings(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        """English must not receive the contradictory instruction to translate
+        and avoid the template's already-English section names."""
+        mock_message = MagicMock()
+        mock_message.__getitem__ = MagicMock(return_value={"content": "{}"})
+        summarizer.client.chat.return_value = mock_message
+
+        summarizer.summarize(
+            transcript="Me: hello.", template_name="general", output_language="en"
+        )
+        user_prompt = summarizer.client.chat.call_args[1]["messages"][-1]["content"]
+        assert "Use every section heading exactly as written" in user_prompt
+        assert "translation into the required output language" not in user_prompt
 
     def test_summarize_no_language_directive_by_default(
         self, summarizer: OllamaSummarizer
@@ -472,6 +490,35 @@ class TestUserNotesMerge:
         system_msg = captured["messages"][0]["content"]
         assert "<user_notes>" not in user_msg
         assert "USER NOTES" not in system_msg
+
+    def test_missing_notes_section_falls_back_to_user_lines(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        """A 4B model may omit From Your Notes despite the prompt; the user's
+        own writing must still remain visible rather than disappearing."""
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Pricing sync",
+                            "sections": [
+                                {"heading": "Overview", "bullets": ["Discussed pricing"]}
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: we discussed pricing.",
+            user_notes="- pricing pushback\n- send proposal Friday",
+        )
+
+        assert "**From Your Notes**" in result.summary
+        assert "- pricing pushback" in result.summary
+        assert "- send proposal Friday" in result.summary
 
 
 class TestChat:
@@ -642,6 +689,19 @@ class TestSpeakerLabelCleanup:
         )
         assert attendees == ["Hamza", "Sarah"]
         assert title == "Standup with Hamza"
+
+    def test_render_drops_duplicate_section_heading(self) -> None:
+        markdown, _, _ = OllamaSummarizer._render(
+            {
+                "title": "Launch sync",
+                "sections": [
+                    {"heading": "Overview", "bullets": ["Launch is ready"]},
+                    {"heading": "Overview", "bullets": ["None mentioned"]},
+                ],
+            }
+        )
+        assert markdown.count("**Overview**") == 1
+        assert "None mentioned" not in markdown
 
 
 class TestAttendeeDetails:
@@ -1263,6 +1323,43 @@ class TestSummarizeViewerLabel:
         user_message = s._chat.call_args[1]["messages"][1]["content"]
         assert "Viewer mic (not the presenter):" in user_message
         assert "Hamza:" not in user_message
+
+
+class TestDraftStream:
+    def test_draft_stream_builds_document_messages(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer._stream_messages = MagicMock(return_value=iter(["# Deliverable"]))
+
+        output = list(
+            summarizer.draft_stream(
+                brief="  # Task\n\nWrite the launch memo.  ",
+                instruction="  Produce a concise memo.  ",
+            )
+        )
+
+        assert output == ["# Deliverable"]
+        messages = summarizer._stream_messages.call_args.args[0]
+        assert messages[0] == {"role": "system", "content": DRAFT_SYSTEM_PROMPT}
+        assert "# Task\n\nWrite the launch memo." in messages[1]["content"]
+        assert "# Instruction\n\nProduce a concise memo." in messages[1]["content"]
+
+    def test_draft_stream_empty_brief_raises(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        with pytest.raises(ValueError, match="Brief is empty"):
+            list(summarizer.draft_stream("   ", "Draft it."))
+
+    def test_chat_stream_still_uses_grounded_prompt(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer._stream_messages = MagicMock(return_value=iter(["Answer."]))
+
+        list(summarizer.chat_stream("Them: launch Friday.", "When is launch?"))
+
+        messages = summarizer._stream_messages.call_args.args[0]
+        assert "single meeting using ONLY the transcript" in messages[0]["content"]
+        assert "Question: When is launch?" in messages[1]["content"]
 
 
 class TestNumCtxGuard:

@@ -5,6 +5,50 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.81] - 2026-08-24
+
+For users this release behaves like 0.3.80 — everything new is groundwork
+behind the development gate, shipped now so staging matches the tree.
+
+### Added (dev-gated: visible only in development builds)
+- **Workspaces autopilot (dev preview).** Meetings bind to a long-lived
+  workspace (graph-suggested); their open to-dos flow in as tasks; an agent
+  (bundled local model, Claude Code, or Codex) runs them one at a time per
+  workspace and every result waits in a review queue for explicit Approve /
+  Reject. Approving closes the original to-do with `done by <agent>` plus an
+  evidence link. Global "Pause all agents"; crash-safe re-queue on launch.
+- **Context engine (dev preview).** Every agent run is briefed automatically
+  from three sources searched by the task's own text: related meetings
+  (full-text + embeddings with a relevance floor), the Obsidian vault, and the
+  projects folder (matched repos attach read-only). Each run carries a receipt
+  naming exactly what was used. Sources are configured in Settings →
+  Integrations; the index refreshes on launch and every 30 minutes.
+- **Skills & agents (dev preview).** A built-in catalog (Deep research,
+  Draw.io diagram, Architecture doc, Meeting-grounded writing, Marketing copy,
+  Slides deck; Researcher, Diagrammer, Technical writer, Reviewer) plus custom
+  skills, attached per workspace and injected into every run. Claude Code gets
+  native SKILL.md files; Codex gets AGENTS.md.
+- **Artifacts render in-app** (dev preview): markdown preview on every review
+  card; `.drawio` files open in draw.io desktop; the local model can emit real
+  files (`=== FILE: name ===`), not just one draft.md.
+- **ADR-016 step A (dev-gated):** groundwork for a managed Ollama engine —
+  sidecar lifecycle on a private port, RAM-tier model profiles with pull
+  progress, one host for chat and embeddings, and a "Semantic search" health
+  row. Invisible in release builds until the engine ships.
+
+### Fixed
+- Popup menus were unreadable in Light/Cream themes (hardcoded background).
+- To-do board: workspace routing chips and task rows no longer overflow or
+  wrap one character per line in narrow panes (dev-gated views).
+
+### Internal
+- Meeting-chat prompt unchanged; a separate local drafting endpoint
+  (`/draft_stream`) now exists for workspace tasks.
+- Retrieval embedding calls are capped at 8 s with keyword fallback, so a
+  stalled embedding backend can never hang a run.
+- Decision records: ADR-016 (one local engine: managed Ollama) accepted with
+  benchmarks; Workspaces boards linked in docs/TODO.md.
+
 ## [0.3.80] - 2026-08-17
 
 ### Fixed

@@ -27,6 +27,15 @@ from .names import dedupe_attendees, ground_to_roster
 
 logger = logging.getLogger(__name__)
 
+DRAFT_SYSTEM_PROMPT = (
+    "You write complete deliverable documents in Markdown from a task brief. "
+    "Use only the context contained in the brief: its meeting notes, related meetings, "
+    "folder references, and any previous rejection notes. Follow the brief's skill and agent "
+    "instructions when present. Where the brief does not contain something you need, do not "
+    "invent it: list it under a final '## Open questions' heading. Structure the document with "
+    "headings, keep it concrete, and output only the document — no preamble, no commentary."
+)
+
 #: Placeholders local models emit instead of omitting an unknown field.
 _NOT_STATED = {"", "null", "none", "n/a", "na", "unknown", "unspecified"}
 
@@ -290,24 +299,58 @@ def _stop_reason(response: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _is_local_ollama_url(url: str | None) -> bool:
-    """True when a base_url is the local Ollama OpenAI-compatible surface.
+_LOCAL_OLLAMA_HOSTS = {
+    "http://127.0.0.1:11434",
+    "http://localhost:11434",
+}
+_MANAGED_OLLAMA_HOST: str | None = None
 
-    Rust routes local Ollama tags through ``http://127.0.0.1:11434/v1``
-    (commands.rs OLLAMA_OPENAI_BASE_URL) — but the OpenAI chat API has no
-    ``num_ctx``, so requests on that path load the model at its model-default
-    context (qwen3.5:9b: 262,144 = the 16 GB runner observed live 2026-08-02).
-    Such URLs must be served by the native Ollama client instead, where
-    ``_ollama_options()`` applies. Loopback host + Ollama's port is the test:
-    anything else on 11434 is not a realistic deployment.
-    """
+
+def _normalize_local_ollama_host(url: str | None) -> str | None:
+    """Return a safe native-client host for a loopback Ollama URL."""
     if not url:
-        return False
+        return None
     try:
         parsed = urlparse(url)
+        port = parsed.port
     except ValueError:
-        return False
-    return parsed.hostname in ("127.0.0.1", "localhost", "::1") and parsed.port == 11434
+        return None
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in ("127.0.0.1", "localhost")
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/", "/v1", "/v1/")
+    ):
+        return None
+    return f"http://{parsed.hostname}:{port}"
+
+
+def configure_local_ollama_host(url: str) -> str:
+    """Allow one additional app-owned loopback Ollama port for this process."""
+    global _MANAGED_OLLAMA_HOST
+    normalized = _normalize_local_ollama_host(url)
+    if normalized is None:
+        raise ValueError("ollama_host must be an http:// loopback URL without a path")
+    _MANAGED_OLLAMA_HOST = normalized
+    return normalized
+
+
+def _is_local_ollama_url(url: str | None) -> bool:
+    """True for Ollama's default loopback host or the app-managed loopback host.
+
+    Both the traditional port 11434 and Adversaria's private sidecar port are
+    routed through the native Ollama client so ``num_ctx`` and the other local
+    runtime options remain available. A random loopback OpenAI-compatible URL
+    is not assumed to be Ollama unless Rust explicitly registered it.
+    """
+    normalized = _normalize_local_ollama_host(url)
+    return normalized is not None and (
+        normalized in _LOCAL_OLLAMA_HOSTS or normalized == _MANAGED_OLLAMA_HOST
+    )
 
 
 def _is_apple_silicon() -> bool:
@@ -852,18 +895,27 @@ class OllamaSummarizer:
         api_key: str | None = None,
     ) -> None:
         self.model = model
-        self.host = host
+        self.host = host.rstrip("/")
         # Caller may pass an explicit backend (the service does, per platform);
         # otherwise fall back to the env-driven module default ("ollama").
         self.backend = (backend or LLM_BACKEND).strip().lower()
         self.base_url = (base_url or LLM_BASE_URL).rstrip("/")
         self.api_key = api_key or LLM_API_KEY
         # Only the ollama backend needs the ollama client; for openai we use httpx.
-        self.client = Client(host=host) if self.backend == "ollama" else None
+        self.client = Client(host=self.host) if self.backend == "ollama" else None
+        self._ollama_clients: dict[str, Client] = {}
+        if self.client is not None:
+            self._ollama_clients[self.host] = self.client
         logger.info(
             "Summarizer initialized: backend=%s model=%s ollama_host=%s openai_base=%s",
-            self.backend, model, host, self.base_url,
+            self.backend, model, self.host, self.base_url,
         )
+
+    def set_ollama_host(self, host: str) -> None:
+        """Make an app-registered Ollama host the default local backend."""
+        self.host = host.rstrip("/")
+        self.backend = "ollama"
+        self.client = self._ollama_client(self.host)
 
     def backend_available(self) -> bool:
         """True if the configured LLM backend is reachable (used by /health)."""
@@ -875,7 +927,7 @@ class OllamaSummarizer:
                     timeout=3.0,
                 )
                 return resp.status_code == 200
-            self.client.list()
+            self._ollama_client().list()
             return True
         except Exception:
             return False
@@ -1126,6 +1178,44 @@ class OllamaSummarizer:
         t = re.sub(r"\s+(and|with|&)$", "", t, flags=re.IGNORECASE).strip()
         return t or title
 
+    @staticmethod
+    def _ensure_user_notes_section(data: dict, notes: str) -> None:
+        """Keep live user notes visible when a small model omits the requested
+        ``From Your Notes`` section.
+
+        The prompt asks the model to enrich the notes with transcript context,
+        but 4B models occasionally skip the section entirely. In that case an
+        honest verbatim fallback is better than silently losing the user's own
+        writing. Existing model-generated sections are left untouched.
+        """
+        sections = data.get("sections")
+        if not isinstance(sections, list):
+            sections = []
+            data["sections"] = sections
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            heading = next(
+                (
+                    str(section[key]).strip()
+                    for key in ("heading", "title", "section", "name", "header")
+                    if isinstance(section.get(key), str) and section[key].strip()
+                ),
+                "",
+            )
+            if heading.casefold() == "from your notes":
+                return
+
+        bullets: list[str] = []
+        for raw in notes.splitlines():
+            line = raw.strip()
+            line = re.sub(r"^(?:[-*•]\s+|\d+[.)]\s+)", "", line)
+            line = re.sub(r"^\[[ xX]\]\s*", "", line).strip()
+            if line:
+                bullets.append(line)
+        if bullets:
+            sections.append({"heading": "From Your Notes", "bullets": bullets})
+
     @classmethod
     def _render(cls, data: dict) -> tuple[str, str, list[str]]:
         """Render any reasonably-shaped notes JSON into (markdown, title, attendees).
@@ -1154,6 +1244,7 @@ class OllamaSummarizer:
             parts.append(f"**Attendees:** {', '.join(attendees)}")
 
         loose: list[str] = []
+        seen_headings: set[str] = set()
         for sec in data.get("sections") or []:
             if isinstance(sec, str):
                 line = sec.strip()
@@ -1173,6 +1264,10 @@ class OllamaSummarizer:
                 None,
             )
             if heading:
+                key = heading.casefold()
+                if key in seen_headings:
+                    continue
+                seen_headings.add(key)
                 parts.append(f"**{heading}**")
             if bullets:
                 rendered = "\n".join(f"- {str(b).strip()}" for b in bullets if str(b).strip())
@@ -1213,7 +1308,13 @@ class OllamaSummarizer:
         Otherwise, the default backend routing (``self.backend``) applies.
         """
         if _is_local_ollama_url(base_url):
-            return self._chat_ollama(messages, model, json_schema, meta=meta)
+            return self._chat_ollama(
+                messages,
+                model,
+                json_schema,
+                meta=meta,
+                host=_normalize_local_ollama_host(base_url),
+            )
         if base_url:
             return self._chat_openai(
                 messages, model, json_schema, base_url=base_url, api_key=api_key, meta=meta
@@ -1222,15 +1323,23 @@ class OllamaSummarizer:
             return self._chat_openai(messages, model, json_schema, meta=meta)
         return self._chat_ollama(messages, model, json_schema, meta=meta)
 
-    def _ollama_client(self) -> Client:
+    def _ollama_client(self, host: str | None = None) -> Client:
         """The native Ollama client, created lazily on the openai backend.
 
         The openai backend skips client construction at init, but a local
         Ollama base_url override still needs one (see ``_is_local_ollama_url``).
         """
-        if self.client is None:
-            self.client = Client(host=self.host)
-        return self.client
+        selected_host = (host or self.host).rstrip("/")
+        client = self._ollama_clients.get(selected_host)
+        if client is None:
+            if selected_host == self.host and self.client is not None:
+                client = self.client
+            else:
+                client = Client(host=selected_host)
+            self._ollama_clients[selected_host] = client
+        if selected_host == self.host:
+            self.client = client
+        return client
 
     def _chat_ollama(
         self,
@@ -1238,6 +1347,7 @@ class OllamaSummarizer:
         model: str,
         json_schema: dict | None,
         meta: dict | None = None,
+        host: str | None = None,
     ) -> str:
         """One native-Ollama completion, retried once if the window cut it off.
 
@@ -1250,10 +1360,9 @@ class OllamaSummarizer:
         so the retry is the safety net for a model more verbose than the output
         budget assumed — not the mechanism that makes long meetings work.
         """
-        num_ctx = _adaptive_num_ctx(
-            _prompt_chars(messages), model, self._ollama_client()
-        )
-        response = self._chat_ollama_once(messages, model, json_schema, num_ctx)
+        client = self._ollama_client(host)
+        num_ctx = _adaptive_num_ctx(_prompt_chars(messages), model, client)
+        response = self._chat_ollama_once(messages, model, json_schema, num_ctx, client)
         if _stop_reason(response) == "length":
             retry_ctx = _retry_num_ctx(num_ctx)
             logger.warning(
@@ -1265,13 +1374,20 @@ class OllamaSummarizer:
             )
             if retry_ctx:
                 num_ctx = retry_ctx
-                response = self._chat_ollama_once(messages, model, json_schema, num_ctx)
+                response = self._chat_ollama_once(
+                    messages, model, json_schema, num_ctx, client
+                )
         if meta is not None:
             meta.update(truncated=_stop_reason(response) == "length", num_ctx=num_ctx)
         return response["message"]["content"]
 
     def _chat_ollama_once(
-        self, messages: list[dict], model: str, json_schema: dict | None, num_ctx: int
+        self,
+        messages: list[dict],
+        model: str,
+        json_schema: dict | None,
+        num_ctx: int,
+        client: Client,
     ) -> Any:
         """Issue one Ollama chat request; return the raw response (content + stop
         reason), which only _chat_ollama unpacks."""
@@ -1284,7 +1400,6 @@ class OllamaSummarizer:
             chat_kwargs["format"] = json_schema
         if _is_thinking_model(model):
             chat_kwargs["think"] = False
-        client = self._ollama_client()
         try:
             response = client.chat(**chat_kwargs)
         except Exception as exc:
@@ -1596,13 +1711,20 @@ class OllamaSummarizer:
             # Spanish stayed English even on a 35B model (founder-reproduced,
             # 2026-08-13). Repeat the directive as the final instruction and
             # resolve the heading conflict explicitly.
-            user_message = (
-                f"{user_message}\n\n{directive}\n"
-                "This applies to the JSON too: write each section heading as the "
-                "template section's translation into the required output language "
-                "(same order, same meaning) — do NOT reuse the English section "
-                "names verbatim."
-            )
+            language = (output_language or "").strip().lower()
+            if language in ("en", "english"):
+                heading_instruction = (
+                    "Use every section heading exactly as written in the template; "
+                    "do not rename or translate the headings."
+                )
+            else:
+                heading_instruction = (
+                    "This applies to the JSON too: write each section heading as the "
+                    "template section's translation into the required output language "
+                    "(same order, same meaning) — do not reuse the English section "
+                    "names verbatim."
+                )
+            user_message = f"{user_message}\n\n{directive}\n{heading_instruction}"
 
         reply_meta: dict = {}
         raw_output = self._chat(
@@ -1644,6 +1766,10 @@ class OllamaSummarizer:
                 template_used=template_name,
                 category=category_hint or heuristic_category,
             )
+
+        data = self._unwrap_envelope(data)
+        if notes:
+            self._ensure_user_notes_section(data, notes)
 
         category = resolve_category(
             category_hint, data.get("category"), heuristic_category
@@ -1880,18 +2006,56 @@ class OllamaSummarizer:
             raise ValueError("Question is empty.")
         use_model = model or self.model
         messages = self._chat_messages(transcript, question)
+        yield from _strip_think_stream(
+            self._stream_messages(messages, use_model, base_url, api_key)
+        )
+
+    def _stream_messages(
+        self,
+        messages,
+        use_model,
+        base_url=None,
+        api_key=None,
+    ):
+        """Dispatch a prepared message list to the configured streaming backend."""
         # Same dispatch as _chat(): a local Ollama base_url is served natively
         # so num_ctx applies; any other base_url (or openai backend) streams
         # over the OpenAI-compatible path.
         if _is_local_ollama_url(base_url):
-            raw = self._chat_ollama_stream(messages, use_model)
-        elif base_url or self.backend == "openai":
-            raw = self._chat_openai_stream(
+            return self._chat_ollama_stream(
+                messages, use_model, host=_normalize_local_ollama_host(base_url)
+            )
+        if base_url or self.backend == "openai":
+            return self._chat_openai_stream(
                 messages, use_model, base_url=base_url, api_key=api_key
             )
-        else:
-            raw = self._chat_ollama_stream(messages, use_model)
-        yield from _strip_think_stream(raw)
+        return self._chat_ollama_stream(messages, use_model)
+
+    def draft_stream(
+        self,
+        brief: str,
+        instruction: str,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ):
+        """Stream a drafted document (token deltas) for a workspace task brief."""
+        if not brief.strip():
+            raise ValueError("Brief is empty.")
+        if not instruction.strip():
+            raise ValueError("Instruction is empty.")
+        messages = [
+            {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"{brief.strip()}\n\n# Instruction\n\n{instruction.strip()}",
+            },
+        ]
+        yield from _strip_think_stream(
+            self._stream_messages(
+                messages, model or self.model, base_url, api_key
+            )
+        )
 
     def _chat_openai_stream(self, messages, model, base_url=None, api_key=None):
         """Stream content deltas from an OpenAI-compatible /chat/completions SSE."""
@@ -1950,9 +2114,9 @@ class OllamaSummarizer:
                         yield delta
                 return
 
-    def _chat_ollama_stream(self, messages, model):
+    def _chat_ollama_stream(self, messages, model, host=None):
         """Stream content deltas from the Ollama chat API."""
-        client = self._ollama_client()
+        client = self._ollama_client(host)
         kwargs = dict(
             model=model,
             messages=messages,
