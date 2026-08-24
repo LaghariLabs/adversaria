@@ -1,14 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
-import type { Meeting, ActionItem } from "../types";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type {
+  ActionItem,
+  Meeting,
+  MeetingWorkspaceBinding,
+  WorkspaceSummary,
+} from "../types";
 import { splitLabel, isRtl } from "../lib/summary";
 import { dateLocale } from "../lib/dateFormat";
 import {
   acceptAgentWork,
+  createWorkspace,
+  createWorkspaceTask,
   getActionItems,
+  listMeetingWorkspaceBindings,
+  listWorkspaces,
   setActionItemDone,
   updateActionItem,
 } from "../lib/tauri";
-import { ListChecks } from "lucide-react";
+import { ListChecks, MoreHorizontal } from "lucide-react";
+import { WorkspaceBindingBanner } from "./workspaces/WorkspaceBindingBanner";
 
 /** Local today as yyyy-mm-dd. */
 function todayStr(): string {
@@ -65,6 +75,13 @@ interface TodosViewProps {
 
 export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChange }: TodosViewProps) {
   const [items, setItems] = useState<ActionItem[]>([]);
+  const [bindings, setBindings] = useState<MeetingWorkspaceBinding[]>([]);
+  const [menuOpenId, setMenuOpenId] = useState<number | null>(null);
+  const [menuWorkspaces, setMenuWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [menuLoading, setMenuLoading] = useState(false);
+  const [menuError, setMenuError] = useState<string | null>(null);
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
 
   // View mode persisted in localStorage, default "triage".
   const [view, setView] = useState<ViewMode>(() => {
@@ -83,12 +100,22 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   // Meeting scope — driven by parent (sidebar click scopes the board).
   // null = All.
 
-  // Load all action items from DB on mount and when meetings change.
-  useEffect(() => {
-    getActionItems(null).then(setItems).catch(() => {});
-  }, [meetings]);
+  const refresh = useCallback(async () => {
+    const requests: Promise<void>[] = [
+      getActionItems(null).then(setItems).catch(() => {}),
+    ];
+    if (import.meta.env.DEV) {
+      requests.push(
+        listMeetingWorkspaceBindings().then(setBindings).catch(() => {}),
+      );
+    }
+    await Promise.all(requests);
+  }, []);
 
-  const refresh = () => getActionItems(null).then(setItems).catch(() => {});
+  // Load all action items and workspace routing on mount and when meetings change.
+  useEffect(() => {
+    void refresh();
+  }, [meetings, refresh]);
 
   // Also refresh when the app/tab regains focus, so items added while this view
   // was already open (e.g. a meeting summarized via the tray/hotkey) show up
@@ -101,7 +128,7 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, []);
+  }, [refresh]);
 
   // Join meeting metadata (title, recordedAt, attendees) by meeting_id.
   const meetingById = useMemo(() => {
@@ -109,6 +136,16 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
     for (const m of meetings) map.set(m.id, m);
     return map;
   }, [meetings]);
+
+  const boundWorkspaceByMeeting = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const binding of bindings) {
+      if (binding.workspace_id != null) {
+        map.set(binding.meeting_id, binding.workspace_name);
+      }
+    }
+    return map;
+  }, [bindings]);
 
   const toggle = (item: ActionItem) => {
     setActionItemDone(item.id, !item.done).then(refresh);
@@ -128,6 +165,58 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   const toggleMine = (item: ActionItem) => {
     const next = isNotMine(item.assignee) ? "" : NOT_MINE;
     updateActionItem(item.id, next, item.due).then(refresh);
+  };
+
+  const closeWorkspaceMenu = () => {
+    setMenuOpenId(null);
+    setMenuError(null);
+    setCreatingWorkspace(false);
+    setNewWorkspaceName("");
+  };
+
+  const openWorkspaceMenu = (itemId: number) => {
+    if (menuOpenId === itemId) {
+      closeWorkspaceMenu();
+      return;
+    }
+    setMenuOpenId(itemId);
+    setMenuWorkspaces([]);
+    setMenuLoading(true);
+    setMenuError(null);
+    setCreatingWorkspace(false);
+    setNewWorkspaceName("");
+    listWorkspaces()
+      .then(setMenuWorkspaces)
+      .catch((error: unknown) => setMenuError(String(error)))
+      .finally(() => setMenuLoading(false));
+  };
+
+  const sendToWorkspace = async (item: ActionItem, workspaceId: number) => {
+    setMenuError(null);
+    try {
+      await createWorkspaceTask(
+        workspaceId,
+        item.text,
+        "",
+        item.meeting_id,
+        item.id,
+      );
+      closeWorkspaceMenu();
+    } catch (error) {
+      setMenuError(String(error));
+    }
+  };
+
+  const createAndSendToWorkspace = async (item: ActionItem) => {
+    const name = newWorkspaceName.trim();
+    if (!name) return;
+    setMenuError(null);
+    try {
+      const workspace = await createWorkspace(name);
+      await sendToWorkspace(item, workspace.id);
+    } catch (error) {
+      setMenuError(String(error));
+    }
   };
 
   const [dragId, setDragId] = useState<number | null>(null);
@@ -341,6 +430,7 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
     const m = meetingById.get(it.meeting_id);
     const meta = it.due ? fmtDueDate(it.due) : "—";
     const ds = it.due ? dueState(it.due, false) : "none";
+    const boundWorkspace = boundWorkspaceByMeeting.get(it.meeting_id);
 
     return (
       <div
@@ -382,6 +472,11 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
             {m.title}
           </span>
         )}
+        {import.meta.env.DEV && boundWorkspace && (
+          <span className="badge-tag blue triage-ws-chip">
+            → {boundWorkspace}
+          </span>
+        )}
         <div className="triage-card-meta">
           <span className={`badge-due ${ds}`}>{meta}</span>
           <input
@@ -399,6 +494,112 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
           >
             Not mine
           </button>
+          {/* Dev-only until Workspaces earns its release (gate mirrors App.tsx). */}
+          {import.meta.env.DEV && (
+          <div className="triage-workspace-menu-wrap">
+            <button
+              className="mrow-menu-btn"
+              type="button"
+              aria-label={`Workspace actions for ${it.text}`}
+              aria-haspopup="menu"
+              aria-expanded={menuOpenId === it.id}
+              title="Actions"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                openWorkspaceMenu(it.id);
+              }}
+            >
+              <MoreHorizontal size={16} aria-hidden="true" />
+            </button>
+            {menuOpenId === it.id && (
+              <>
+                <div
+                  style={{ position: "fixed", inset: 0, zIndex: 20 }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    closeWorkspaceMenu();
+                  }}
+                />
+                <div
+                  className="tag-add-popup triage-workspace-menu"
+                  role="menu"
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div className="triage-workspace-menu-title">
+                    Push to workspace…
+                  </div>
+                  {menuLoading ? (
+                    <button className="settings-menu-item" type="button" disabled>
+                      Loading…
+                    </button>
+                  ) : menuWorkspaces.length === 0 ? (
+                    <button className="settings-menu-item" type="button" disabled>
+                      No workspaces yet
+                    </button>
+                  ) : (
+                    menuWorkspaces.map((summary) => (
+                      <button
+                        className="settings-menu-item"
+                        type="button"
+                        role="menuitem"
+                        key={summary.workspace.id}
+                        onClick={() =>
+                          void sendToWorkspace(it, summary.workspace.id)
+                        }
+                      >
+                        {summary.workspace.name}
+                      </button>
+                    ))
+                  )}
+                  <button
+                    className="settings-menu-item"
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onScopeChange(it.meeting_id);
+                      closeWorkspaceMenu();
+                    }}
+                  >
+                    Route this meeting&apos;s to-dos…
+                  </button>
+                  <div className="triage-workspace-menu-divider" />
+                  {creatingWorkspace ? (
+                    <input
+                      className="tag-popup-input"
+                      value={newWorkspaceName}
+                      placeholder="Workspace name"
+                      aria-label="Workspace name"
+                      autoFocus
+                      onChange={(event) => setNewWorkspaceName(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void createAndSendToWorkspace(it);
+                        } else if (event.key === "Escape") {
+                          setCreatingWorkspace(false);
+                          setNewWorkspaceName("");
+                        }
+                      }}
+                    />
+                  ) : (
+                    <button
+                      className="settings-menu-item"
+                      type="button"
+                      role="menuitem"
+                      onClick={() => setCreatingWorkspace(true)}
+                    >
+                      New workspace…
+                    </button>
+                  )}
+                  {menuError && <p className="triage-workspace-menu-error">{menuError}</p>}
+                </div>
+              </>
+            )}
+          </div>
+          )}
         </div>
       </div>
     );
@@ -497,6 +698,12 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
 
       {/* Meeting scope chips */}
       {renderScopeChips()}
+      {import.meta.env.DEV && scopeMeetingId != null && (
+        <WorkspaceBindingBanner
+          meetingId={scopeMeetingId}
+          onChanged={() => void refresh()}
+        />
+      )}
 
       {/* Body */}
       {total === 0 ? (

@@ -200,6 +200,66 @@ Endpoints:
 - **`prompts/`** — editable templates: `general`, `one-on-one`, `client-meeting`.
   Drop a new `.md` file here and it appears in the API automatically.
 
+## Workspaces (dev-gated) — the autopilot loop
+
+_Added 2026-08-22 (Phase 3a). Shown only when `import.meta.env.DEV`; the contract
+below is what the code does today, see `docs/TODO.md` (08-22 block) for the why._
+
+```
+meeting summarized ──sync_action_items──▶ action_items
+        │ (bound meeting)                      │
+        ▼                                      ▼
+meeting_workspace_bindings ──push──▶ workspace_tasks (queued)
+                                           │  autopilot::kick → drain
+                                           ▼
+                                   workspace_runs (running, one per workspace)
+                                           │  run ends
+                                           ▼
+                                 task = awaiting_review ──Approve──▶ done + action_item.done/evidence
+                                           └──Reject(note)──▶ queued (attempt+1, note in brief)
+```
+
+- **Tables** (`storage.rs`): `workspaces`, `workspace_context_items`,
+  `workspace_tasks` (status `queued|running|awaiting_review|done|failed`,
+  `action_item_id`, `attempt`, `rejection_notes` JSON), `workspace_runs`,
+  `workspace_artifacts`, `meeting_workspace_bindings` (no row = undecided,
+  `workspace_id NULL` = "not a project"). `migrate_workspace_tasks_v2` rebuilds
+  the task table on databases created before 08-22.
+- **Routing**: `suggest_workspace_for_meeting` scores every workspace
+  `2·|related meetings via embeddings::hybrid_rank| + |shared attendees|`
+  (≥ 2 to suggest). `set_meeting_workspace_binding` stores the decision and
+  pushes every open, "mine" to-do of that meeting as a task (dedup by
+  `action_item_id`); `sync_action_items` re-links tasks after re-extraction
+  and pushes new items.
+- **Runs**: `commands::execute_workspace_run` is the single executor (Run
+  button and autopilot both call it; the frontend channel is one `LogSink`).
+  `AppState.autopilot_gate` serialises "check nothing is running in this
+  workspace → mark running". Engines: `local` (streamed from the Python
+  service), `claude` / `codex` (headless CLIs supervised in
+  `workspace_runs.rs`, 15-min cap, Stop kills the child). Output dir only.
+- **Autopilot** (`autopilot.rs`): `kick(app)` is idempotent; it drains when
+  `AppConfig.agents_paused` is false: per workspace with nothing running,
+  start the oldest queued task on the workspace's engine if detected. Kicked
+  on task create, binding set, reject, resume, engine change, run end (only
+  after a run existed), summary sync, and 15 s after launch. Startup re-queues
+  tasks orphaned in `running`; a task that cannot start is moved to `failed`
+  with a failed run carrying the error so the queue keeps moving.
+- **Brief**: task + rejection notes + bound meetings (summary + transcript,
+  20k chars) + top-3 related meetings from `embeddings::hybrid_rank`
+  (summaries only) + read-only folders; the run log's first line is the
+  context receipt. Artifacts are previewed in-app (`read_workspace_artifact`,
+  sandboxed to the workspaces root; `src/lib/markdown.ts`).
+- **Context engine** (`context_index.rs`): the Obsidian vault and the projects
+  root are indexed (FTS5 + chunk embeddings) like meetings; every run
+  searches the to-do text across meetings, vault notes, and project cards
+  with a relevance floor, and the receipt names what was used. Skills and
+  agents (`addons.rs`) are injected into the brief and written natively for
+  Claude Code / Codex.
+- **Frontend contract**: `workspace-task-changed` event `{workspace_id,
+  task_id}` after every state change; the detail view polls
+  `get_latest_workspace_run` every 2 s for runs it did not start (the run log
+  is persisted every ~0.5 s by the supervisor, every 40 tokens for `local`).
+
 ## End-to-end data flow (record → notes)
 
 1. User toggles recording (button, tray, or `Ctrl+Shift+M`) → `start_recording`

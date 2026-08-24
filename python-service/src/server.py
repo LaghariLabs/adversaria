@@ -10,11 +10,13 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .live import LiveCaptionSession, is_filler_hallucination, is_repetition_loop
 from .models import (
+    DraftRequest,
     GenerateTemplateRequest,
     GenerateTemplateResponse,
     ChatRequest,
@@ -22,6 +24,7 @@ from .models import (
     EmbedRequest,
     EmbedResponse,
     HealthResponse,
+    LlmHostRequest,
     LiveFeedRequest,
     LiveFeedResponse,
     ModelDownloadRequest,
@@ -42,7 +45,11 @@ from .model_setup import (
     on_download_ready,
     start_model_download,
 )
-from .summarizer import OllamaSummarizer, default_llm_backend
+from .summarizer import (
+    OllamaSummarizer,
+    configure_local_ollama_host,
+    default_llm_backend,
+)
 from .transcriber import (
     MlxWhisperTranscriber,
     WhisperTranscriber,
@@ -82,6 +89,7 @@ _transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
 _live_transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
 _summarizer: OllamaSummarizer | None = None
 _embedder: OllamaEmbedder | None = None
+_OLLAMA_HOST = "http://localhost:11434"
 
 # Why `_transcriber` is None right now — the UI renders this state, so a fresh
 # machine reads "no model downloaded yet" instead of a dead service. Values:
@@ -368,8 +376,10 @@ async def lifespan(app: FastAPI):
     ).start()
     # Backend is platform-resolved: Rapid-MLX (openai) on Apple Silicon, Ollama
     # elsewhere — unless LLM_BACKEND is set explicitly.
-    _summarizer = OllamaSummarizer(backend=default_llm_backend())
-    _embedder = OllamaEmbedder()
+    _summarizer = OllamaSummarizer(
+        backend=default_llm_backend(), host=_OLLAMA_HOST
+    )
+    _embedder = OllamaEmbedder(host=_OLLAMA_HOST)
     logger.info("ML service singletons initialized.")
     yield
     logger.info("Shutting down ML service lifespan.")
@@ -414,13 +424,53 @@ def health() -> HealthResponse:
     if _transcriber is not None and ollama_available:
         status = "ok"
 
+    embedder_state, embedder_detail = _embedding_health()
+
     return HealthResponse(
         status=status,
         whisper_model=whisper_model,
         ollama_available=ollama_available,
         transcriber_state="ready" if _transcriber is not None else _TRANSCRIBER_STATE,
         transcriber_detail=None if _transcriber is not None else _TRANSCRIBER_DETAIL,
+        embedder_state=embedder_state,
+        embedder_detail=embedder_detail,
     )
+
+
+def _embedding_health() -> tuple[str, str]:
+    """Check only Ollama's model catalogue; never load the embedding model."""
+    if _embedder is None:
+        return "unavailable", "The semantic-search service is not initialized."
+    try:
+        response = httpx.get(f"{_OLLAMA_HOST}/api/tags", timeout=2.0)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+    except Exception:
+        return "unavailable", "The local engine is not reachable."
+    names = {
+        str(model.get("name") or model.get("model") or "").strip()
+        for model in models
+        if isinstance(model, dict)
+    }
+    if any(name == "bge-m3" or name.startswith("bge-m3:") for name in names):
+        return "ready", "bge-m3 is ready for semantic search."
+    return "missing", "bge-m3 is not downloaded."
+
+
+@app.post("/setup/llm_host")
+def setup_llm_host(request: LlmHostRequest) -> dict[str, str]:
+    """Register the app-owned loopback Ollama host for chat and embeddings."""
+    global _OLLAMA_HOST
+    try:
+        normalized = configure_local_ollama_host(request.ollama_host)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _OLLAMA_HOST = normalized
+    if _summarizer is not None:
+        _summarizer.set_ollama_host(normalized)
+    if _embedder is not None:
+        _embedder.set_default_host(normalized)
+    return {"ollama_host": normalized}
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +590,41 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+@app.post("/draft_stream")
+async def draft_stream(request: DraftRequest) -> StreamingResponse:
+    """Stream a workspace deliverable draft token-by-token as Server-Sent Events."""
+    if _summarizer is None:
+        raise HTTPException(status_code=503, detail="Summarizer not initialized")
+
+    summarizer = _summarizer
+
+    def generate():
+        try:
+            sent = 0
+            for attempt in range(2):
+                for token in summarizer.draft_stream(
+                    brief=request.brief,
+                    instruction=request.instruction,
+                    model=request.model,
+                    base_url=request.llm_base_url,
+                    api_key=request.llm_api_key,
+                ):
+                    sent += 1
+                    yield f"data: {json.dumps({'t': token})}\n\n"
+                if sent:
+                    break
+                logger.warning("draft_stream yielded no tokens; retrying once")
+            if sent:
+                yield "data: [DONE]\n\n"
+            else:
+                yield f"data: {json.dumps({'error': 'The local model returned an empty draft (it may have been interrupted under load) — please try again.'})}\n\n"
+        except Exception as exc:  # surface inline instead of failing the request
+            logger.exception("Draft stream failed")
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
 # ---------------------------------------------------------------------------
 # Embed
 # ---------------------------------------------------------------------------
@@ -555,7 +640,11 @@ def embed(request: EmbedRequest) -> EmbedResponse:
     if len(request.texts) > 128:
         raise HTTPException(status_code=400, detail="texts: at most 128 per request")
     try:
-        embeddings, model = _embedder.embed(request.texts, request.model)
+        embeddings, model = _embedder.embed(
+            request.texts,
+            request.model,
+            host=request.ollama_host or _OLLAMA_HOST,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     dim = len(embeddings[0]) if embeddings and embeddings[0] else 0

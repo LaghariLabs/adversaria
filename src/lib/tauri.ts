@@ -8,9 +8,11 @@ import type {
   ActionItem,
   Meeting,
   MeetingStats,
+  MeetingWorkspaceBinding,
   PersonProfile,
   ManagedLlmStatus,
   ModelDownloadStatus,
+  OllamaInstallPlan,
   OnboardingState,
   RegistrationState,
   SetupStatus,
@@ -22,12 +24,23 @@ import type {
   CalendarEvent,
   ChatMessage,
   ChatTurn,
+  ContextIndexStatus,
+  ContextSources,
   GraphData,
   HealthResponse,
   Tag,
   TemplateInfo,
   WeeklyBriefing,
   WhisperModelInfo,
+  Workspace,
+  WorkspaceAddon,
+  WorkspaceEngine,
+  WorkspaceContextItem,
+  WorkspaceDetail,
+  WorkspaceRun,
+  WorkspaceSummary,
+  WorkspaceSuggestion,
+  WorkspaceTask,
 } from "../types";
 
 // ---- Recording ----
@@ -543,6 +556,18 @@ export function getEngineInstallPlan(): Promise<EngineInstallPlan> {
   return invoke("get_engine_install_plan");
 }
 
+export function getOllamaInstallPlan(): Promise<OllamaInstallPlan> {
+  return invoke("get_ollama_install_plan");
+}
+
+export function ensureEmbeddingModel(): Promise<ModelDownloadStatus> {
+  return invoke("ensure_embedding_model");
+}
+
+export function getEmbeddingModelStatus(): Promise<ModelDownloadStatus> {
+  return invoke("get_embedding_model_status");
+}
+
 export function installLocalEngine(): Promise<void> {
   return invoke("install_local_engine");
 }
@@ -693,4 +718,241 @@ export function probeSystemAudio(): Promise<CapturePermissions> {
 /** Open the exact System Settings pane for a permission. */
 export function openPrivacySettings(which: "microphone" | "system_audio"): Promise<void> {
   return invoke("open_privacy_settings", { which });
+}
+
+// ---- Workspaces ----
+
+/** Create a long-lived workspace using the local engine. */
+export function createWorkspace(name: string): Promise<Workspace> {
+  return invoke("create_workspace", { name });
+}
+
+/** List workspaces and the summary counts shown on their cards. */
+export function listWorkspaces(): Promise<WorkspaceSummary[]> {
+  return invoke("list_workspaces");
+}
+
+/** Load a workspace with all of its tasks and context items. */
+export function getWorkspace(id: number): Promise<WorkspaceDetail> {
+  return invoke("get_workspace", { id });
+}
+
+/** List the reusable skill and agent catalog. */
+export function listWorkspaceAddons(): Promise<WorkspaceAddon[]> {
+  return invoke("list_workspace_addons");
+}
+
+/** Create a custom skill or agent role. */
+export function createWorkspaceAddon(
+  kind: string,
+  name: string,
+  description: string,
+  instructions: string,
+): Promise<WorkspaceAddon> {
+  return invoke("create_workspace_addon", {
+    kind,
+    name,
+    description,
+    instructions,
+  });
+}
+
+/** Delete a custom skill or agent role. */
+export function deleteWorkspaceAddon(id: number): Promise<void> {
+  return invoke("delete_workspace_addon", { id });
+}
+
+/** Return the vault and projects roots searched for every workspace run. */
+export function getContextSources(): Promise<ContextSources> {
+  return invoke("get_context_sources");
+}
+
+/** Persist both automatic context roots; an empty value disables that source. */
+export function setContextSources(
+  vaultPath: string,
+  projectsRoot: string,
+): Promise<void> {
+  return invoke("set_context_sources", { vaultPath, projectsRoot });
+}
+
+/** Re-scan both context roots and refresh semantic chunks immediately. */
+export function reindexContextSources(): Promise<ContextIndexStatus> {
+  return invoke("reindex_context_sources");
+}
+
+/** Return current context document counts and the last completed sync time. */
+export function getContextIndexStatus(): Promise<ContextIndexStatus> {
+  return invoke("get_context_index_status");
+}
+
+/** Attach a skill or the workspace's single agent role. */
+export function attachWorkspaceAddon(
+  workspaceId: number,
+  addonId: number,
+): Promise<WorkspaceAddon[]> {
+  return invoke("attach_workspace_addon", { workspaceId, addonId });
+}
+
+/** Detach a skill or agent role from a workspace. */
+export function detachWorkspaceAddon(
+  workspaceId: number,
+  addonId: number,
+): Promise<WorkspaceAddon[]> {
+  return invoke("detach_workspace_addon", { workspaceId, addonId });
+}
+
+/** Rename a workspace. */
+export function renameWorkspace(id: number, name: string): Promise<void> {
+  return invoke("rename_workspace", { id, name });
+}
+
+/** Delete a workspace and its tasks and context links. */
+export function deleteWorkspace(id: number): Promise<void> {
+  return invoke("delete_workspace", { id });
+}
+
+/** Add an existing local folder to a workspace's readable context. */
+export function addWorkspaceFolderContext(
+  workspaceId: number,
+  path: string,
+): Promise<WorkspaceContextItem | null> {
+  return invoke("add_workspace_folder_context", { workspaceId, path });
+}
+
+/** Remove a context item from a workspace. */
+export function removeWorkspaceContext(itemId: number): Promise<void> {
+  return invoke("remove_workspace_context", { itemId });
+}
+
+/** Queue a task in a workspace, optionally linking its source meeting. */
+export function createWorkspaceTask(
+  workspaceId: number,
+  title: string,
+  details: string,
+  sourceMeetingId: number | null,
+  actionItemId: number | null = null,
+): Promise<WorkspaceTask> {
+  return invoke("create_workspace_task", {
+    workspaceId,
+    title,
+    details,
+    sourceMeetingId,
+    actionItemId,
+  });
+}
+
+/** Include or exclude a queued task from automatic agent pickup. */
+export function setWorkspaceTaskAgentEligible(
+  taskId: number,
+  eligible: boolean,
+): Promise<void> {
+  return invoke("set_workspace_task_agent_eligible", { taskId, eligible });
+}
+
+/** Approve a workspace task after reviewing its latest output. */
+export function approveWorkspaceTask(taskId: number): Promise<void> {
+  return invoke("approve_workspace_task", { taskId });
+}
+
+/** Reject a workspace task and queue another attempt with feedback. */
+export function rejectWorkspaceTask(taskId: number, reason: string): Promise<void> {
+  return invoke("reject_workspace_task", { taskId, reason });
+}
+
+/** Bind a meeting's open to-dos to a workspace, or mark it as not a project. */
+export function setMeetingWorkspaceBinding(
+  meetingId: number,
+  workspaceId: number | null,
+): Promise<number> {
+  return invoke("set_meeting_workspace_binding", { meetingId, workspaceId });
+}
+
+/** Clear a meeting's workspace decision so it becomes undecided again. */
+export function clearMeetingWorkspaceBinding(meetingId: number): Promise<void> {
+  return invoke("clear_meeting_workspace_binding", { meetingId });
+}
+
+/** Return the stored workspace decision for one meeting. */
+export function getMeetingWorkspaceBinding(
+  meetingId: number,
+): Promise<MeetingWorkspaceBinding | null> {
+  return invoke("get_meeting_workspace_binding", { meetingId });
+}
+
+/** List every meeting that has a workspace decision. */
+export function listMeetingWorkspaceBindings(): Promise<MeetingWorkspaceBinding[]> {
+  return invoke("list_meeting_workspace_bindings");
+}
+
+/** Suggest the strongest existing workspace for a meeting. */
+export function suggestWorkspaceForMeeting(
+  meetingId: number,
+): Promise<WorkspaceSuggestion | null> {
+  return invoke("suggest_workspace_for_meeting", { meetingId });
+}
+
+/** Return whether automatic workspace agents are globally paused. */
+export function getAgentsPaused(): Promise<boolean> {
+  return invoke("get_agents_paused");
+}
+
+/** Persist the global automatic-agent pause state. */
+export function setAgentsPaused(paused: boolean): Promise<void> {
+  return invoke("set_agents_paused", { paused });
+}
+
+/** Delete a task from a workspace queue. */
+export function deleteWorkspaceTask(taskId: number): Promise<void> {
+  return invoke("delete_workspace_task", { taskId });
+}
+
+/** Open a native folder picker and return the selected absolute path. */
+export function pickWorkspaceFolder(): Promise<string | null> {
+  return invoke("pick_workspace_folder");
+}
+
+/** Detect the local model and supported headless agent CLIs. */
+export function detectWorkspaceEngines(): Promise<WorkspaceEngine[]> {
+  return invoke("detect_workspace_engines");
+}
+
+/** Select the engine used by a workspace. */
+export function setWorkspaceEngine(id: number, engine: string): Promise<void> {
+  return invoke("set_workspace_engine", { id, engine });
+}
+
+/** Execute a workspace task and stream live output to `onLog`. */
+export function runWorkspaceTask(
+  taskId: number,
+  engine: string,
+  onLog: (line: string) => void,
+): Promise<WorkspaceRun> {
+  const channel = new Channel<string>();
+  channel.onmessage = onLog;
+  return invoke("run_workspace_task", { taskId, engine, onLog: channel });
+}
+
+/** Stop a running Claude Code or Codex task. */
+export function stopWorkspaceRun(runId: number): Promise<void> {
+  return invoke("stop_workspace_run", { runId });
+}
+
+/** Return the newest run for a workspace task. */
+export function getLatestWorkspaceRun(taskId: number): Promise<WorkspaceRun | null> {
+  return invoke("get_latest_workspace_run", { taskId });
+}
+
+/** Open a workspace artifact with its default macOS application. */
+export function openWorkspaceArtifact(path: string): Promise<void> {
+  return invoke("open_workspace_artifact", { path });
+}
+
+/** Read a text workspace artifact for an in-app preview. */
+export function readWorkspaceArtifact(path: string): Promise<string> {
+  return invoke("read_workspace_artifact", { path });
+}
+
+/** Reveal a workspace artifact in the platform file browser. */
+export function revealWorkspaceArtifact(path: string): Promise<void> {
+  return invoke("reveal_workspace_artifact", { path });
 }

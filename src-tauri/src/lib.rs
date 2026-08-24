@@ -14,17 +14,22 @@ use tauri::Manager;
 pub mod types;
 
 // Registered as tasks progress — uncomment each after implementation:
+pub mod addons;
 pub mod audio;
+pub mod autopilot;
 pub mod calendar;
 pub mod commands;
 pub mod config;
+pub mod context_index;
 pub mod demo;
 pub mod detection;
 pub mod diagnostics;
 pub mod embeddings;
 pub mod http_client;
 pub mod llama_engine;
+pub mod local_output;
 pub mod meeting_reminders;
+pub mod ollama_engine;
 pub mod permissions;
 pub mod recap;
 pub mod recording_spool;
@@ -34,7 +39,9 @@ pub mod second_brain;
 pub mod setup;
 pub mod stats;
 pub mod storage;
+pub mod task_triage;
 pub mod tray;
+pub mod workspace_runs;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -124,6 +131,13 @@ pub fn run() {
                     .show();
                 std::process::exit(1);
             }
+            match storage::requeue_orphaned_running_tasks() {
+                Ok(count) if count > 0 => eprintln!(
+                    "[autopilot] re-queued {count} task(s) left running by a previous session"
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("[autopilot] failed to recover orphaned tasks: {error}"),
+            }
             if let Err(error) = registration::migrate_legacy_config() {
                 eprintln!("[onboarding] legacy state migration failed: {error}");
             }
@@ -185,18 +199,32 @@ pub fn run() {
                     && onboarding.as_ref().is_some_and(|state| {
                         state.setup_complete
                             && setup::profile_alias(&state.selected_model_profile).is_some()
+                            && (cfg!(debug_assertions)
+                                || ollama_engine::tier(&state.selected_model_profile).is_none())
                     })
                 {
                     let profile = onboarding.unwrap().selected_model_profile;
                     tauri::async_runtime::spawn(async move {
-                        if let Err(error) = setup::start(
+                        match setup::start(
                             &handle,
                             &handle.state::<commands::AppState>().managed_llm,
                             &profile,
                         )
                         .await
                         {
-                            eprintln!("[local-model] background start failed: {error}");
+                            Ok(_) => {
+                                if cfg!(debug_assertions)
+                                    && ollama_engine::tier(&profile).is_some()
+                                    && !ollama_engine::has_tag(ollama_engine::EMBED_TAG)
+                                        .await
+                                        .unwrap_or(false)
+                                {
+                                    ollama_engine::pull(ollama_engine::EMBED_TAG).await;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("[local-model] background start failed: {error}")
+                            }
                         }
                     });
                 }
@@ -228,6 +256,16 @@ pub fn run() {
                             }
                         }
                     }
+                });
+            }
+
+            context_index::spawn_periodic(app.handle().clone());
+
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    crate::autopilot::kick(handle);
                 });
             }
 
@@ -298,10 +336,13 @@ pub fn run() {
             commands::engine_configured,
             commands::accept_agent_work,
             commands::get_engine_install_plan,
+            commands::get_ollama_install_plan,
             commands::install_local_engine,
             commands::start_model_download,
             commands::reset_model_download,
             commands::get_model_download_status,
+            commands::ensure_embedding_model,
+            commands::get_embedding_model_status,
             commands::get_managed_llm_status,
             commands::start_managed_llm,
             commands::stop_managed_llm,
@@ -333,6 +374,43 @@ pub fn run() {
             commands::get_action_items,
             commands::set_action_item_done,
             commands::update_action_item,
+            commands::get_context_sources,
+            commands::set_context_sources,
+            commands::reindex_context_sources,
+            commands::get_context_index_status,
+            commands::create_workspace,
+            commands::list_workspaces,
+            commands::get_workspace,
+            commands::list_workspace_addons,
+            commands::create_workspace_addon,
+            commands::delete_workspace_addon,
+            commands::attach_workspace_addon,
+            commands::detach_workspace_addon,
+            commands::rename_workspace,
+            commands::delete_workspace,
+            commands::add_workspace_folder_context,
+            commands::remove_workspace_context,
+            commands::create_workspace_task,
+            commands::set_workspace_task_agent_eligible,
+            commands::delete_workspace_task,
+            commands::pick_workspace_folder,
+            commands::detect_workspace_engines,
+            commands::set_workspace_engine,
+            commands::get_latest_workspace_run,
+            commands::open_workspace_artifact,
+            commands::read_workspace_artifact,
+            commands::reveal_workspace_artifact,
+            commands::run_workspace_task,
+            commands::stop_workspace_run,
+            commands::approve_workspace_task,
+            commands::reject_workspace_task,
+            commands::set_meeting_workspace_binding,
+            commands::clear_meeting_workspace_binding,
+            commands::get_meeting_workspace_binding,
+            commands::list_meeting_workspace_bindings,
+            commands::get_agents_paused,
+            commands::set_agents_paused,
+            commands::suggest_workspace_for_meeting,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

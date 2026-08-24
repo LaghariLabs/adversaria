@@ -265,6 +265,123 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelatedSignal {
+    TextMatch,
+    Semantic(f32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedHit {
+    pub meeting_id: i64,
+    pub signal: RelatedSignal,
+}
+
+/// Best cosine per meeting across all chunks, descending. Pure.
+pub fn best_cosine_per_meeting(
+    chunks: &[crate::types::ChunkRow],
+    query: &[f32],
+) -> Vec<(i64, f32)> {
+    let mut best = std::collections::HashMap::<i64, f32>::new();
+    for chunk in chunks {
+        let score = cosine(&chunk.embedding, query);
+        best.entry(chunk.meeting_id)
+            .and_modify(|current| {
+                if current.is_nan() || (!score.is_nan() && score > *current) {
+                    *current = score;
+                }
+            })
+            .or_insert(score);
+    }
+
+    let mut scored = best.into_iter().collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or_else(|| {
+            if a.1.is_nan() {
+                if b.1.is_nan() {
+                    std::cmp::Ordering::Equal
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            } else {
+                std::cmp::Ordering::Less
+            }
+        })
+    });
+    scored
+}
+
+/// FTS hits first, then sufficiently similar semantic hits not already present.
+pub fn merge_related(
+    fts: &[i64],
+    semantic: &[(i64, f32)],
+    exclude: &std::collections::HashSet<i64>,
+    min_cosine: f32,
+    limit: usize,
+) -> Vec<RelatedHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut hits = Vec::new();
+
+    for meeting_id in fts {
+        if !exclude.contains(meeting_id) && seen.insert(*meeting_id) {
+            hits.push(RelatedHit {
+                meeting_id: *meeting_id,
+                signal: RelatedSignal::TextMatch,
+            });
+            if hits.len() == limit {
+                return hits;
+            }
+        }
+    }
+
+    for (meeting_id, score) in semantic {
+        if *score >= min_cosine && !exclude.contains(meeting_id) && seen.insert(*meeting_id) {
+            hits.push(RelatedHit {
+                meeting_id: *meeting_id,
+                signal: RelatedSignal::Semantic(*score),
+            });
+            if hits.len() == limit {
+                break;
+            }
+        }
+    }
+
+    hits
+}
+
+/// Related meetings for a short text, using FTS and chunk embeddings.
+pub async fn related_meetings_for_text(
+    client: &crate::http_client::HttpClient,
+    text: &str,
+    exclude: &std::collections::HashSet<i64>,
+    min_cosine: f32,
+    limit: usize,
+) -> Vec<RelatedHit> {
+    let fts = crate::storage::search_meeting_ids(text, 10).unwrap_or_default();
+    let input = [text.to_string()];
+    let semantic =
+        match tokio::time::timeout(std::time::Duration::from_secs(8), client.embed(&input)).await {
+            Ok(Ok((vecs, model))) if !vecs.is_empty() => best_cosine_per_meeting(
+                &crate::storage::get_chunks_for_model(&model).unwrap_or_default(),
+                &vecs[0],
+            ),
+            Ok(Ok(_)) => Vec::new(),
+            Ok(Err(error)) => {
+                eprintln!("[retrieval] embed skipped: {error}");
+                Vec::new()
+            }
+            Err(error) => {
+                eprintln!("[retrieval] embed skipped: {error}");
+                Vec::new()
+            }
+        };
+    merge_related(&fts, &semantic, exclude, min_cosine, limit)
+}
+
 /// Semantic hits for a query vector against the chunk index.
 pub struct VectorHits {
     /// Meeting ids ranked by their best chunk's cosine (chunks below 0.30
@@ -650,6 +767,77 @@ mod tests {
     fn cosine_zero_vector() {
         assert_eq!(cosine(&[0.0f32, 0.0], &[1.0f32, 0.0]), -1.0);
         assert_eq!(cosine(&[1.0f32, 0.0], &[0.0f32, 0.0]), -1.0);
+    }
+
+    #[test]
+    fn best_cosine_per_meeting_uses_best_chunk_and_sorts_descending() {
+        use crate::types::ChunkRow;
+
+        let chunks = vec![
+            ChunkRow {
+                meeting_id: 1,
+                kind: "summary".into(),
+                text: "weak".into(),
+                embedding: vec![0.6, 0.8],
+            },
+            ChunkRow {
+                meeting_id: 2,
+                kind: "summary".into(),
+                text: "middle".into(),
+                embedding: vec![0.8, 0.6],
+            },
+            ChunkRow {
+                meeting_id: 1,
+                kind: "transcript".into(),
+                text: "best".into(),
+                embedding: vec![1.0, 0.0],
+            },
+            ChunkRow {
+                meeting_id: 3,
+                kind: "summary".into(),
+                text: "invalid".into(),
+                embedding: vec![f32::NAN, 0.0],
+            },
+        ];
+
+        let scores = best_cosine_per_meeting(&chunks, &[1.0, 0.0]);
+        assert_eq!(scores.len(), 3);
+        assert_eq!(scores[0].0, 1);
+        assert!((scores[0].1 - 1.0).abs() < 1e-6);
+        assert_eq!(scores[1].0, 2);
+        assert!((scores[1].1 - 0.8).abs() < 1e-6);
+        assert_eq!(scores[2].0, 3);
+        assert!(scores[2].1.is_nan());
+    }
+
+    #[test]
+    fn merge_related_prioritizes_fts_filters_and_caps_results() {
+        let fts = [3, 1, 3, 9];
+        let semantic = [(1, 0.99), (2, 0.80), (4, 0.54), (5, 0.70)];
+        let exclude = std::collections::HashSet::from([9]);
+
+        let hits = merge_related(&fts, &semantic, &exclude, 0.55, 3);
+        assert_eq!(
+            hits,
+            vec![
+                RelatedHit {
+                    meeting_id: 3,
+                    signal: RelatedSignal::TextMatch,
+                },
+                RelatedHit {
+                    meeting_id: 1,
+                    signal: RelatedSignal::TextMatch,
+                },
+                RelatedHit {
+                    meeting_id: 2,
+                    signal: RelatedSignal::Semantic(0.80),
+                },
+            ]
+        );
+
+        let uncapped = merge_related(&fts, &semantic, &exclude, 0.55, 10);
+        assert_eq!(uncapped.len(), 4);
+        assert_eq!(uncapped[3].meeting_id, 5);
     }
 
     // ---- rrf_fuse ----

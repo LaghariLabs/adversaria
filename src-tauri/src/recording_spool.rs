@@ -536,8 +536,8 @@ fn downmix_f32_to_mono(carry: &mut Vec<u8>, input: &[u8], channels: usize) -> Ve
     let mut out = Vec::with_capacity((complete / frame_size) * 4);
     for frame in carry[..complete].chunks_exact(frame_size) {
         let mut sum = 0f32;
-        for sample in frame.chunks_exact(4) {
-            sum += f32::from_le_bytes(sample.try_into().unwrap());
+        for sample in frame.as_chunks::<4>().0 {
+            sum += f32::from_le_bytes(*sample);
         }
         out.extend_from_slice(&(sum / channels as f32).to_le_bytes());
     }

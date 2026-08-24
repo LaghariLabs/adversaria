@@ -264,15 +264,15 @@ pub(crate) fn current_rms(state: &StreamState) -> f32 {
     let mut n = 0u64;
     match (format_tag, bytes_per_sample) {
         (WAV_FORMAT_IEEE_FLOAT, 4) => {
-            for c in tail.chunks_exact(4) {
-                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
+            for c in tail.as_chunks::<4>().0 {
+                let v = f32::from_le_bytes(*c) as f64;
                 sum_sq += v * v;
                 n += 1;
             }
         }
         (WAV_FORMAT_PCM, 2) => {
-            for c in tail.chunks_exact(2) {
-                let v = (i16::from_le_bytes([c[0], c[1]]) as f64) / 32768.0;
+            for c in tail.as_chunks::<2>().0 {
+                let v = (i16::from_le_bytes(*c) as f64) / 32768.0;
                 sum_sq += v * v;
                 n += 1;
             }
