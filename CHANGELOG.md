@@ -5,6 +5,42 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.82] - 2026-08-30
+
+### Added
+- **Projects in the Meetings tab.** Group meetings by the real-world project
+  they belong to: a Projects section in the sidebar (coloured folders with
+  counts), created from the + button, from any meeting's "Move to project"
+  menu, or by dragging a meeting onto a folder. The app suggests a project for
+  unfiled meetings from the meeting graph; filing is always your confirm. The
+  open note shows its project as a chip in the header.
+- **Project screen.** Click a project to see what it knows: an AI **project
+  overview** (3-5 grounded sentences built only from the filed meetings,
+  cached and marked stale when new context arrives, one-click Update), the
+  people across those meetings, standing instructions that travel with every
+  briefing and run in the project, a per-project network-access switch
+  (off = fully on-device), the filed meetings, and the project's open action
+  items with working checkboxes. Projects can be renamed or deleted from the
+  sidebar.
+- **Meeting Room.** At wide window sizes the live transcript docks beside the
+  notes instead of stacking above them, and "+ add context" lets you attach
+  reference documents or prior meeting summaries mid-recording; they fold into
+  the summarization as reference material.
+
+### Changed
+- Summarization templates rewritten to be tighter and more faithful to the
+  transcript (this build ships them live; template changes are dormant until
+  a release freeze).
+
+### Fixed
+- Clicking away from an attendee rename now commits the edit instead of
+  discarding it.
+
+### Added (dev-gated: visible only in development builds)
+- Per-task run setup for workspace tasks (ADR-017) and a per-workspace model
+  choice, separate from the notes model; semantic colour palette for the
+  built-in draw.io skill.
+
 ## [0.3.81] - 2026-08-24
 
 For users this release behaves like 0.3.80 — everything new is groundwork

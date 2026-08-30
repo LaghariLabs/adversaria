@@ -6,16 +6,20 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
   EngineInstallPlan,
   ActionItem,
+  AttachmentDraft,
   Meeting,
+  MeetingAttachment,
   MeetingStats,
   MeetingWorkspaceBinding,
   PersonProfile,
+  ProjectOverview,
   ManagedLlmStatus,
   ModelDownloadStatus,
   OllamaInstallPlan,
   OnboardingState,
   RegistrationState,
   SetupStatus,
+  TaskStaffing,
   AppConfig,
   AskMessage,
   AskResponse,
@@ -162,6 +166,28 @@ export function importAudio(
  *  (.m4a, .mp3, .wav). Returns the absolute path, or null if cancelled. */
 export function pickAudioFile(): Promise<string | null> {
   return invoke("pick_audio_file");
+}
+
+/** Pick a Markdown or text file to use as meeting context. No DB write occurs. */
+export function pickContextFile(): Promise<[string, string] | null> {
+  return invoke("pick_context_file");
+}
+
+export function addMeetingAttachments(
+  meetingId: number,
+  items: AttachmentDraft[],
+): Promise<MeetingAttachment[]> {
+  return invoke("add_meeting_attachments", { meetingId, items });
+}
+
+export function listMeetingAttachments(
+  meetingId: number,
+): Promise<MeetingAttachment[]> {
+  return invoke("list_meeting_attachments", { meetingId });
+}
+
+export function removeMeetingAttachment(id: number): Promise<void> {
+  return invoke("remove_meeting_attachment", { id });
 }
 
 /** "Structure with AI": turn a standalone note's rough text into structured
@@ -722,9 +748,17 @@ export function openPrivacySettings(which: "microphone" | "system_audio"): Promi
 
 // ---- Workspaces ----
 
+/** Load the cached project overview, generating it when missing or explicitly refreshed. */
+export function getProjectOverview(
+  workspaceId: number,
+  refresh = false,
+): Promise<ProjectOverview> {
+  return invoke("get_project_overview", { workspaceId, refresh });
+}
+
 /** Create a long-lived workspace using the local engine. */
-export function createWorkspace(name: string): Promise<Workspace> {
-  return invoke("create_workspace", { name });
+export function createWorkspace(name: string, color?: string): Promise<Workspace> {
+  return invoke("create_workspace", { name, color: color ?? null });
 }
 
 /** List workspaces and the summary counts shown on their cards. */
@@ -806,6 +840,27 @@ export function renameWorkspace(id: number, name: string): Promise<void> {
   return invoke("rename_workspace", { id, name });
 }
 
+/** Update a workspace's standing instructions. */
+export function setWorkspaceInstructions(
+  id: number,
+  instructions: string,
+): Promise<void> {
+  return invoke("set_workspace_instructions", { id, instructions });
+}
+
+/** Change whether a workspace may use the network. */
+export function setWorkspaceNetworkAllowed(
+  id: number,
+  allowed: boolean,
+): Promise<void> {
+  return invoke("set_workspace_network_allowed", { id, allowed });
+}
+
+/** Update a workspace's sidebar color. */
+export function setWorkspaceColor(id: number, color: string): Promise<void> {
+  return invoke("set_workspace_color", { id, color });
+}
+
 /** Delete a workspace and its tasks and context links. */
 export function deleteWorkspace(id: number): Promise<void> {
   return invoke("delete_workspace", { id });
@@ -838,6 +893,28 @@ export function createWorkspaceTask(
     details,
     sourceMeetingId,
     actionItemId,
+  });
+}
+
+/** Return the run setup resolved for one workspace task. */
+export function getWorkspaceTaskStaffing(
+  taskId: number,
+): Promise<TaskStaffing | null> {
+  return invoke("get_workspace_task_staffing", { taskId });
+}
+
+/** Choose automatic or manual run setup for one workspace task. */
+export function setWorkspaceTaskStaffing(
+  taskId: number,
+  mode: string,
+  agentId: number | null,
+  skillIds: number[],
+): Promise<TaskStaffing> {
+  return invoke("set_workspace_task_staffing", {
+    taskId,
+    mode,
+    agentId,
+    skillIds,
   });
 }
 
@@ -919,6 +996,11 @@ export function detectWorkspaceEngines(): Promise<WorkspaceEngine[]> {
 /** Select the engine used by a workspace. */
 export function setWorkspaceEngine(id: number, engine: string): Promise<void> {
   return invoke("set_workspace_engine", { id, engine });
+}
+
+/** Select the model used by a workspace's local-engine runs. */
+export function setWorkspaceModel(id: number, model: string): Promise<void> {
+  return invoke("set_workspace_model", { id, model });
 }
 
 /** Execute a workspace task and stream live output to `onLog`. */

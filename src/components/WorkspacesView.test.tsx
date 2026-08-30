@@ -18,7 +18,10 @@ const summary: WorkspaceSummary = {
     id: 4,
     name: "Launch planning",
     engine: "local",
+    model: "",
     network_allowed: false,
+    instructions: "",
+    color: "blue",
     created_at: "2026-08-17T10:00:00Z",
     updated_at: "2026-08-17T10:00:00Z",
   },
@@ -283,15 +286,25 @@ describe("WorkspacesView", () => {
     );
   });
 
-  it("shows an attached skill as pressed in the Context pane", async () => {
+  it("shows staffing on its queued task instead of in the Context pane", async () => {
     const detailWithSkill: WorkspaceDetail = {
       ...detail,
       addons: [attachedSkill],
+      tasks: [workspaceTask()],
     };
     mockIPC((command) => {
       if (command === "list_workspaces") return [summary];
       if (command === "get_workspace") return detailWithSkill;
       if (command === "list_workspace_addons") return [attachedSkill];
+      if (command === "get_workspace_task_staffing") {
+        return {
+          mode: "manual",
+          agent_id: null,
+          skill_ids: [attachedSkill.id],
+          reason: "",
+          resolved_at: "2026-08-25T10:05:00Z",
+        };
+      }
       if (command === "detect_workspace_engines") return engines;
       if (command === "get_agents_paused") return false;
       if (command === "get_latest_workspace_run") return null;
@@ -304,8 +317,11 @@ describe("WorkspacesView", () => {
     await user.click(await screen.findByText("Launch planning"));
 
     expect(
-      await screen.findByRole("button", { name: "Architecture doc" }),
-    ).toHaveAttribute("aria-pressed", "true");
+      await screen.findByText("Run setup: Manual · Architecture doc"),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Architecture doc" }),
+    ).not.toBeInTheDocument();
   });
 
   it("runs a task, refreshes artifacts, and opens the produced file", async () => {

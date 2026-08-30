@@ -1,6 +1,6 @@
 [package]
 name = "meeting-note-taker"
-version = "0.3.81"
+version = "0.3.82"
 authors = ["Mohammad Hamza Laghari <hamza@lagharilabs.com>"]
 edition = "2021"
 
@@ -57,6 +57,7 @@ regex = "1"
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system"] }
 tauri-plugin-wdio = { version = "1", optional = true }
 tauri-plugin-wdio-webdriver = { version = "1", optional = true }
+quick-xml = "0.41.0"
 
 # --- Windows-only: WASAPI dual capture + registry-based meeting detection ---
 [target.'cfg(windows)'.dependencies]

@@ -16,11 +16,12 @@ use crate::audio::AudioCapture;
 use crate::calendar::{oauth, tokens};
 use crate::http_client::{HttpClient, SummarizeParams, TranscribeParams};
 use crate::types::{
-    ActionItem, AppConfig, AskMessage, AskResponse, CalendarAccount, CalendarConfig, CalendarEvent,
-    ChatMessage, ChatTurn, ContextIndexStatus, ContextSources, HealthResponse, Meeting, MeetingRef,
-    MeetingWorkspaceBinding, SummarizeResponse, Tag, TemplateInfo, WeeklyBriefing, WeeklyOpenLoop,
-    Workspace, WorkspaceAddon, WorkspaceContextItem, WorkspaceDetail, WorkspaceEngine,
-    WorkspaceRun, WorkspaceSuggestion, WorkspaceSummary, WorkspaceTask,
+    ActionItem, AppConfig, AskMessage, AskResponse, AttachmentDraft, CalendarAccount,
+    CalendarConfig, CalendarEvent, ChatMessage, ChatTurn, ContextIndexStatus, ContextSources,
+    HealthResponse, Meeting, MeetingAttachment, MeetingRef, MeetingWorkspaceBinding,
+    ProjectOverview, SummarizeResponse, Tag, TaskStaffing, TemplateInfo, WeeklyBriefing,
+    WeeklyOpenLoop, Workspace, WorkspaceAddon, WorkspaceContextItem, WorkspaceDetail,
+    WorkspaceEngine, WorkspaceRun, WorkspaceSuggestion, WorkspaceSummary, WorkspaceTask,
 };
 
 /// How often to feed new recording audio to the VAD-gated live-caption
@@ -1165,6 +1166,7 @@ pub async fn transcribe_and_summarize(
                 model: configured_model(),
                 output_language: configured_language(),
                 user_notes: Some(notes.clone()),
+                attached_context: attached_context_for(new_id),
                 llm_base_url: configured_llm_base_url(),
                 llm_api_key: configured_llm_api_key(),
                 known_attendees: None, // TODO: calendar roster
@@ -1742,6 +1744,7 @@ pub async fn transcribe_meeting(
             model: configured_model(),
             output_language: configured_language(),
             user_notes: Some(meeting.user_notes.clone()),
+            attached_context: attached_context_for(id),
             llm_base_url: configured_llm_base_url(),
             llm_api_key: configured_llm_api_key(),
             known_attendees: None, // TODO: calendar roster
@@ -1844,6 +1847,7 @@ async fn write_missing_notes(app: &AppHandle, client: &HttpClient, id: i64) -> R
             model: configured_model(),
             output_language: configured_language(),
             user_notes: Some(meeting.user_notes.clone()),
+            attached_context: attached_context_for(id),
             llm_base_url: configured_llm_base_url(),
             llm_api_key: configured_llm_api_key(),
             known_attendees: (!meeting.attendees.is_empty()).then(|| meeting.attendees.clone()),
@@ -2043,6 +2047,8 @@ pub async fn import_audio(
                 model,
                 output_language: language,
                 user_notes: None,
+                // The imported meeting row is created only after this summary.
+                attached_context: None,
                 llm_base_url,
                 llm_api_key,
                 known_attendees: None,
@@ -2136,6 +2142,93 @@ pub async fn pick_audio_file() -> Result<Option<String>, String> {
     .await
     .map_err(|e| format!("File dialog failed: {e}"))?;
     Ok(path.map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// Native file dialog for meeting reference material. No DB write occurs.
+#[tauri::command]
+pub async fn pick_context_file() -> Result<Option<(String, String)>, String> {
+    let path = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .add_filter("Text", &["md", "txt", "markdown"])
+            .pick_file()
+    })
+    .await
+    .map_err(|e| format!("File dialog failed: {e}"))?;
+    Ok(path.map(|path| {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (path.to_string_lossy().into_owned(), filename)
+    }))
+}
+
+#[tauri::command]
+pub async fn add_meeting_attachments(
+    meeting_id: i64,
+    items: Vec<AttachmentDraft>,
+) -> Result<Vec<MeetingAttachment>, String> {
+    let items = items
+        .into_iter()
+        .map(|item| (item.kind, item.value, item.label))
+        .collect::<Vec<_>>();
+    crate::storage::add_meeting_attachments(meeting_id, &items)
+        .map_err(|e| format!("Failed to add meeting attachments: {e}"))
+}
+
+#[tauri::command]
+pub async fn list_meeting_attachments(meeting_id: i64) -> Result<Vec<MeetingAttachment>, String> {
+    crate::storage::list_meeting_attachments(meeting_id)
+        .map_err(|e| format!("Failed to list meeting attachments: {e}"))
+}
+
+#[tauri::command]
+pub async fn remove_meeting_attachment(id: i64) -> Result<(), String> {
+    crate::storage::remove_meeting_attachment(id)
+        .map_err(|e| format!("Failed to remove meeting attachment: {e}"))
+}
+
+/// Assemble attachment material for one meeting: files read from disk (best-effort,
+/// capped), attached meetings contribute their stored summary. Returns None when empty.
+fn attached_context_for(meeting_id: i64) -> Option<String> {
+    const ATTACHMENT_LIMIT: usize = 5;
+    const CHAR_LIMIT: usize = 4_000;
+    const TRUNCATED: &str = "… [truncated]";
+
+    fn capped(text: &str) -> String {
+        if text.chars().count() <= CHAR_LIMIT {
+            return text.to_string();
+        }
+        let keep = CHAR_LIMIT.saturating_sub(TRUNCATED.chars().count());
+        let mut result = text.chars().take(keep).collect::<String>();
+        result.push_str(TRUNCATED);
+        result
+    }
+
+    let attachments = crate::storage::list_meeting_attachments(meeting_id).ok()?;
+    let mut blocks = Vec::new();
+    for attachment in attachments.into_iter().take(ATTACHMENT_LIMIT) {
+        let material = match attachment.kind.as_str() {
+            "file" => match std::fs::read_to_string(&attachment.value) {
+                Ok(contents) if !contents.trim().is_empty() => Some(capped(contents.trim())),
+                Ok(_) => None,
+                Err(_) => Some(format!("[{} could not be read]", attachment.label)),
+            },
+            "meeting" => attachment
+                .value
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| crate::storage::get_meeting(id).ok().flatten())
+                .map(|meeting| meeting.summary)
+                .filter(|summary| !summary.trim().is_empty())
+                .map(|summary| capped(summary.trim())),
+            _ => None,
+        };
+        if let Some(material) = material {
+            blocks.push(format!("## {}\n{}", attachment.label, material));
+        }
+    }
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
 /// The Ollama model configured by the user, or `None` to let the service
@@ -3372,6 +3465,7 @@ pub async fn resummarize_meeting(
             model,
             output_language: language,
             user_notes: Some(meeting.user_notes.clone()),
+            attached_context: attached_context_for(id),
             llm_base_url,
             llm_api_key,
             known_attendees: (!meeting.attendees.is_empty()).then(|| meeting.attendees.clone()),
@@ -3475,6 +3569,7 @@ pub async fn structure_note(
             model: configured_model(),
             output_language: configured_language(),
             user_notes: None,
+            attached_context: attached_context_for(id),
             llm_base_url: configured_llm_base_url(),
             llm_api_key: configured_llm_api_key(),
             known_attendees: None,
@@ -4499,7 +4594,10 @@ fn sync_actions_for_meeting(app: &AppHandle, id: i64, summary: &str) {
         }
     };
     match crate::storage::sync_action_items(&conn, id, summary) {
-        Ok(()) => crate::autopilot::kick(app.clone()),
+        Ok(()) => {
+            resolve_unstaffed_queued_tasks_for_meeting(id);
+            crate::autopilot::kick(app.clone());
+        }
         Err(e) => eprintln!("[action_items] sync failed for meeting {id}: {e}"),
     }
 }
@@ -5066,6 +5164,7 @@ pub async fn test_local_setup(state: State<'_, AppState>) -> Result<String, Stri
             model: Some(configured_model().unwrap_or_else(|| "default".to_string())),
             output_language: Some("en".to_string()),
             user_notes: None,
+            attached_context: None, // connectivity smoke test; no meeting exists
             llm_base_url: base_url,
             llm_api_key: api_key,
             known_attendees: Some(vec!["Amina".to_string(), "Omar".to_string()]),
@@ -5105,6 +5204,7 @@ pub async fn test_cloud_setup(
             model: Some(model.trim().to_string()),
             output_language: Some("en".to_string()),
             user_notes: None,
+            attached_context: None, // connectivity smoke test; no meeting exists
             llm_base_url: Some(base_url),
             llm_api_key: Some(api_key),
             known_attendees: Some(vec!["Amina".to_string(), "Omar".to_string()]),
@@ -5705,6 +5805,92 @@ fn spawn_live_caption(app: AppHandle) {
 
 // ---- Workspaces ----
 
+fn automatic_task_staffing(task: &WorkspaceTask, catalog: &[WorkspaceAddon]) -> TaskStaffing {
+    let staffing = crate::workspace_runs::suggest_staffing(&task.title, &task.details, catalog, 2);
+    TaskStaffing {
+        mode: "automatic".to_string(),
+        agent_id: staffing.agent.map(|agent| agent.id),
+        skill_ids: staffing.skills.into_iter().map(|skill| skill.id).collect(),
+        reason: staffing.reasons.join(" "),
+        resolved_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+fn resolve_and_persist_automatic_task_staffing(
+    task: &WorkspaceTask,
+) -> anyhow::Result<TaskStaffing> {
+    let catalog = crate::storage::list_addons()?;
+    let staffing = automatic_task_staffing(task, &catalog);
+    crate::storage::set_task_staffing(task.id, &staffing)?;
+    Ok(staffing)
+}
+
+fn resolve_task_staffing_with<Get, Resolve>(
+    task: &WorkspaceTask,
+    get_staffing: Get,
+    resolve_and_persist: Resolve,
+) -> anyhow::Result<()>
+where
+    Get: FnOnce(i64) -> anyhow::Result<Option<TaskStaffing>>,
+    Resolve: FnOnce(&WorkspaceTask) -> anyhow::Result<()>,
+{
+    if get_staffing(task.id)?.is_some_and(|staffing| staffing.mode == "manual") {
+        return Ok(());
+    }
+    resolve_and_persist(task)
+}
+
+/// Resolve and persist automatic staffing for a queued task. Never fails a caller:
+/// on any error it logs to stderr and leaves the task unstaffed.
+fn resolve_task_staffing(task: &WorkspaceTask) {
+    if let Err(error) =
+        resolve_task_staffing_with(task, crate::storage::get_task_staffing, |task| {
+            resolve_and_persist_automatic_task_staffing(task).map(|_| ())
+        })
+    {
+        eprintln!(
+            "Failed to resolve staffing for workspace task {}: {error}",
+            task.id
+        );
+    }
+}
+
+fn resolve_unstaffed_queued_tasks_for_meeting(meeting_id: i64) {
+    let binding = match crate::storage::get_meeting_binding(meeting_id) {
+        Ok(binding) => binding,
+        Err(error) => {
+            eprintln!("Failed to load workspace binding for meeting {meeting_id}: {error}");
+            return;
+        }
+    };
+    let Some(workspace_id) = binding.and_then(|binding| binding.workspace_id) else {
+        return;
+    };
+    let detail = match crate::storage::get_workspace(workspace_id) {
+        Ok(Some(detail)) => detail,
+        Ok(None) => {
+            eprintln!(
+                "Failed to resolve staffing for meeting {meeting_id}: workspace {workspace_id} was not found"
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!("Failed to load queued tasks for meeting {meeting_id} staffing: {error}");
+            return;
+        }
+    };
+    for task in detail
+        .tasks
+        .iter()
+        .filter(|task| task.status == "queued" && task.source_meeting_id == Some(meeting_id))
+    {
+        match crate::storage::get_task_staffing(task.id) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => resolve_task_staffing(task),
+        }
+    }
+}
+
 /// Return the folders that feed automatic context into every workspace run.
 #[tauri::command]
 pub async fn get_context_sources() -> Result<ContextSources, String> {
@@ -5744,12 +5930,22 @@ pub async fn get_context_index_status() -> Result<ContextIndexStatus, String> {
 
 /// Create a long-lived workspace using the local engine.
 #[tauri::command]
-pub async fn create_workspace(name: String) -> Result<Workspace, String> {
+pub async fn create_workspace(name: String, color: Option<String>) -> Result<Workspace, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Workspace name can't be empty.".into());
     }
-    crate::storage::create_workspace(name).map_err(|e| format!("Failed to create workspace: {e}"))
+    let color = color.unwrap_or_default();
+    let color = if color.is_empty() {
+        "blue"
+    } else {
+        color.as_str()
+    };
+    if !matches!(color, "blue" | "purple" | "orange" | "green" | "red") {
+        return Err(format!("Unknown project colour: {color}"));
+    }
+    crate::storage::create_workspace(name, color)
+        .map_err(|e| format!("Failed to create workspace: {e}"))
 }
 
 /// List workspaces and the summary counts shown on their cards.
@@ -5771,6 +5967,17 @@ pub async fn get_workspace(id: i64) -> Result<WorkspaceDetail, String> {
 pub async fn list_workspace_addons() -> Result<Vec<WorkspaceAddon>, String> {
     crate::storage::list_addons()
         .map_err(|error| format!("Failed to list workspace add-ons: {error}"))
+}
+
+/// Preview the staffing the app would choose for a task title, without running it.
+#[tauri::command]
+pub async fn suggest_workspace_staffing(
+    title: String,
+    details: String,
+) -> Result<Vec<String>, String> {
+    let catalog = crate::storage::list_addons()
+        .map_err(|error| format!("Failed to list workspace add-ons: {error}"))?;
+    Ok(crate::workspace_runs::suggest_staffing(&title, &details, &catalog, 2).reasons)
 }
 
 /// Create a custom skill or agent role.
@@ -5821,6 +6028,33 @@ pub async fn rename_workspace(id: i64, name: String) -> Result<(), String> {
     }
     crate::storage::rename_workspace(id, name)
         .map_err(|e| format!("Failed to rename workspace: {e}"))
+}
+
+/// Update a workspace's standing instructions.
+#[tauri::command]
+pub async fn set_workspace_instructions(id: i64, instructions: String) -> Result<(), String> {
+    crate::storage::set_workspace_instructions(id, &instructions)
+        .map_err(|e| format!("Failed to update workspace instructions: {e}"))
+}
+
+/// Change whether a workspace may use the network.
+#[tauri::command]
+pub async fn set_workspace_network_allowed(id: i64, allowed: bool) -> Result<(), String> {
+    crate::storage::set_workspace_network_allowed(id, allowed)
+        .map_err(|e| format!("Failed to update workspace network access: {e}"))
+}
+
+/// Update a workspace's sidebar color.
+#[tauri::command]
+pub async fn set_workspace_color(id: i64, color: String) -> Result<(), String> {
+    if !matches!(
+        color.as_str(),
+        "blue" | "purple" | "orange" | "green" | "red"
+    ) {
+        return Err(format!("Unknown project colour: {color}"));
+    }
+    crate::storage::set_workspace_color(id, &color)
+        .map_err(|e| format!("Failed to update workspace colour: {e}"))
 }
 
 /// Delete a workspace and its tasks and context links, leaving meetings untouched.
@@ -5876,12 +6110,51 @@ pub async fn create_workspace_task(
         action_item_id,
     )
     .map_err(|e| format!("Failed to create workspace task: {e}"))?;
+    resolve_task_staffing(&task);
     let _ = app.emit(
         "workspace-task-changed",
         serde_json::json!({ "workspace_id": task.workspace_id, "task_id": task.id }),
     );
     crate::autopilot::kick(app.clone());
     Ok(task)
+}
+
+/// Return the run setup resolved for one workspace task.
+#[tauri::command]
+pub async fn get_workspace_task_staffing(task_id: i64) -> Result<Option<TaskStaffing>, String> {
+    crate::storage::get_task_staffing(task_id)
+        .map_err(|error| format!("Failed to load workspace task staffing: {error}"))
+}
+
+/// Choose automatic or manual run setup for one workspace task.
+#[tauri::command]
+pub async fn set_workspace_task_staffing(
+    task_id: i64,
+    mode: String,
+    agent_id: Option<i64>,
+    skill_ids: Vec<i64>,
+) -> Result<TaskStaffing, String> {
+    let task = crate::storage::get_workspace_task(task_id)
+        .map_err(|error| format!("Failed to load workspace task: {error}"))?
+        .ok_or_else(|| format!("Workspace task not found: {task_id}"))?;
+    let staffing = match mode.as_str() {
+        "automatic" => resolve_and_persist_automatic_task_staffing(&task)
+            .map_err(|error| format!("Failed to resolve automatic staffing: {error}"))?,
+        "manual" => {
+            let staffing = TaskStaffing {
+                mode,
+                agent_id,
+                skill_ids,
+                reason: String::new(),
+                resolved_at: chrono::Utc::now().to_rfc3339(),
+            };
+            crate::storage::set_task_staffing(task_id, &staffing)
+                .map_err(|error| format!("Failed to save manual staffing: {error}"))?;
+            staffing
+        }
+        _ => return Err("Staffing mode must be \"automatic\" or \"manual\".".to_string()),
+    };
+    Ok(staffing)
 }
 
 /// Include or exclude one queued task from automatic agent pickup.
@@ -5979,6 +6252,13 @@ pub async fn set_workspace_engine(app: AppHandle, id: i64, engine: String) -> Re
     Ok(())
 }
 
+/// Set the model a workspace's local-engine runs use. Empty string = inherit the notes model.
+#[tauri::command]
+pub async fn set_workspace_model(id: i64, model: String) -> Result<(), String> {
+    crate::storage::set_workspace_model(id, &model)
+        .map_err(|error| format!("Failed to set workspace model: {error}"))
+}
+
 /// Return the newest run for one task, if it has ever run.
 #[tauri::command]
 pub async fn get_latest_workspace_run(task_id: i64) -> Result<Option<WorkspaceRun>, String> {
@@ -6056,7 +6336,7 @@ async fn execute_workspace_run_inner(
         return Err(format!("Unknown engine: {engine}"));
     }
 
-    let (task, meetings, folders, addons, run) = {
+    let (task, workspace, meetings, folders, run) = {
         let state = app.state::<AppState>();
         let _gate = state.autopilot_gate.lock().unwrap();
         let task = crate::storage::get_workspace_task(task_id)
@@ -6094,10 +6374,9 @@ async fn execute_workspace_run_inner(
                 _ => {}
             }
         }
-        let addons = detail.addons;
         let run = crate::storage::create_workspace_run(task.workspace_id, task.id, &engine)
             .map_err(|error| format!("Failed to create workspace run: {error}"))?;
-        (task, meetings, folders, addons, run)
+        (task, detail.workspace, meetings, folders, run)
     };
 
     let all = match crate::storage::get_meetings() {
@@ -6132,25 +6411,82 @@ async fn execute_workspace_run_inner(
         vault_path: config.context_vault_path,
         projects_root: config.context_projects_root,
     };
-    let agent = addons.iter().find(|addon| addon.kind == "agent");
-    let skills = addons
+    let persisted_staffing = match crate::storage::get_task_staffing(task.id) {
+        Ok(staffing) => staffing,
+        Err(error) => {
+            return fail_workspace_run(
+                run.id,
+                "",
+                &format!("Failed to load workspace task staffing: {error}"),
+            );
+        }
+    };
+    let catalog = match crate::storage::list_addons() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return fail_workspace_run(
+                run.id,
+                "",
+                &format!("Failed to list workspace add-ons: {error}"),
+            );
+        }
+    };
+    let staffing = match persisted_staffing {
+        Some(staffing) => staffing,
+        None => {
+            let staffing = automatic_task_staffing(&task, &catalog);
+            if let Err(error) = crate::storage::set_task_staffing(task.id, &staffing) {
+                return fail_workspace_run(
+                    run.id,
+                    "",
+                    &format!("Failed to persist workspace task staffing: {error}"),
+                );
+            }
+            staffing
+        }
+    };
+    let selected_agent = staffing
+        .agent_id
+        .and_then(|agent_id| catalog.iter().find(|addon| addon.id == agent_id).cloned());
+    let skills = staffing
+        .skill_ids
         .iter()
-        .filter(|addon| addon.kind == "skill")
-        .cloned()
-        .collect::<Vec<WorkspaceAddon>>();
-    let receipt_line = format!(
-        "{}\n",
-        crate::workspace_runs::context_receipt(
-            &meetings,
-            &related,
-            &folders,
-            &context_sources,
-            &vault_hits,
-            &project_hits,
-            agent,
-            &skills,
-        )
-    );
+        .filter_map(|skill_id| catalog.iter().find(|addon| addon.id == *skill_id).cloned())
+        .collect::<Vec<_>>();
+    let agent = selected_agent.as_ref();
+    let local_model = if engine == "local" {
+        if workspace.model.is_empty() {
+            Some((configured_model(), "notes model"))
+        } else {
+            Some((Some(workspace.model.clone()), "workspace override"))
+        }
+    } else {
+        None
+    };
+    let mut receipt_line = String::new();
+    if staffing.mode == "manual" {
+        receipt_line.push_str("Run setup: chosen manually.\n");
+    } else if !staffing.reason.is_empty() {
+        receipt_line.push_str(&staffing.reason);
+        receipt_line.push('\n');
+    }
+    receipt_line.push_str(&crate::workspace_runs::context_receipt(
+        &meetings,
+        &related,
+        &folders,
+        &context_sources,
+        &vault_hits,
+        &project_hits,
+        agent,
+        &skills,
+    ));
+    receipt_line.push('\n');
+    if let Some((model, source)) = &local_model {
+        receipt_line.push_str(&format!(
+            "Model: {} ({source})\n",
+            model.as_deref().unwrap_or("service default")
+        ));
+    }
     if let Err(error) = crate::storage::update_workspace_run_log(run.id, &receipt_line) {
         return fail_workspace_run(
             run.id,
@@ -6219,10 +6555,11 @@ async fn execute_workspace_run_inner(
         &skills,
         &vault_hits,
         &project_hits,
+        &workspace.instructions,
     );
 
     if engine == "local" {
-        let model = configured_model();
+        let model = local_model.as_ref().and_then(|(model, _)| model.as_deref());
         let llm_base_url = configured_llm_base_url();
         let llm_api_key = configured_llm_api_key();
         let accumulated = Arc::new(Mutex::new(receipt_line.clone()));
@@ -6235,7 +6572,7 @@ async fn execute_workspace_run_inner(
             .draft_stream(
                 &brief,
                 LOCAL_WORKSPACE_INSTRUCTION,
-                model.as_deref(),
+                model,
                 llm_base_url.as_deref(),
                 llm_api_key.as_deref(),
                 |token| {
@@ -6282,6 +6619,14 @@ async fn execute_workspace_run_inner(
             written_names.push("draft.md".to_string());
         }
 
+        for warning in crate::workspace_runs::drawio_artifact_warnings(&output_dir) {
+            if !log.ends_with('\n') {
+                log.push('\n');
+            }
+            log.push_str(&warning);
+            log.push('\n');
+            sink(format!("{warning}\n"));
+        }
         let count = match persist_workspace_artifacts(task.workspace_id, run.id, &output_dir) {
             Ok(count) => count,
             Err(error) => return fail_workspace_run(run.id, &log, &error),
@@ -6382,11 +6727,19 @@ async fn execute_workspace_run_inner(
     }
 
     if outcome.exit_success {
+        let mut log = outcome.log;
+        for warning in crate::workspace_runs::drawio_artifact_warnings(&output_dir) {
+            if !log.ends_with('\n') {
+                log.push('\n');
+            }
+            log.push_str(&warning);
+            log.push('\n');
+            sink(format!("{warning}\n"));
+        }
         let count = match persist_workspace_artifacts(task.workspace_id, run.id, &output_dir) {
             Ok(count) => count,
-            Err(error) => return fail_workspace_run(run.id, &outcome.log, &error),
+            Err(error) => return fail_workspace_run(run.id, &log, &error),
         };
-        let mut log = outcome.log;
         if count == 0 {
             log.push_str("\n(No files were produced.)");
         }
@@ -6498,6 +6851,7 @@ pub async fn reject_workspace_task(
         .ok_or_else(|| format!("Workspace task not found: {task_id}"))?;
     crate::storage::reject_workspace_task(task_id, &reason)
         .map_err(|e| format!("Failed to reject workspace task: {e}"))?;
+    resolve_task_staffing(&task);
     let _ = app.emit(
         "workspace-task-changed",
         serde_json::json!({ "workspace_id": task.workspace_id, "task_id": task_id }),
@@ -6515,6 +6869,9 @@ pub async fn set_meeting_workspace_binding(
 ) -> Result<usize, String> {
     let queued = crate::storage::set_meeting_binding(meeting_id, workspace_id)
         .map_err(|e| format!("Failed to bind meeting to workspace: {e}"))?;
+    if queued > 0 {
+        resolve_unstaffed_queued_tasks_for_meeting(meeting_id);
+    }
     crate::autopilot::kick(app.clone());
     Ok(queued)
 }
@@ -6675,8 +7032,115 @@ pub async fn suggest_workspace_for_meeting(
     }))
 }
 
+#[tauri::command]
+pub async fn get_project_overview(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    refresh: bool,
+) -> Result<ProjectOverview, String> {
+    const PROJECT_OVERVIEW_CHAR_CAP: usize = 12_000;
+
+    // 1. Validate workspace exists and capture instructions + model.
+    let (instructions, workspace_model) = {
+        let workspace = crate::storage::get_workspace(workspace_id)
+            .map_err(|e| format!("Failed to load workspace: {e}"))?
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+        (workspace.workspace.instructions, workspace.workspace.model)
+    };
+
+    // 2. Load only meetings explicitly filed to this workspace, newest first.
+    let meetings = crate::storage::get_meetings_for_workspace(workspace_id)
+        .map_err(|e| format!("Failed to load workspace meetings: {e}"))?;
+
+    // 3. Compute stable source hash.
+    let current_hash = crate::project_overview::compute_source_hash(&instructions, &meetings);
+
+    // 4. Zero filed meetings -> empty overview, no model call.
+    if meetings.is_empty() {
+        return Ok(ProjectOverview {
+            workspace_id,
+            summary: String::new(),
+            generated_at: String::new(),
+            source_meeting_count: 0,
+            stale: false,
+        });
+    }
+
+    // Load cached overview if any.
+    let cached = crate::storage::get_project_overview_cache(workspace_id)
+        .map_err(|e| format!("Failed to load project overview: {e}"))?;
+
+    // 5. If refresh is false and a cached summary exists, return it with stale flag.
+    if !refresh {
+        if let Some((summary, cached_hash, generated_at)) = cached {
+            if !summary.trim().is_empty() {
+                let stale = cached_hash != current_hash;
+                return Ok(ProjectOverview {
+                    workspace_id,
+                    summary,
+                    generated_at,
+                    source_meeting_count: meetings.len() as i64,
+                    stale,
+                });
+            }
+        }
+    }
+
+    // If refresh is false and no cache exists, we fall through to generation.
+    // If refresh is true, we always regenerate.
+
+    // 6. Determine model preference (workspace model when non-empty).
+    let model = if !workspace_model.trim().is_empty() {
+        Some(workspace_model.trim().to_string())
+    } else {
+        configured_model()
+    };
+    let llm_base_url = configured_llm_base_url();
+    let llm_api_key = configured_llm_api_key();
+
+    // 7. Build grounded context and 8. include instructions as trusted.
+    let context =
+        crate::project_overview::build_project_context(&meetings, PROJECT_OVERVIEW_CHAR_CAP);
+    let chat_question =
+        crate::project_overview::build_overview_question(&instructions, meetings.len());
+
+    let answer = state
+        .client
+        .chat(
+            &context,
+            &chat_question,
+            model.as_deref(),
+            llm_base_url.as_deref(),
+            llm_api_key.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("Could not generate the project overview: {e}"))?;
+
+    let trimmed = answer.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(
+            "The notes model returned an empty overview. Try again in a moment.".to_string(),
+        );
+    }
+
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    // Persist summary/hash/generated timestamp; do not overwrite on failure (we only reach here on success).
+    crate::storage::upsert_project_overview(workspace_id, &trimmed, &current_hash, &generated_at)
+        .map_err(|e| format!("Failed to save project overview: {e}"))?;
+
+    Ok(ProjectOverview {
+        workspace_id,
+        summary: trimmed,
+        generated_at,
+        source_meeting_count: meetings.len() as i64,
+        stale: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     #[test]
     fn ollama_tags_are_told_apart_from_managed_aliases() {
         // Rapid-MLX aliases never contain a colon; Ollama names always do.
@@ -6726,6 +7190,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn resolve_task_staffing_preserves_manual_choice() {
+        let task = WorkspaceTask {
+            id: 7,
+            workspace_id: 3,
+            title: "Draft the launch memo".to_string(),
+            details: "Summarize the decisions.".to_string(),
+            status: "queued".to_string(),
+            source_meeting_id: None,
+            source_meeting_title: String::new(),
+            action_item_id: None,
+            attempt: 1,
+            rejection_notes: Vec::new(),
+            agent_eligible: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let manual = TaskStaffing {
+            mode: "manual".to_string(),
+            agent_id: Some(11),
+            skill_ids: vec![13, 17],
+            reason: String::new(),
+            resolved_at: "2026-08-25T18:00:00Z".to_string(),
+        };
+        let overwritten = Cell::new(false);
+
+        resolve_task_staffing_with(
+            &task,
+            |_| Ok(Some(manual)),
+            |_| {
+                overwritten.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!overwritten.get());
+    }
 
     #[test]
     fn mic_path_for_swaps_suffix() {

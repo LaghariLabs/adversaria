@@ -1534,6 +1534,7 @@ class OllamaSummarizer:
         model: str | None = None,
         output_language: str | None = None,
         user_notes: str | None = None,
+        attached_context: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         known_attendees: list[str] | None = None,
@@ -1552,6 +1553,8 @@ class OllamaSummarizer:
             transcript: The raw meeting transcript text.
             template_name: Name of the prompt template to use (e.g. 'general').
             model: Ollama model override; defaults to the summarizer's model.
+            attached_context: User-attached reference material. It may resolve
+                names and details but is never evidence of what this meeting said.
             base_url: When non-empty, route through the OpenAI-compatible path
                 with this URL + api_key regardless of the default backend.
             api_key: API key for the cloud provider (used with base_url).
@@ -1675,6 +1678,17 @@ class OllamaSummarizer:
                 "support; just keep the note as written)."
             )
 
+        context = (attached_context or "").strip()
+        if context:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "ATTACHED CONTEXT: The material in the <attached_context> block "
+                "of the user message is reference/background the user attached. "
+                "Use it to resolve names, context, and details, but NEVER treat it "
+                "as something said in this meeting. Claims about what happened or "
+                "was said in this meeting must stay grounded in the transcript."
+            )
+
         # Pin the exact JSON shape in the prompt. Local vLLM/Rapid-MLX enforces it
         # via response_format=json_schema, but cloud servers like DeepSeek don't
         # support json_schema (we fall back to json_object), so without this the
@@ -1702,6 +1716,10 @@ class OllamaSummarizer:
         user_message = self._build_user_message(transcript)
         if notes:
             user_message = f"{user_message}\n\n<user_notes>\n{notes}\n</user_notes>"
+        if context:
+            user_message = (
+                f"{user_message}\n\n<attached_context>\n{context}\n</attached_context>"
+            )
         if directive:
             # Same-script languages (es/fr/pt/…) lose to the English template by
             # recency: the directive sits FIRST (system prompt) while the English

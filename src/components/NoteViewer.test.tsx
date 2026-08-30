@@ -581,3 +581,76 @@ describe("NoteViewer attendee rename", () => {
     );
   });
 });
+
+describe("NoteViewer project context", () => {
+  const meeting = pendingMeeting({ summary: "Meeting notes" });
+  const suggestion = {
+    workspace_id: 9,
+    workspace_name: "Launch plan",
+    related_meeting_count: 3,
+    shared_attendee_count: 2,
+  };
+
+  it("renders the assigned project chip", () => {
+    mockIPC((command) => {
+      if (command === "list_templates") return [];
+      if (command === "get_action_items") return [];
+      if (command === "get_config") return appConfig();
+      return null;
+    });
+
+    render(
+      <NoteViewer
+        meeting={meeting}
+        onMeetingUpdated={vi.fn()}
+        projectChip={{ name: "Launch plan", color: "purple" }}
+      />,
+    );
+
+    expect(screen.getByText("Launch plan")).toBeVisible();
+  });
+
+  it("accepts the suggested project", async () => {
+    mockIPC((command) => {
+      if (command === "list_templates") return [];
+      if (command === "get_action_items") return [];
+      if (command === "get_config") return appConfig();
+      return null;
+    });
+    const onAcceptSuggestion = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <NoteViewer
+        meeting={meeting}
+        onMeetingUpdated={vi.fn()}
+        suggestion={suggestion}
+        onAcceptSuggestion={onAcceptSuggestion}
+      />,
+    );
+
+    expect(screen.getByText(/Looks like Launch plan:/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Add to Launch plan" }));
+    expect(onAcceptSuggestion).toHaveBeenCalledWith(9);
+  });
+
+  it("hides the suggestion banner when a project chip is set", () => {
+    mockIPC((command) => {
+      if (command === "list_templates") return [];
+      if (command === "get_action_items") return [];
+      if (command === "get_config") return appConfig();
+      return null;
+    });
+
+    render(
+      <NoteViewer
+        meeting={meeting}
+        onMeetingUpdated={vi.fn()}
+        projectChip={{ name: "Launch plan", color: "purple" }}
+        suggestion={suggestion}
+      />,
+    );
+
+    expect(screen.queryByText(/Looks like Launch plan:/)).not.toBeInTheDocument();
+  });
+});

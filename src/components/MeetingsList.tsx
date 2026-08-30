@@ -1,18 +1,29 @@
 import { useState, useEffect, useRef } from "react";
 import {
   Archive,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Folder,
   Lock,
   LockOpen,
   MoreHorizontal,
   Pin,
+  Plus,
   Search,
   Trash2,
 } from "lucide-react";
 import { formatDateTime, formatDate, dateLocale } from "../lib/dateFormat";
-import type { Meeting, Tag } from "../types";
+import type {
+  Meeting,
+  MeetingWorkspaceBinding,
+  Tag,
+  WorkspaceSuggestion,
+  WorkspaceSummary,
+} from "../types";
 import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { TAG_COLORS } from "../lib/tags";
-import { updateMeetingTags } from "../lib/tauri";
+import { suggestWorkspaceForMeeting, updateMeetingTags } from "../lib/tauri";
 import { cleanMeetingTitle } from "../lib/summary";
 import { DateHeatmap } from "./DateHeatmap";
 
@@ -25,6 +36,13 @@ function isGenericParticipant(name: string): boolean {
 
 interface MeetingsListProps {
   meetings: Meeting[];
+  projects?: WorkspaceSummary[];
+  bindings?: MeetingWorkspaceBinding[];
+  selectedProjectId?: number | null;
+  onSelectProject?: (workspaceId: number) => void;
+  onAssignToProject?: (meeting: Meeting, workspaceId: number | null) => void;
+  onCreateProject?: (name: string, color: string) => Promise<number | null>;
+  onDeleteProject?: (workspaceId: number) => void;
   onSelect: (meeting: Meeting) => void;
   onTagsUpdated?: () => void;
   onDelete?: (meeting: Meeting) => void;
@@ -47,6 +65,16 @@ interface MeetingsListProps {
   transcriptionSetup?: TranscriptionSetup;
 }
 
+const PROJECT_COLORS: Record<string, string> = {
+  blue: "#8ec5ff",
+  purple: "#e1b3ff",
+  orange: "#ffd19a",
+  green: "#b7ffc6",
+  red: "#ffbcba",
+};
+
+const PROJECT_COLOR_NAMES = ["blue", "purple", "orange", "green", "red"];
+
 function formatDuration(seconds: number): string {
   const mins = Math.round(seconds / 60);
   if (mins < 60) return `${mins} min`;
@@ -64,6 +92,13 @@ function snippetFor(summary: string): string {
 
 export function MeetingsList({
   meetings,
+  projects,
+  bindings,
+  selectedProjectId,
+  onSelectProject,
+  onAssignToProject,
+  onCreateProject,
+  onDeleteProject,
   onSelect,
   onTagsUpdated,
   onDelete,
@@ -117,6 +152,103 @@ export function MeetingsList({
   const [mentionDismissed, setMentionDismissed] = useState("");
   const [tagMentionHighlight, setTagMentionHighlight] = useState(0);
   const [tagMentionDismissed, setTagMentionDismissed] = useState("");
+  const [expandedProjects, setExpandedProjects] = useState<Set<number>>(new Set());
+  const [projectMenuOpenId, setProjectMenuOpenId] = useState<number | null>(null);
+  const [dragOverProjectId, setDragOverProjectId] = useState<number | null>(null);
+  const [projectPopupOpen, setProjectPopupOpen] = useState(false);
+  const [projectName, setProjectName] = useState("");
+  const [projectColor, setProjectColor] = useState("blue");
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [assignAfterCreateMeetingId, setAssignAfterCreateMeetingId] = useState<
+    number | null
+  >(null);
+  const [projectSuggestions, setProjectSuggestions] = useState<
+    Map<number, WorkspaceSuggestion | null>
+  >(new Map());
+
+  const bindingByMeeting = new Map<number, number>();
+  for (const binding of bindings ?? []) {
+    if (binding.workspace_id !== null) {
+      bindingByMeeting.set(binding.meeting_id, binding.workspace_id);
+    }
+  }
+  const sortedProjects = [...(projects ?? [])].sort((a, b) =>
+    a.workspace.name.localeCompare(b.workspace.name),
+  );
+  const projectActionsAvailable =
+    projects !== undefined &&
+    onAssignToProject !== undefined &&
+    onCreateProject !== undefined;
+
+  useEffect(() => {
+    if (
+      !projectActionsAvailable ||
+      menuOpenId === null ||
+      bindingByMeeting.has(menuOpenId) ||
+      projectSuggestions.has(menuOpenId)
+    ) {
+      return;
+    }
+    const meetingId = menuOpenId;
+    setProjectSuggestions((current) => {
+      const next = new Map(current);
+      next.set(meetingId, null);
+      return next;
+    });
+    void suggestWorkspaceForMeeting(meetingId)
+      .then((suggestion) => {
+        setProjectSuggestions((current) => {
+          const next = new Map(current);
+          next.set(meetingId, suggestion);
+          return next;
+        });
+      })
+      .catch((error) => {
+        console.warn("Failed to suggest project:", error);
+      });
+  }, [bindings, menuOpenId, projectActionsAvailable, projectSuggestions]);
+
+  const closeProjectPopup = () => {
+    if (creatingProject) return;
+    setProjectPopupOpen(false);
+    setAssignAfterCreateMeetingId(null);
+  };
+
+  const openProjectPopup = (meetingId: number | null) => {
+    if (!onCreateProject) return;
+    setProjectName("");
+    setProjectColor("blue");
+    setAssignAfterCreateMeetingId(meetingId);
+    setProjectPopupOpen(true);
+  };
+
+  const submitProject = async () => {
+    const name = projectName.trim();
+    if (!name || !onCreateProject) return;
+    setCreatingProject(true);
+    try {
+      const workspaceId = await onCreateProject(name, projectColor);
+      if (workspaceId !== null) {
+        setExpandedProjects((current) => {
+          const next = new Set(current);
+          next.add(workspaceId);
+          return next;
+        });
+        if (assignAfterCreateMeetingId !== null && onAssignToProject) {
+          const meeting = meetings.find(
+            (item) => item.id === assignAfterCreateMeetingId,
+          );
+          if (meeting) onAssignToProject(meeting, workspaceId);
+        }
+      }
+    } catch (error) {
+      console.warn("Failed to create project:", error);
+    } finally {
+      setCreatingProject(false);
+      setProjectPopupOpen(false);
+      setAssignAfterCreateMeetingId(null);
+    }
+  };
   const saveTag = async (meeting: Meeting, index: number) => {
     const label = draftLabel.trim();
     if (!label) { setEditing(null); return; }
@@ -328,6 +460,87 @@ export function MeetingsList({
     return "var(--text-muted)";
   }
 
+  const renderProjectMenuItems = (meeting: Meeting) => {
+    if (!projectActionsAvailable || !onAssignToProject) return null;
+    const currentProjectId = bindingByMeeting.get(meeting.id);
+    const suggestion = projectSuggestions.get(meeting.id);
+    return (
+      <>
+        <div
+          aria-hidden="true"
+          style={{ height: 1, background: "var(--overlay-8)", margin: "2px 0" }}
+        />
+        <div
+          style={{
+            color: "var(--text-muted)",
+            fontSize: 10,
+            letterSpacing: "0.08em",
+            padding: "2px var(--btn-padding-x) 0",
+            textTransform: "uppercase",
+          }}
+        >
+          Move to project
+        </div>
+        {sortedProjects.map((project) => {
+          const workspace = project.workspace;
+          const isCurrent = currentProjectId === workspace.id;
+          const isSuggested = suggestion?.workspace_id === workspace.id;
+          return (
+            <button
+              key={workspace.id}
+              onClick={() => {
+                setMenuOpenId(null);
+                if (!isCurrent) onAssignToProject(meeting, workspace.id);
+              }}
+              className="settings-menu-item"
+            >
+              <Folder
+                size={13}
+                aria-hidden="true"
+                style={{ color: PROJECT_COLORS[workspace.color] ?? PROJECT_COLORS.blue }}
+              />
+              <span
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {workspace.name}
+              </span>
+              {isSuggested && (
+                <span style={{ color: "#8ec5ff", fontSize: 10 }}>suggested</span>
+              )}
+              {isCurrent && <Check size={12} aria-hidden="true" />}
+            </button>
+          );
+        })}
+        {currentProjectId !== undefined && (
+          <button
+            onClick={() => {
+              setMenuOpenId(null);
+              onAssignToProject(meeting, null);
+            }}
+            className="settings-menu-item"
+          >
+            Remove from project
+          </button>
+        )}
+        <button
+          onClick={() => {
+            setMenuOpenId(null);
+            openProjectPopup(meeting.id);
+          }}
+          className="settings-menu-item"
+        >
+          + New project…
+        </button>
+      </>
+    );
+  };
+
   function rowWhenLabel(
     meeting: Meeting,
     bin: string,
@@ -371,6 +584,11 @@ export function MeetingsList({
         <div
           className={rowClass}
           onClick={() => onSelect(meeting)}
+          draggable={onAssignToProject ? true : undefined}
+          onDragStart={onAssignToProject ? (event) => {
+            event.dataTransfer.setData("text/plain", String(meeting.id));
+            event.dataTransfer.effectAllowed = "move";
+          } : undefined}
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
@@ -490,6 +708,7 @@ export function MeetingsList({
                     <Trash2 size={15} aria-hidden="true" />
                     Delete
                   </button>
+                  {renderProjectMenuItems(meeting)}
                 </div>
               </>
             )}
@@ -677,6 +896,7 @@ export function MeetingsList({
                   <Trash2 size={15} aria-hidden="true" />
                   Delete
                 </button>
+                {renderProjectMenuItems(meeting)}
               </div>
             </>
           )}
@@ -849,6 +1069,267 @@ export function MeetingsList({
   }
 
   const [archiveOpen, setArchiveOpen] = useState(false);
+
+  const renderProjectPopup = () => (
+    <>
+      <div
+        style={{ position: "fixed", inset: 0, zIndex: 20 }}
+        onClick={(event) => {
+          event.stopPropagation();
+          closeProjectPopup();
+        }}
+      />
+      <div
+        className="tag-add-popup"
+        onClick={(event) => event.stopPropagation()}
+        style={{ left: 0, right: "auto", width: 200, zIndex: 30 }}
+      >
+        <input
+          autoFocus
+          value={projectName}
+          onChange={(event) => setProjectName(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void submitProject();
+            if (event.key === "Escape") closeProjectPopup();
+          }}
+          placeholder="Project name"
+          className="tag-popup-input"
+          disabled={creatingProject}
+        />
+        <div className="tag-color-dots">
+          {PROJECT_COLOR_NAMES.map((color) => (
+            <button
+              key={color}
+              type="button"
+              onClick={() => setProjectColor(color)}
+              aria-label={`Project color ${color}`}
+              className={`color-dot ${color} ${projectColor === color ? "selected" : ""}`}
+              disabled={creatingProject}
+            />
+          ))}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
+          <button
+            type="button"
+            onClick={closeProjectPopup}
+            className="btn-popup-action cancel"
+            disabled={creatingProject}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => void submitProject()}
+            className="btn-popup-action confirm"
+            disabled={creatingProject || projectName.trim() === ""}
+          >
+            Create
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  const renderProjectsSection = () => {
+    if (projects === undefined) return null;
+    return (
+      <div>
+        <div
+          style={{
+            alignItems: "center",
+            display: "flex",
+            justifyContent: "space-between",
+            position: "relative",
+          }}
+        >
+          <div className="list-section-cap">Projects</div>
+          <button
+            type="button"
+            onClick={() => openProjectPopup(null)}
+            aria-label="New project"
+            disabled={!onCreateProject}
+            style={{
+              alignItems: "center",
+              background: "transparent",
+              border: 0,
+              color: "var(--text-muted)",
+              cursor: onCreateProject ? "pointer" : "default",
+              display: "flex",
+              height: 20,
+              justifyContent: "center",
+              padding: 0,
+              width: 20,
+            }}
+          >
+            <Plus size={13} aria-hidden="true" />
+          </button>
+          {projectPopupOpen && !filtersActive && renderProjectPopup()}
+        </div>
+        {sortedProjects.map((project) => {
+          const workspace = project.workspace;
+          const expanded = expandedProjects.has(workspace.id);
+          const projectMenuOpen = projectMenuOpenId === workspace.id;
+          const projectMeetings = sorted.filter(
+            (meeting) => bindingByMeeting.get(meeting.id) === workspace.id,
+          );
+          const dragOver = dragOverProjectId === workspace.id;
+          const toggleProjectMeetings = () => {
+            setExpandedProjects((current) => {
+              const next = new Set(current);
+              if (next.has(workspace.id)) next.delete(workspace.id);
+              else next.add(workspace.id);
+              return next;
+            });
+          };
+          const selectOrToggleProject = () => {
+            if (!onSelectProject) {
+              toggleProjectMeetings();
+              return;
+            }
+            onSelectProject(workspace.id);
+            setExpandedProjects((current) => {
+              const next = new Set(current);
+              next.add(workspace.id);
+              return next;
+            });
+          };
+          return (
+            <div key={workspace.id} className="mrow-wrap project-row-wrap">
+              <div
+                className={`mrow${
+                  selectedProjectId === workspace.id ? " mrow--selected" : ""
+                }${projectMenuOpen ? " mrow--peek-open" : ""}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={expanded}
+                onClick={selectOrToggleProject}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    selectOrToggleProject();
+                  }
+                }}
+                onDragOver={onAssignToProject ? (event) => {
+                  event.preventDefault();
+                  setDragOverProjectId(workspace.id);
+                } : undefined}
+                onDragLeave={onAssignToProject ? () => {
+                  setDragOverProjectId((current) =>
+                    current === workspace.id ? null : current,
+                  );
+                } : undefined}
+                onDrop={onAssignToProject ? (event) => {
+                  event.preventDefault();
+                  const meetingId = Number(event.dataTransfer.getData("text/plain"));
+                  const meeting = meetings.find((item) => item.id === meetingId);
+                  if (meeting) onAssignToProject(meeting, workspace.id);
+                  setDragOverProjectId(null);
+                } : undefined}
+                style={dragOver ? {
+                  background: "rgba(0,122,255,0.10)",
+                  boxShadow: "0 0 0 1px rgba(0,122,255,0.55)",
+                } : undefined}
+              >
+                <button
+                  type="button"
+                  aria-label="Toggle project meetings"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toggleProjectMeetings();
+                  }}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  style={{
+                    alignItems: "center",
+                    background: "transparent",
+                    border: 0,
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    display: "inline-flex",
+                    flexShrink: 0,
+                    height: 20,
+                    justifyContent: "center",
+                    padding: 0,
+                    width: 20,
+                  }}
+                >
+                  {expanded ? (
+                    <ChevronDown size={12} aria-hidden="true" />
+                  ) : (
+                    <ChevronRight size={12} aria-hidden="true" />
+                  )}
+                </button>
+                <Folder
+                  size={13}
+                  aria-hidden="true"
+                  style={{ color: PROJECT_COLORS[workspace.color] ?? PROJECT_COLORS.blue }}
+                />
+                <span className="mrow-title" style={{ fontWeight: 500 }}>
+                  {workspace.name}
+                </span>
+                <span className="project-meeting-count">
+                  {projectMeetings.length}
+                </span>
+                {onDeleteProject && (
+                  <button
+                    className="mrow-menu-btn"
+                    type="button"
+                    aria-label={`Actions for project ${workspace.name}`}
+                    aria-haspopup="menu"
+                    aria-expanded={projectMenuOpen}
+                    title="Project actions"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setProjectMenuOpenId(projectMenuOpen ? null : workspace.id);
+                    }}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  >
+                    <MoreHorizontal size={16} aria-hidden="true" />
+                  </button>
+                )}
+              </div>
+              {projectMenuOpen && onDeleteProject && (
+                <>
+                  <div
+                    className="project-menu-overlay"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setProjectMenuOpenId(null);
+                    }}
+                  />
+                  <div
+                    className="tag-add-popup project-row-menu"
+                    role="menu"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      className="settings-menu-item"
+                      role="menuitem"
+                      style={{ color: "var(--accent-red)" }}
+                      onClick={() => {
+                        setProjectMenuOpenId(null);
+                        onDeleteProject(workspace.id);
+                      }}
+                    >
+                      <Trash2 size={15} aria-hidden="true" />
+                      Delete project
+                    </button>
+                  </div>
+                </>
+              )}
+              {expanded && (
+                <div style={{ paddingLeft: 18 }}>
+                  {projectMeetings.map((meeting) =>
+                    renderMeeting(meeting, { bin: `project-${workspace.id}` }),
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   return (
     <div
@@ -1049,19 +1530,10 @@ export function MeetingsList({
 
       {/* Meetings list */}
       <div className="meetings-list-wrapper">
-        {sorted.length === 0 ? (
-          <div
-            style={{
-              textAlign: "center",
-              color: "var(--text-muted)",
-              fontSize: "12px",
-              marginTop: "30px",
-            }}
-          >
-            <p style={{ fontWeight: 500, marginBottom: "4px" }}>No meetings yet</p>
-            <p>Press Record or use {navigator.userAgent.includes("Mac") ? "⌘⇧M" : "Ctrl+Shift+M"} to start</p>
-          </div>
-        ) : filtersActive ? (
+        {filtersActive && projectPopupOpen && (
+          <div style={{ position: "relative" }}>{renderProjectPopup()}</div>
+        )}
+        {filtersActive ? (
           /* ---- Filtered view: flat compact rows ---- */
           visible.length === 0 ? (
             <div
@@ -1082,13 +1554,17 @@ export function MeetingsList({
             )
           )
         ) : (
-          /* ---- Resting view: date bins ---- */
+          /* ---- Resting view: projects + date bins ---- */
           <>
+            {renderProjectsSection()}
             {(() => {
-              const bins = buildBins(sorted);
+              const bins = buildBins(
+                sorted.filter((meeting) => !bindingByMeeting.has(meeting.id)),
+              );
               if (bins.length === 0) {
+                if (sorted.length > 0) return null;
                 return (
-                  <p
+                  <div
                     style={{
                       textAlign: "center",
                       color: "var(--text-muted)",
@@ -1096,8 +1572,11 @@ export function MeetingsList({
                       marginTop: "30px",
                     }}
                   >
-                    No meetings yet
-                  </p>
+                    <p style={{ fontWeight: 500, marginBottom: 4 }}>No meetings yet</p>
+                    <p>
+                      Press Record or use {navigator.userAgent.includes("Mac") ? "⌘⇧M" : "Ctrl+Shift+M"} to start
+                    </p>
+                  </div>
                 );
               }
               return bins.map((bin) => {

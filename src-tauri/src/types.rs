@@ -169,6 +169,23 @@ pub struct Meeting {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingAttachment {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub kind: String,
+    pub value: String,
+    pub label: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentDraft {
+    pub kind: String,
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
     pub meeting_id: i64,
@@ -800,7 +817,10 @@ pub struct Workspace {
     pub id: i64,
     pub name: String,
     pub engine: String,
+    pub model: String,
     pub network_allowed: bool,
+    pub instructions: String,
+    pub color: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -886,6 +906,19 @@ pub struct WorkspaceTask {
     pub updated_at: String,
 }
 
+/// Which agent and skills a queued task will run with, and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskStaffing {
+    /// "automatic" | "manual"
+    pub mode: String,
+    pub agent_id: Option<i64>,
+    pub skill_ids: Vec<i64>,
+    /// Human-readable explanation, empty for manual.
+    pub reason: String,
+    pub resolved_at: String,
+}
+
 /// One execution attempt for a workspace task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -932,4 +965,14 @@ pub struct WorkspaceDetail {
     pub addons: Vec<WorkspaceAddon>,
     pub tasks: Vec<WorkspaceTask>,
     pub artifacts: Vec<WorkspaceArtifact>,
+}
+
+/// Cached, AI-generated understanding of a project built from its filed meetings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectOverview {
+    pub workspace_id: i64,
+    pub summary: String,
+    pub generated_at: String,
+    pub source_meeting_count: i64,
+    pub stale: bool,
 }

@@ -1,11 +1,14 @@
 //! Workspace execution helpers shared by the Tauri command layer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 
 use crate::context_index::ContextHit;
 use crate::types::{Meeting, WorkspaceAddon, WorkspaceEngine, WorkspaceTask};
@@ -37,6 +40,7 @@ pub fn compose_task_brief(
     skills: &[WorkspaceAddon],
     vault_hits: &[ContextHit],
     project_hits: &[ContextHit],
+    workspace_instructions: &str,
 ) -> String {
     let mut brief = format!("# Task\n\n{}", task.title);
     if !task.details.trim().is_empty() {
@@ -52,6 +56,11 @@ pub fn compose_task_brief(
             brief.push('\n');
         }
         brief.pop();
+    }
+
+    if !workspace_instructions.trim().is_empty() {
+        brief.push_str("\n\n# Project instructions\n\n");
+        brief.push_str(workspace_instructions.trim());
     }
 
     if let Some(agent) = agent {
@@ -203,6 +212,209 @@ pub fn write_native_addon_files(
         _ => {}
     }
     Ok(())
+}
+
+/// The agent and skills chosen for one run, with a human-readable reason per pick.
+pub struct Staffing {
+    pub agent: Option<WorkspaceAddon>,
+    pub skills: Vec<WorkspaceAddon>,
+    pub reasons: Vec<String>,
+}
+
+const STAFFING_STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "into", "your", "what", "when", "each",
+    "every", "only", "them", "they", "have", "been", "than", "then", "onto", "over", "under",
+];
+
+const DIAGRAM_DOMAIN_WORDS: &[&str] = &[
+    "diagram",
+    "chart",
+    "drawio",
+    "draw.io",
+    "architecture diagram",
+    "flowchart",
+    "hld",
+    "high level diagram",
+];
+const SLIDES_DOMAIN_WORDS: &[&str] = &["slide", "slides", "deck", "presentation"];
+const RESEARCH_DOMAIN_WORDS: &[&str] = &["research", "investigate", "compare", "landscape"];
+const ARCHITECTURE_DOMAIN_WORDS: &[&str] = &["architecture", "design doc", "technical doc"];
+const MARKETING_DOMAIN_WORDS: &[&str] = &["copy", "marketing", "launch", "announcement", "landing"];
+const REVIEW_DOMAIN_WORDS: &[&str] = &["review", "critique", "feedback"];
+
+fn staffing_keywords(addon: &WorkspaceAddon) -> BTreeSet<String> {
+    fn add_keyword(keywords: &mut BTreeSet<String>, word: &str) {
+        let word = word.to_lowercase();
+        if word.chars().count() >= 4 && !STAFFING_STOP_WORDS.contains(&word.as_str()) {
+            keywords.insert(word);
+        }
+    }
+
+    let mut keywords = BTreeSet::new();
+    for word in addon.slug.split('-') {
+        add_keyword(&mut keywords, word);
+    }
+    for word in addon
+        .name
+        .split(|character: char| !character.is_alphanumeric())
+    {
+        add_keyword(&mut keywords, word);
+    }
+    for word in addon
+        .description
+        .split(|character: char| !character.is_alphanumeric())
+    {
+        add_keyword(&mut keywords, word);
+    }
+    keywords
+}
+
+fn normalized_staffing_words(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn staffing_domain_words(addon: &WorkspaceAddon) -> &'static [&'static str] {
+    match (addon.kind.as_str(), addon.slug.as_str()) {
+        ("skill", "drawio-diagram") | ("agent", "diagrammer") => DIAGRAM_DOMAIN_WORDS,
+        ("skill", "slides-deck") => SLIDES_DOMAIN_WORDS,
+        ("skill", "deep-research") | ("agent", "researcher") => RESEARCH_DOMAIN_WORDS,
+        ("skill", "architecture-doc") | ("agent", "tech-writer") => ARCHITECTURE_DOMAIN_WORDS,
+        ("skill", "marketing-copy") => MARKETING_DOMAIN_WORDS,
+        ("agent", "reviewer") => REVIEW_DOMAIN_WORDS,
+        _ => &[],
+    }
+}
+
+fn staffing_domain_match(
+    lower_title: &str,
+    bounded_title_words: &str,
+    addon: &WorkspaceAddon,
+) -> Option<&'static str> {
+    staffing_domain_words(addon).iter().copied().find(|word| {
+        if word.contains(' ') {
+            lower_title.contains(word)
+        } else {
+            let word = normalized_staffing_words(word);
+            bounded_title_words.contains(&format!(" {word} "))
+        }
+    })
+}
+
+fn staffing_score(
+    lower_title: &str,
+    lower_details: &str,
+    bounded_title_words: &str,
+    addon: &WorkspaceAddon,
+) -> (u32, Option<String>) {
+    let mut score = 0;
+    let mut reason = None;
+    let mut reason_weight = 0;
+    for keyword in staffing_keywords(addon) {
+        let weight = if lower_title.contains(&keyword) {
+            3
+        } else if lower_details.contains(&keyword) {
+            1
+        } else {
+            0
+        };
+        score += weight;
+        if weight > reason_weight {
+            reason = Some(keyword);
+            reason_weight = weight;
+        }
+    }
+    if let Some(domain_word) = staffing_domain_match(lower_title, bounded_title_words, addon) {
+        score += 6;
+        reason = Some(domain_word.to_string());
+    }
+    (score, reason)
+}
+
+/// Choose an agent and up to `max_skills` skills from `catalog` for one task.
+/// Scores each addon by how well its slug/name/description matches the task's
+/// title and details. Returns empty staffing when nothing scores above zero.
+pub fn suggest_staffing(
+    title: &str,
+    details: &str,
+    catalog: &[WorkspaceAddon],
+    max_skills: usize,
+) -> Staffing {
+    struct ScoredAddon {
+        addon: WorkspaceAddon,
+        score: u32,
+        reason: String,
+    }
+
+    let lower_title = title.to_lowercase();
+    let lower_details = details.to_lowercase();
+    let title_words = normalized_staffing_words(&lower_title);
+    let bounded_title_words = format!(" {title_words} ");
+    let mut agents = Vec::new();
+    let mut skills = Vec::new();
+
+    for addon in catalog {
+        let (score, reason) =
+            staffing_score(&lower_title, &lower_details, &bounded_title_words, addon);
+        if score == 0 {
+            continue;
+        }
+        let Some(reason) = reason else {
+            continue;
+        };
+        let scored = ScoredAddon {
+            addon: addon.clone(),
+            score,
+            reason,
+        };
+        match addon.kind.as_str() {
+            "agent" => agents.push(scored),
+            "skill" => skills.push(scored),
+            _ => {}
+        }
+    }
+
+    let by_score_then_id = |left: &ScoredAddon, right: &ScoredAddon| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.addon.id.cmp(&right.addon.id))
+    };
+    agents.sort_by(by_score_then_id);
+    skills.sort_by(by_score_then_id);
+
+    let agent = agents.into_iter().next();
+    let skills = skills.into_iter().take(max_skills).collect::<Vec<_>>();
+    let mut reasons = Vec::new();
+    if let Some(agent) = &agent {
+        reasons.push(format!(
+            "Chose the {} agent automatically — the task mentions \"{}\".",
+            agent.addon.name, agent.reason
+        ));
+    }
+    for skill in &skills {
+        reasons.push(format!(
+            "Attached the {} skill automatically — the task mentions \"{}\".",
+            skill.addon.name, skill.reason
+        ));
+    }
+
+    Staffing {
+        agent: agent.map(|scored| scored.addon),
+        skills: skills.into_iter().map(|scored| scored.addon).collect(),
+        reasons,
+    }
 }
 
 /// Summarize exactly which context sources were made available to a run.
@@ -506,6 +718,173 @@ pub fn scan_output_files(output_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn drawio_element_has_vertex(element: &BytesStart<'_>, position: u64) -> Result<bool, String> {
+    let mut has_vertex = false;
+    for attribute in element.attributes() {
+        let attribute = attribute
+            .map_err(|error| format!("not well-formed XML at position {position}: {error}"))?;
+        let value = attribute
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, element.decoder())
+            .map_err(|error| format!("not well-formed XML at position {position}: {error}"))?;
+        if attribute.key.as_ref() == b"vertex" && value == "1" {
+            has_vertex = true;
+        }
+    }
+    Ok(has_vertex)
+}
+
+fn drawio_path_is(stack: &[Vec<u8>], expected: &[&[u8]]) -> bool {
+    stack.len() == expected.len()
+        && stack
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.as_slice() == *expected)
+}
+
+/// Validate that a produced .drawio artifact is uncompressed, well-formed XML
+/// with the mxfile/diagram/mxGraphModel/root nesting and at least one vertex.
+pub fn validate_drawio(content: &str) -> Result<(), String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+
+    let mut stack = Vec::<Vec<u8>>::new();
+    let mut saw_mxfile = false;
+    let mut saw_diagram = false;
+    let mut saw_graph_model = false;
+    let mut saw_root = false;
+    let mut vertex_count = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = element.name().as_ref().to_vec();
+                if name == b"mxfile" && stack.is_empty() {
+                    saw_mxfile = true;
+                } else if name == b"diagram" && drawio_path_is(&stack, &[b"mxfile"]) {
+                    saw_diagram = true;
+                } else if name == b"mxGraphModel"
+                    && drawio_path_is(&stack, &[b"mxfile", b"diagram"])
+                {
+                    saw_graph_model = true;
+                } else if name == b"root"
+                    && drawio_path_is(&stack, &[b"mxfile", b"diagram", b"mxGraphModel"])
+                {
+                    saw_root = true;
+                }
+                let has_vertex = drawio_element_has_vertex(&element, reader.buffer_position())?;
+                if name == b"mxCell" && has_vertex {
+                    vertex_count += 1;
+                }
+                stack.push(name);
+            }
+            Ok(Event::Empty(element)) => {
+                let name = element.name().as_ref().to_vec();
+                if name == b"mxfile" && stack.is_empty() {
+                    saw_mxfile = true;
+                } else if name == b"diagram" && drawio_path_is(&stack, &[b"mxfile"]) {
+                    saw_diagram = true;
+                } else if name == b"mxGraphModel"
+                    && drawio_path_is(&stack, &[b"mxfile", b"diagram"])
+                {
+                    saw_graph_model = true;
+                } else if name == b"root"
+                    && drawio_path_is(&stack, &[b"mxfile", b"diagram", b"mxGraphModel"])
+                {
+                    saw_root = true;
+                }
+                let has_vertex = drawio_element_has_vertex(&element, reader.buffer_position())?;
+                if name == b"mxCell" && has_vertex {
+                    vertex_count += 1;
+                }
+            }
+            Ok(Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(Event::Text(text)) => {
+                if stack.last().is_some_and(|name| name == b"diagram") {
+                    let text = text.decode().map_err(|error| {
+                        format!(
+                            "not well-formed XML at position {}: {error}",
+                            reader.buffer_position()
+                        )
+                    })?;
+                    if text
+                        .split_whitespace()
+                        .any(|run| run.chars().count() > 40 && !run.contains('<'))
+                    {
+                        return Err(
+                            "compressed draw.io payload — must be uncompressed XML".to_string()
+                        );
+                    }
+                }
+            }
+            Ok(Event::Eof) => {
+                if let Some(name) = stack.last() {
+                    return Err(format!(
+                        "not well-formed XML at position {}: unexpected EOF with unclosed <{}> element",
+                        reader.buffer_position(),
+                        String::from_utf8_lossy(name)
+                    ));
+                }
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "not well-formed XML at position {}: {error}",
+                    reader.buffer_position()
+                ));
+            }
+        }
+    }
+
+    for (name, saw_element) in [
+        ("mxfile", saw_mxfile),
+        ("diagram", saw_diagram),
+        ("mxGraphModel", saw_graph_model),
+        ("root", saw_root),
+    ] {
+        if !saw_element {
+            return Err(format!(
+                "missing <{name}> element — is the file compressed or truncated?"
+            ));
+        }
+    }
+    if vertex_count == 0 {
+        return Err("no vertex cells — the diagram is empty".to_string());
+    }
+    Ok(())
+}
+
+/// Scan an output dir and return one warning line per invalid .drawio artifact.
+pub fn drawio_artifact_warnings(output_dir: &Path) -> Vec<String> {
+    let Ok(files) = scan_output_files(output_dir) else {
+        return Vec::new();
+    };
+
+    files
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("drawio"))
+        })
+        .filter_map(|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            let error = match std::fs::read_to_string(&path) {
+                Ok(content) => validate_drawio(&content).err(),
+                Err(error) => Some(format!("could not read file: {error}")),
+            }?;
+            Some(format!(
+                "Warning: {name} failed draw.io validation: {error}"
+            ))
+        })
+        .collect()
+}
+
 /// Return the last `limit` Unicode scalar values from a string.
 pub fn tail_chars(value: &str, limit: usize) -> String {
     let chars: Vec<char> = value.chars().collect();
@@ -569,6 +948,84 @@ mod tests {
         }
     }
 
+    fn staffing_catalog() -> Vec<WorkspaceAddon> {
+        [
+            (
+                "skill",
+                "drawio-diagram",
+                "Draw.io diagram",
+                "Produce an editable .drawio file (plus a short legend) that opens in draw.io desktop.",
+            ),
+            (
+                "skill",
+                "slides-deck",
+                "Slides deck",
+                "A presentation as a Marp Markdown deck: one idea per slide, speaker notes, sources.",
+            ),
+            (
+                "skill",
+                "deep-research",
+                "Deep research",
+                "Structured research from the context you have, with confidence and open questions.",
+            ),
+            (
+                "skill",
+                "architecture-doc",
+                "Architecture doc",
+                "Turn a repo and its meetings into a grounded architecture document.",
+            ),
+            (
+                "skill",
+                "marketing-copy",
+                "Marketing copy",
+                "Audience first, one promise per piece, concrete nouns, two variants.",
+            ),
+            (
+                "skill",
+                "meeting-grounded-writing",
+                "Meeting-grounded writing",
+                "Every claim points at the meeting it came from; gaps are named, not filled.",
+            ),
+            (
+                "agent",
+                "diagrammer",
+                "Diagrammer",
+                "Explains systems with diagrams first, prose second.",
+            ),
+            (
+                "agent",
+                "researcher",
+                "Researcher",
+                "Investigates before writing; separates what is known from what is guessed.",
+            ),
+            (
+                "agent",
+                "tech-writer",
+                "Technical writer",
+                "Writes precise, structured documents grounded in code and meetings.",
+            ),
+            (
+                "agent",
+                "reviewer",
+                "Reviewer",
+                "A critical reader: finds problems, ranks them, proposes fixes; never rewrites wholesale.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, slug, name, description))| WorkspaceAddon {
+            id: index as i64 + 1,
+            kind: kind.to_string(),
+            slug: slug.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            instructions: format!("{name} instructions"),
+            builtin: true,
+            created_at: String::new(),
+        })
+        .collect()
+    }
+
     fn addon_temp_dir(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -578,6 +1035,170 @@ mod tests {
             "adversaria-addon-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    fn valid_drawio() -> &'static str {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio"><diagram name="Page-1"><mxGraphModel><root>
+<mxCell id="0"/><mxCell id="1" parent="0"/>
+<mxCell id="2" value="A" style="rounded=1" vertex="1" parent="1"><mxGeometry x="0" y="0" width="160" height="60" as="geometry"/></mxCell>
+<mxCell id="3" value="writes" style="edgeStyle=orthogonalEdgeStyle" edge="1" parent="1" source="2" target="2"><mxGeometry relative="1" as="geometry"/></mxCell>
+</root></mxGraphModel></diagram></mxfile>"#
+    }
+
+    #[test]
+    fn suggest_staffing_picks_diagrammer_and_drawio_for_high_level_diagram() {
+        let staffing = suggest_staffing(
+            "high level diagram for Adversaria",
+            "",
+            &staffing_catalog(),
+            2,
+        );
+
+        assert_eq!(staffing.agent.as_ref().unwrap().slug, "diagrammer");
+        assert!(staffing
+            .skills
+            .iter()
+            .any(|skill| skill.slug == "drawio-diagram"));
+        assert!(!staffing.reasons.is_empty());
+        assert_eq!(
+            staffing.reasons[0],
+            "Chose the Diagrammer agent automatically — the task mentions \"diagram\"."
+        );
+        assert!(staffing.reasons.iter().any(|reason| {
+            reason
+            == "Attached the Draw.io diagram skill automatically — the task mentions \"diagram\"."
+        }));
+    }
+
+    #[test]
+    fn suggest_staffing_picks_slides_without_diagrammer_for_slide_deck() {
+        let staffing = suggest_staffing(
+            "Build a slide deck for the beta launch",
+            "",
+            &staffing_catalog(),
+            2,
+        );
+
+        assert!(staffing
+            .skills
+            .iter()
+            .any(|skill| skill.slug == "slides-deck"));
+        assert_ne!(
+            staffing.agent.as_ref().map(|agent| agent.slug.as_str()),
+            Some("diagrammer")
+        );
+    }
+
+    #[test]
+    fn suggest_staffing_picks_research_for_comparison() {
+        let staffing = suggest_staffing(
+            "Compare the top three notetakers",
+            "",
+            &staffing_catalog(),
+            2,
+        );
+
+        assert!(
+            staffing
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.slug == "researcher")
+                || staffing
+                    .skills
+                    .iter()
+                    .any(|skill| skill.slug == "deep-research")
+        );
+    }
+
+    #[test]
+    fn suggest_staffing_returns_empty_for_unmatched_task() {
+        let staffing = suggest_staffing("asdfgh qwerty", "", &staffing_catalog(), 2);
+
+        assert!(staffing.agent.is_none());
+        assert!(staffing.skills.is_empty());
+        assert!(staffing.reasons.is_empty());
+    }
+
+    #[test]
+    fn suggest_staffing_respects_max_skills() {
+        let staffing = suggest_staffing(
+            "Create a diagram, slides, and research summary",
+            "",
+            &staffing_catalog(),
+            2,
+        );
+
+        assert!(staffing.skills.len() <= 2);
+    }
+
+    #[test]
+    fn suggest_staffing_is_deterministic() {
+        let catalog = staffing_catalog();
+        let first = suggest_staffing("Research an architecture diagram", "", &catalog, 2);
+        let second = suggest_staffing("Research an architecture diagram", "", &catalog, 2);
+        let slugs = |staffing: &Staffing| {
+            (
+                staffing.agent.as_ref().map(|agent| agent.slug.clone()),
+                staffing
+                    .skills
+                    .iter()
+                    .map(|skill| skill.slug.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(slugs(&first), slugs(&second));
+    }
+
+    #[test]
+    fn validates_minimal_uncompressed_drawio() {
+        assert_eq!(validate_drawio(valid_drawio()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_truncated_drawio() {
+        let valid = valid_drawio();
+        let truncated = &valid[..valid.len() - 20];
+        let error = validate_drawio(truncated).unwrap_err();
+        assert!(error.contains("well-formed"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unescaped_ampersand_in_drawio_attribute() {
+        let invalid = valid_drawio().replacen("value=\"A\"", "value=\"A & B\"", 1);
+        assert!(validate_drawio(&invalid).is_err());
+    }
+
+    #[test]
+    fn rejects_drawio_without_vertices() {
+        let invalid = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio"><diagram name="Page-1"><mxGraphModel><root>
+<mxCell id="0"/><mxCell id="1" parent="0"/>
+</root></mxGraphModel></diagram></mxfile>"#;
+        let error = validate_drawio(invalid).unwrap_err();
+        assert!(error.contains("no vertex"), "{error}");
+    }
+
+    #[test]
+    fn rejects_compressed_drawio_payload() {
+        let invalid = r#"<mxfile host="app"><diagram id="x">dGhpcyBpcyBkZWZpbml0ZWx5IG5vdCB4bWwgYXQgYWxsIGp1c3QgYmFzZTY0</diagram></mxfile>"#;
+        let error = validate_drawio(invalid).unwrap_err();
+        assert!(error.contains("compressed"), "{error}");
+    }
+
+    #[test]
+    fn drawio_warnings_name_only_the_invalid_artifact() {
+        let dir = addon_temp_dir("drawio-warnings");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("valid.drawio"), valid_drawio()).unwrap();
+        std::fs::write(dir.join("broken.drawio"), "<mxfile>").unwrap();
+
+        let warnings = drawio_artifact_warnings(&dir);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("broken.drawio"), "{}", warnings[0]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -594,6 +1215,7 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
 
         assert!(brief.contains("Write the launch memo"));
@@ -619,6 +1241,7 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
         assert!(brief.contains("### Transcript\n\n1234567890\n[transcript truncated]"));
         assert!(!brief.contains("1234567890e"));
@@ -637,6 +1260,7 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
         assert!(!without_notes.contains("# Previous attempts were rejected because"));
 
@@ -653,6 +1277,7 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
         assert!(with_notes.contains(
             "# Previous attempts were rejected because\n\n- Too long\n- Cite the source"
@@ -677,6 +1302,7 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
         assert!(with_related.contains(
             "# Related meetings (from your meeting graph)\n\n## Pricing follow-up\n\nThe team agreed on the enterprise tier."
@@ -694,6 +1320,7 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
         assert!(without_related.contains("# Related meetings (from your meeting graph)\n\n(none)"));
     }
@@ -726,6 +1353,7 @@ mod tests {
             &[],
             &[vault],
             &[project],
+            "",
         );
 
         assert!(brief.contains(
@@ -761,6 +1389,7 @@ mod tests {
             &skills,
             &[],
             &[],
+            "",
         );
 
         assert!(brief.contains(
@@ -787,6 +1416,7 @@ mod tests {
             &skills,
             &[],
             &[],
+            "",
         );
         assert!(!brief.contains("# Agent"));
         assert!(brief.contains("# Skills\n\n## Deep research\n\nShow confidence."));
@@ -805,9 +1435,93 @@ mod tests {
             &[],
             &[],
             &[],
+            "",
         );
         assert!(!brief.contains("# Agent"));
         assert!(!brief.contains("# Skills"));
+    }
+
+    #[test]
+    fn task_brief_includes_project_instructions_when_present() {
+        let brief = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "Prioritize technical risks.",
+        );
+        assert!(brief.contains("# Project instructions\n\nPrioritize technical risks."));
+        // Must be before Agent/Skills and after rejection notes.
+        let agent = addon("agent", "researcher", "Researcher", "Investigate first.");
+        let with_agent = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            Some(&agent),
+            &[],
+            &[],
+            &[],
+            "Keep decisions concise.",
+        );
+        let instr_pos = with_agent.find("# Project instructions").unwrap();
+        let agent_pos = with_agent.find("# Agent").unwrap();
+        assert!(instr_pos < agent_pos);
+    }
+
+    #[test]
+    fn task_brief_omits_project_instructions_when_blank() {
+        let brief_empty = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "",
+        );
+        assert!(!brief_empty.contains("# Project instructions"));
+        let brief_whitespace = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "   \n\t  ",
+        );
+        assert!(!brief_whitespace.contains("# Project instructions"));
+        // Trimming
+        let brief_trimmed = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "  keep decisions concise  ",
+        );
+        assert!(brief_trimmed.contains("# Project instructions\n\nkeep decisions concise"));
     }
 
     #[test]

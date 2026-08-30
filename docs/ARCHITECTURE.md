@@ -200,10 +200,11 @@ Endpoints:
 - **`prompts/`** — editable templates: `general`, `one-on-one`, `client-meeting`.
   Drop a new `.md` file here and it appears in the API automatically.
 
-## Workspaces (dev-gated) — the autopilot loop
+## Workspaces and Meeting projects — one data model, two surfaces
 
-_Added 2026-08-22 (Phase 3a). Shown only when `import.meta.env.DEV`; the contract
-below is what the code does today, see `docs/TODO.md` (08-22 block) for the why._
+_Added 2026-08-22 (Phase 3a), extended 2026-08-30. The Workspaces tab remains
+development-only; its project-facing Meetings-tab surface is available through
+the regular Meetings UI. Both operate on the same workspace rows and bindings._
 
 ```
 meeting summarized ──sync_action_items──▶ action_items
@@ -219,12 +220,18 @@ meeting_workspace_bindings ──push──▶ workspace_tasks (queued)
                                            └──Reject(note)──▶ queued (attempt+1, note in brief)
 ```
 
-- **Tables** (`storage.rs`): `workspaces`, `workspace_context_items`,
+- **Tables** (`storage.rs`): `workspaces` (including `instructions`, `color`,
+  `network_allowed`, and cached-overview fields), `workspace_context_items`,
   `workspace_tasks` (status `queued|running|awaiting_review|done|failed`,
   `action_item_id`, `attempt`, `rejection_notes` JSON), `workspace_runs`,
   `workspace_artifacts`, `meeting_workspace_bindings` (no row = undecided,
   `workspace_id NULL` = "not a project"). `migrate_workspace_tasks_v2` rebuilds
   the task table on databases created before 08-22.
+- **Project lifecycle**: `create_workspace` creates the same row used by both
+  surfaces. Each meeting has at most one `meeting_workspace_bindings` row.
+  `delete_workspace_on` removes bindings for that workspace before deleting the
+  container; meeting and action-item rows are deliberately preserved and become
+  unfiled. Other projects and their bindings are untouched.
 - **Routing**: `suggest_workspace_for_meeting` scores every workspace
   `2·|related meetings via embeddings::hybrid_rank| + |shared attendees|`
   (≥ 2 to suggest). `set_meeting_workspace_binding` stores the decision and
@@ -244,10 +251,11 @@ meeting_workspace_bindings ──push──▶ workspace_tasks (queued)
   after a run existed), summary sync, and 15 s after launch. Startup re-queues
   tasks orphaned in `running`; a task that cannot start is moved to `failed`
   with a failed run carrying the error so the queue keeps moving.
-- **Brief**: task + rejection notes + bound meetings (summary + transcript,
+- **Brief**: standing instructions + task + rejection notes + bound meetings (summary + transcript,
   20k chars) + top-3 related meetings from `embeddings::hybrid_rank`
-  (summaries only) + read-only folders; the run log's first line is the
-  context receipt. Artifacts are previewed in-app (`read_workspace_artifact`,
+  (summaries only) + read-only folders. The brief explicitly states whether the
+  per-project web-research gate allows network access; the run log's first line
+  is the context receipt. Artifacts are previewed in-app (`read_workspace_artifact`,
   sandboxed to the workspaces root; `src/lib/markdown.ts`).
 - **Context engine** (`context_index.rs`): the Obsidian vault and the projects
   root are indexed (FTS5 + chunk embeddings) like meetings; every run
@@ -259,6 +267,20 @@ meeting_workspace_bindings ──push──▶ workspace_tasks (queued)
   task_id}` after every state change; the detail view polls
   `get_latest_workspace_run` every 2 s for runs it did not start (the run log
   is persisted every ~0.5 s by the supervisor, every 40 tokens for `local`).
+- **Meetings-tab project surface**: `MeetingsList.tsx` owns create, select,
+  move/drag, and confirmed-delete interactions. `App.tsx` resolves project and
+  binding state, prioritizes `ProjectView.tsx` over the note/empty pane, and
+  clears project selection when a note opens. `ProjectView.tsx` renders a wide
+  responsive two-column canvas: overview/meetings/instructions/web controls on
+  the left, open action items on the right.
+- **Project overview** (`project_overview.rs`): the selected Notes engine
+  summarizes only the project's filed meeting summaries/transcript excerpts,
+  plus its standing instructions. Generation never browses the web. The cache
+  key hashes ordered meeting source content, instructions, and a prompt-version
+  constant; changing any of them makes the result stale. The prompt carries the
+  exact filed-meeting count to prevent grouped events being reported as the
+  number of meetings. Attendee frequency chips are deterministic and do not
+  infer roles.
 
 ## End-to-end data flow (record → notes)
 

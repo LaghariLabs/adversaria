@@ -41,6 +41,7 @@ def _fake_summarize(
     model: str | None = None,
     output_language: str | None = None,
     user_notes: str | None = None,
+    attached_context: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     known_attendees: list[str] | None = None,
