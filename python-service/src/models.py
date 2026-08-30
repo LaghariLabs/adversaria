@@ -108,6 +108,13 @@ class SummarizeRequest(BaseModel):
             "staying grounded in the transcript."
         ),
     )
+    attached_context: str | None = Field(
+        default=None,
+        description=(
+            "Reference material the user attached to the meeting; background only, "
+            "not things said in the meeting"
+        ),
+    )
     llm_base_url: str | None = Field(
         default=None,
         description=(

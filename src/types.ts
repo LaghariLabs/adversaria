@@ -71,6 +71,21 @@ export interface Meeting {
   transcript_turns: TranscriptTurn[];
 }
 
+export interface MeetingAttachment {
+  id: number;
+  meeting_id: number;
+  kind: string;
+  value: string;
+  label: string;
+  created_at: string;
+}
+
+export interface AttachmentDraft {
+  kind: string;
+  value: string;
+  label: string;
+}
+
 export interface ChatMessage {
   id: number;
   meeting_id: number;
@@ -531,7 +546,10 @@ export interface Workspace {
   id: number;
   name: string;
   engine: string;
+  model: string;
   network_allowed: boolean;
+  instructions: string;
+  color: string;
   created_at: string;
   updated_at: string;
 }
@@ -596,6 +614,17 @@ export interface WorkspaceTask {
   updated_at: string;
 }
 
+/** Which agent and skills a queued task will run with, and why. */
+export interface TaskStaffing {
+  /** "automatic" | "manual" */
+  mode: string;
+  agent_id: number | null;
+  skill_ids: number[];
+  /** Human-readable explanation, empty for manual. */
+  reason: string;
+  resolved_at: string;
+}
+
 /** One execution attempt for a workspace task. */
 export interface WorkspaceRun {
   id: number;
@@ -649,4 +678,12 @@ export interface WorkspaceDetail {
   addons: WorkspaceAddon[];
   tasks: WorkspaceTask[];
   artifacts: WorkspaceArtifact[];
+}
+
+export interface ProjectOverview {
+  workspace_id: number;
+  summary: string;
+  generated_at: string;
+  source_meeting_count: number;
+  stale: boolean;
 }

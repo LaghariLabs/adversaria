@@ -6,15 +6,20 @@ import {
   detectWorkspaceEngines,
   getContextSources,
   getLatestWorkspaceRun,
+  getSetupStatus,
+  listWorkspaceAddons,
   openWorkspaceArtifact,
   rejectWorkspaceTask,
   runWorkspaceTask,
   setWorkspaceTaskAgentEligible,
   setWorkspaceEngine,
+  setWorkspaceModel,
   stopWorkspaceRun,
 } from "../../lib/tauri";
 import type {
   ContextSources,
+  ModelProfile,
+  WorkspaceAddon,
   WorkspaceContextItem,
   WorkspaceDetail,
   WorkspaceEngine,
@@ -22,8 +27,8 @@ import type {
 } from "../../types";
 import { ArtifactPreview } from "./ArtifactPreview";
 import { engineLabel } from "./engineLabel";
-import { WorkspaceAddons } from "./WorkspaceAddons";
 import { WorkspaceRunPanel } from "./WorkspaceRunPanel";
+import { TaskRunSetup } from "./TaskRunSetup";
 
 interface WorkspaceDetailViewProps {
   detail: WorkspaceDetail;
@@ -87,8 +92,11 @@ export function WorkspaceDetailView({
   onRefresh,
 }: WorkspaceDetailViewProps) {
   const [taskTitle, setTaskTitle] = useState("");
+  const [catalog, setCatalog] = useState<WorkspaceAddon[]>([]);
   const [engines, setEngines] = useState<WorkspaceEngine[]>([]);
+  const [installedModels, setInstalledModels] = useState<ModelProfile[]>([]);
   const [engineBusy, setEngineBusy] = useState(false);
+  const [modelBusy, setModelBusy] = useState(false);
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [polledRuns, setPolledRuns] = useState<Record<number, WorkspaceRun>>({});
@@ -133,6 +141,36 @@ export function WorkspaceDetailView({
       })
       .catch((detectError) => {
         if (!cancelled) setActionError(errorMessage(detectError));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getSetupStatus()
+      .then((setup) => {
+        if (!cancelled) {
+          setInstalledModels(setup?.profiles.filter((profile) => profile.installed) ?? []);
+        }
+      })
+      .catch((setupError: unknown) => {
+        if (!cancelled) setActionError(errorMessage(setupError));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listWorkspaceAddons()
+      .then((addons) => {
+        if (!cancelled) setCatalog(Array.isArray(addons) ? addons : []);
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) setActionError(errorMessage(loadError));
       });
     return () => {
       cancelled = true;
@@ -256,6 +294,20 @@ export function WorkspaceDetailView({
       setActionError(errorMessage(selectionError));
     } finally {
       setEngineBusy(false);
+    }
+  };
+
+  const chooseModel = async (model: string) => {
+    if (model === detail.workspace.model || modelBusy) return;
+    setModelBusy(true);
+    setActionError(null);
+    try {
+      await setWorkspaceModel(detail.workspace.id, model);
+      await onRefresh();
+    } catch (selectionError) {
+      setActionError(errorMessage(selectionError));
+    } finally {
+      setModelBusy(false);
     }
   };
 
@@ -460,6 +512,27 @@ export function WorkspaceDetailView({
             )}
           </div>
           <p className="ws-context-caption">{engineCaption(selectedEngineId)}</p>
+          {detail.workspace.engine === "local" && (
+            <>
+              <select
+                className="ws-inline-input"
+                aria-label="Workspace model"
+                value={detail.workspace.model}
+                disabled={modelBusy}
+                onChange={(event) => void chooseModel(event.target.value)}
+              >
+                <option value="">Same as notes model</option>
+                {installedModels.map((profile) => (
+                  <option value={profile.model_alias} key={profile.id}>
+                    {profile.display_name}
+                  </option>
+                ))}
+              </select>
+              <p className="ws-context-caption">
+                Workspace tasks can use a bigger model than your meeting notes.
+              </p>
+            </>
+          )}
         </div>
       </div>
       {(actionError || error) && <p className="ws-error">{actionError || error}</p>}
@@ -682,6 +755,7 @@ export function WorkspaceDetailView({
                           </button>
                         </div>
                       </div>
+                      <TaskRunSetup taskId={task.id} catalog={catalog} />
                       {isActive && activeRun && (
                         <WorkspaceRunPanel
                           engine={activeRun.engine}
@@ -784,6 +858,7 @@ export function WorkspaceDetailView({
                         </button>
                       </div>
                     </div>
+                    <TaskRunSetup taskId={task.id} catalog={catalog} />
                     {isActive && (
                       <WorkspaceRunPanel
                         engine={activeRun.engine}
@@ -958,14 +1033,10 @@ export function WorkspaceDetailView({
             <Folder size={15} aria-hidden="true" />
             Add folder…
           </button>
-          <WorkspaceAddons
-            workspaceId={detail.workspace.id}
-            attached={detail.addons}
-            onChanged={onRefresh}
-          />
           <p className="ws-context-caption">
-            What you add here is what the agent will be allowed to read and how it
-            will work. Related meetings are pulled from your graph automatically.
+            What you add here is what the agent will be allowed to read. Related
+            meetings are pulled from your graph automatically. Which agent and
+            skills run is set per task above.
           </p>
         </section>
       </div>

@@ -227,8 +227,9 @@ class TestSummarize:
         assert "{{transcript}}" not in system_msg
         assert "{{transcript}}" not in user_msg
         # The instructions are not duplicated into the user message.
-        assert "expert meeting note taker" in system_msg.lower()
-        assert "expert meeting note taker" not in user_msg.lower()
+        prompt_opening = "create faithful notes from a live meeting transcript"
+        assert prompt_opening in system_msg.lower()
+        assert prompt_opening not in user_msg.lower()
 
     def test_summarize_passes_structured_output_schema(
         self, summarizer: OllamaSummarizer
@@ -519,6 +520,50 @@ class TestUserNotesMerge:
         assert "**From Your Notes**" in result.summary
         assert "- pricing pushback" in result.summary
         assert "- send proposal Friday" in result.summary
+
+
+class TestAttachedContextPrompt:
+    """Attached context is reference material, separate from the transcript."""
+
+    def test_attached_context_appears_in_user_message(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        captured = {}
+
+        def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return {"message": {"content": '{"title": "T", "sections": []}'}}
+
+        summarizer.client.chat = MagicMock(side_effect=fake_chat)
+        summarizer.summarize(
+            "Them: we discussed the launch.",
+            attached_context="## Project brief\nThe customer is Northstar.",
+        )
+
+        user_msg = captured["messages"][-1]["content"]
+        system_msg = captured["messages"][0]["content"]
+        assert (
+            "<attached_context>\n## Project brief\nThe customer is Northstar.\n"
+            "</attached_context>"
+        ) in user_msg
+        assert "NEVER treat it as something said in this meeting" in system_msg
+
+    def test_absent_attached_context_leaves_prompt_clean(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        captured = {}
+
+        def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return {"message": {"content": '{"title": "T", "sections": []}'}}
+
+        summarizer.client.chat = MagicMock(side_effect=fake_chat)
+        summarizer.summarize("Them: hello.")
+
+        user_msg = captured["messages"][-1]["content"]
+        system_msg = captured["messages"][0]["content"]
+        assert "<attached_context>" not in user_msg
+        assert "ATTACHED CONTEXT" not in system_msg
 
 
 class TestChat:

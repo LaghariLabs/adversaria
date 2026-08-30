@@ -1,4 +1,12 @@
-import { lazy, Suspense, useCallback, useState, useEffect, useRef } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   CalendarDays,
@@ -12,6 +20,7 @@ import { useMeetings } from "./hooks/useMeetings";
 import { RecordingControls } from "./components/RecordingControls";
 import { MeetingsList } from "./components/MeetingsList";
 import { NoteViewer, NoteViewerEmpty } from "./components/NoteViewer";
+import { ProjectView } from "./components/ProjectView";
 import { RecordingCompanion } from "./components/RecordingCompanion";
 import { ErrorBanner } from "./components/ErrorBanner";
 import { UpdatePrompt } from "./components/UpdatePrompt";
@@ -35,10 +44,24 @@ import {
   importMeetingBundle,
   pickAudioFile,
   biometricAuthenticate,
+  clearMeetingWorkspaceBinding,
+  createWorkspace,
+  deleteWorkspace,
+  listMeetingWorkspaceBindings,
+  listWorkspaces,
+  setMeetingWorkspaceBinding,
+  suggestWorkspaceForMeeting,
 } from "./lib/tauri";
 import { verifyPin } from "./lib/pin";
 import { setDateFormat } from "./lib/dateFormat";
-import type { Meeting, PromptTemplate } from "./types";
+import type {
+  AttachmentDraft,
+  Meeting,
+  MeetingWorkspaceBinding,
+  PromptTemplate,
+  WorkspaceSuggestion,
+  WorkspaceSummary,
+} from "./types";
 
 // Secondary views are intentionally split from the startup/recording path.
 // GraphView alone pulls in Cytoscape; Settings is also large. Loading them only
@@ -100,6 +123,7 @@ function App() {
   // App name from an auto-detected meeting, or null when nothing is pending.
   const [detectedApp, setDetectedApp] = useState<string | null>(null);
   const [userNotes, setUserNotes] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<AttachmentDraft[]>([]);
   const [liveLines, setLiveLines] = useState<{ text: string; source: string }[]>([]);
   const [sidebarWidth, setSidebarWidth] = useState(288);
   const [meetingOverPrompt, setMeetingOverPrompt] = useState(false);
@@ -121,6 +145,9 @@ function App() {
   // Meeting pending delete-confirmation (in-app modal — window.confirm is a
   // no-op in the Tauri webview, so it can't gate the delete).
   const [deletePrompt, setDeletePrompt] = useState<Meeting | null>(null);
+  const [deleteProjectPrompt, setDeleteProjectPrompt] =
+    useState<WorkspaceSummary | null>(null);
+  const [deletingProject, setDeletingProject] = useState(false);
   const [recordingView, setRecordingView] = useState("balanced");
   const [peekBrowse, setPeekBrowse] = useState(false);
   // Auto-stop thresholds, loaded from config (defaults match the old constants).
@@ -149,6 +176,142 @@ function App() {
   const lastActivityRef = useRef(Date.now());
   const { meetings, selectedMeeting, selectMeeting, clearSelection, refresh } =
     useMeetings();
+  const [projects, setProjects] = useState<WorkspaceSummary[]>([]);
+  const [bindings, setBindings] = useState<MeetingWorkspaceBinding[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [workspaceSuggestions, setWorkspaceSuggestions] = useState<
+    Map<number, WorkspaceSuggestion | null>
+  >(new Map());
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<number>>(
+    new Set(),
+  );
+
+  const refreshProjects = useCallback(async () => {
+    try {
+      const [nextProjects, nextBindings] = await Promise.all([
+        listWorkspaces(),
+        listMeetingWorkspaceBindings(),
+      ]);
+      setProjects(nextProjects);
+      setBindings(nextBindings);
+      setProjectsLoaded(true);
+    } catch (loadError) {
+      setNotice("Couldn't load projects: " + String(loadError).slice(0, 160));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshProjects();
+  }, [meetings, refreshProjects]);
+
+  const handleAssignToProject = useCallback(
+    async (meeting: Meeting, workspaceId: number | null) => {
+      try {
+        if (workspaceId === null) {
+          await clearMeetingWorkspaceBinding(meeting.id);
+        } else {
+          await setMeetingWorkspaceBinding(meeting.id, workspaceId);
+        }
+        await refreshProjects();
+      } catch (assignError) {
+        setNotice("Couldn't update project: " + String(assignError).slice(0, 160));
+      }
+    },
+    [refreshProjects],
+  );
+
+  const handleCreateProject = useCallback(
+    async (name: string, color: string): Promise<number | null> => {
+      try {
+        const workspace = await createWorkspace(name, color);
+        await refreshProjects();
+        return workspace.id;
+      } catch (createError) {
+        setNotice("Couldn't create project: " + String(createError).slice(0, 160));
+        return null;
+      }
+    },
+    [refreshProjects],
+  );
+
+  const selectedBinding = selectedMeeting
+    ? bindings.find((binding) => binding.meeting_id === selectedMeeting.id)
+    : undefined;
+  const selectedProject = selectedBinding?.workspace_id == null
+    ? undefined
+    : projects.find(
+        (project) => project.workspace.id === selectedBinding.workspace_id,
+      );
+  const selectedProjectForView = selectedProjectId === null
+    ? undefined
+    : projects.find((project) => project.workspace.id === selectedProjectId);
+  const projectMeetings = useMemo(() => {
+    if (selectedProjectId === null) return [];
+    const projectMeetingIds = new Set(
+      bindings
+        .filter(
+          (binding) =>
+            binding.workspace_id !== null &&
+            binding.workspace_id === selectedProjectId,
+        )
+        .map((binding) => binding.meeting_id),
+    );
+    return meetings
+      .filter((meeting) => projectMeetingIds.has(meeting.id))
+      .sort(
+        (a, b) =>
+          new Date(b.recorded_at).getTime() - new Date(a.recorded_at).getTime(),
+      );
+  }, [bindings, meetings, selectedProjectId]);
+
+  useEffect(() => {
+    if (
+      selectedProjectId !== null &&
+      !projects.some((project) => project.workspace.id === selectedProjectId)
+    ) {
+      setSelectedProjectId(null);
+    }
+  }, [projects, selectedProjectId]);
+
+  useEffect(() => {
+    if (
+      !selectedMeeting ||
+      !projectsLoaded ||
+      selectedBinding !== undefined ||
+      selectedMeeting.summary.trim() === "" ||
+      dismissedSuggestions.has(selectedMeeting.id) ||
+      workspaceSuggestions.has(selectedMeeting.id)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    suggestWorkspaceForMeeting(selectedMeeting.id)
+      .then((suggestion) => {
+        if (cancelled) return;
+        setWorkspaceSuggestions((current) => {
+          const next = new Map(current);
+          next.set(selectedMeeting.id, suggestion);
+          return next;
+        });
+      })
+      .catch((suggestionError) => {
+        console.warn("Failed to suggest project:", suggestionError);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    dismissedSuggestions,
+    projectsLoaded,
+    selectedBinding,
+    selectedMeeting,
+    workspaceSuggestions,
+  ]);
+
+  const selectedSuggestion = selectedMeeting && !dismissedSuggestions.has(selectedMeeting.id)
+    ? workspaceSuggestions.get(selectedMeeting.id) ?? null
+    : null;
 
   // Refs for Tauri event listeners to avoid stale closures
   const statusRef = useRef(status);
@@ -157,6 +320,16 @@ function App() {
   templateRef.current = selectedTemplate;
   const userNotesRef = useRef(userNotes);
   userNotesRef.current = userNotes;
+  const pendingAttachmentsRef = useRef(pendingAttachments);
+  pendingAttachmentsRef.current = pendingAttachments;
+
+  const stopWithPendingAttachments = useCallback(
+    async (templateName?: string, notes?: string) => {
+      await stop(templateName, notes, pendingAttachmentsRef.current);
+      setPendingAttachments([]);
+    },
+    [stop],
+  );
 
   useEffect(() => {
     const previewTheme = (event: Event) => {
@@ -226,6 +399,7 @@ function App() {
     if (lastMeetingId !== null && lastMeetingId !== prevLastMeetingId.current) {
       prevLastMeetingId.current = lastMeetingId;
       refresh();
+      setSelectedProjectId(null);
       selectMeeting(lastMeetingId);
       setUserNotes("");
       setLiveLines([]);
@@ -246,6 +420,7 @@ function App() {
       return;
     }
     if (lastSettledId !== null && selectedMeetingRef.current?.id === lastSettledId) {
+      setSelectedProjectId(null);
       selectMeeting(lastSettledId);
     }
   }, [settledTick, lastSettledId, lastDiscardedId, refresh, selectMeeting, clearSelection]);
@@ -264,7 +439,7 @@ function App() {
       if (statusRef.current === "idle") {
         start();
       } else if (statusRef.current === "recording") {
-        stop(templateRef.current, userNotesRef.current);
+        void stopWithPendingAttachments(templateRef.current, userNotesRef.current);
       }
     };
 
@@ -297,7 +472,7 @@ function App() {
         registration.then((unlisten) => unlisten());
       });
     };
-  }, [start, stop]);
+  }, [start, stopWithPendingAttachments]);
 
   // Silence-based auto-stop: reset clock on recording (re)start, check on interval
   useEffect(() => {
@@ -307,13 +482,13 @@ function App() {
     const id = setInterval(() => {
       const idle = Date.now() - lastActivityRef.current;
       if (idle >= autoStop.stopMs) {
-        stop(templateRef.current, userNotesRef.current);
+        void stopWithPendingAttachments(templateRef.current, userNotesRef.current);
       } else if (idle >= autoStop.promptMs) {
         setMeetingOverPrompt(true);
       }
     }, SILENCE_CHECK_MS);
     return () => clearInterval(id);
-  }, [status, stop, autoStop]);
+  }, [status, stopWithPendingAttachments, autoStop]);
 
   // A new recording takes over the pane: clear any open meeting so the live
   // notes pad shows. (The user can still browse meetings while recording — the
@@ -321,6 +496,7 @@ function App() {
   useEffect(() => {
     if (status === "recording") {
       clearSelection();
+      setSelectedProjectId(null);
       setView("meetings");
       setLiveLines([]);
       setPeekBrowse(false);
@@ -366,20 +542,24 @@ function App() {
   };
 
   const handleStopRecording = () => {
-    stop(selectedTemplate, userNotes);
+    void stopWithPendingAttachments(selectedTemplate, userNotes);
   };
 
   // The post-unlock action, shared by the biometric and PIN paths.
   const performUnlock = (meeting: Meeting, purpose: "view" | "unlock") => {
     if (purpose === "view") {
       setUnlockedIds((prev) => new Set(prev).add(meeting.id));
+      setSelectedProjectId(null);
       selectMeeting(meeting.id);
       setView("meetings");
     } else {
       setMeetingLocked(meeting.id, false)
         .then(() => {
           refresh();
-          if (selectedMeeting?.id === meeting.id) selectMeeting(meeting.id);
+          if (selectedMeeting?.id === meeting.id) {
+            setSelectedProjectId(null);
+            selectMeeting(meeting.id);
+          }
         })
         .catch((e) => console.error("Failed to unlock meeting:", e));
     }
@@ -417,6 +597,7 @@ function App() {
       requestUnlock(meeting, "view");
       return;
     }
+    setSelectedProjectId(null);
     selectMeeting(meeting.id);
     // Clicking a meeting in the sidebar jumps to its note from any other
     // tab (Weekly / Ask / Graph / Settings).
@@ -448,7 +629,10 @@ function App() {
       try {
         await setMeetingLocked(meeting.id, false);
         refresh();
-        if (selectedMeeting?.id === meeting.id) selectMeeting(meeting.id);
+        if (selectedMeeting?.id === meeting.id) {
+          setSelectedProjectId(null);
+          selectMeeting(meeting.id);
+        }
       } catch (e) {
         console.error("Failed to unlock meeting:", e);
       }
@@ -482,12 +666,20 @@ function App() {
   };
 
   const handleOpenFromTodos = (id: number) => {
+    setSelectedProjectId(null);
     selectMeeting(id);
     setView("meetings");
   };
 
   const handleDeleteMeeting = (meeting: Meeting) => {
     setDeletePrompt(meeting);
+  };
+
+  const handleDeleteProject = (workspaceId: number) => {
+    const project = projects.find(
+      (candidate) => candidate.workspace.id === workspaceId,
+    );
+    if (project) setDeleteProjectPrompt(project);
   };
 
   const confirmDelete = async () => {
@@ -503,11 +695,32 @@ function App() {
     }
   };
 
+  const confirmDeleteProject = async () => {
+    if (!deleteProjectPrompt || deletingProject) return;
+    const projectId = deleteProjectPrompt.workspace.id;
+    setDeletingProject(true);
+    try {
+      await deleteWorkspace(projectId);
+      if (selectedProjectId === projectId) setSelectedProjectId(null);
+      setDeleteProjectPrompt(null);
+      await refreshProjects();
+    } catch (deleteError) {
+      setNotice(
+        "Couldn't delete project: " + String(deleteError).slice(0, 160),
+      );
+    } finally {
+      setDeletingProject(false);
+    }
+  };
+
   const handleTogglePin = async (meeting: Meeting) => {
     try {
       await setMeetingPinned(meeting.id, !meeting.pinned);
       refresh();
-      if (selectedMeeting?.id === meeting.id) selectMeeting(meeting.id);
+      if (selectedMeeting?.id === meeting.id) {
+        setSelectedProjectId(null);
+        selectMeeting(meeting.id);
+      }
     } catch (e) {
       setNotice("Couldn't pin: " + String(e).slice(0, 120));
       console.error("Failed to pin meeting:", e);
@@ -518,7 +731,10 @@ function App() {
     try {
       await setMeetingArchived(meeting.id, !meeting.archived);
       refresh();
-      if (selectedMeeting?.id === meeting.id) selectMeeting(meeting.id);
+      if (selectedMeeting?.id === meeting.id) {
+        setSelectedProjectId(null);
+        selectMeeting(meeting.id);
+      }
     } catch (e) {
       setNotice("Couldn't archive: " + String(e).slice(0, 120));
       console.error("Failed to archive meeting:", e);
@@ -526,13 +742,21 @@ function App() {
   };
 
   const handleMeetingUpdated = (updated: { id: number }) => {
+    setSelectedProjectId(null);
     selectMeeting(updated.id);
     refresh();
   };
 
   const isRecordingActive = status === "recording" || status === "stopping";
   const companionActive =
-    isRecordingActive && !selectedMeeting && view === "meetings" && !peekBrowse;
+    isRecordingActive &&
+    !selectedMeeting &&
+    selectedProjectId === null &&
+    view === "meetings" &&
+    !peekBrowse;
+  const recentMeetings = meetings
+    .slice(0, 10)
+    .map(({ id, title }) => ({ id, title }));
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -597,6 +821,7 @@ function App() {
                     try {
                       const meeting = await importAudio(path);
                       refresh();
+                      setSelectedProjectId(null);
                       selectMeeting(meeting.id);
                       setView("meetings");
                     } catch (e) {
@@ -619,6 +844,7 @@ function App() {
                       const meeting = await importMeetingBundle();
                       if (meeting) {
                         refresh();
+                        setSelectedProjectId(null);
                         selectMeeting(meeting.id);
                         setView("meetings");
                       }
@@ -640,7 +866,17 @@ function App() {
       <div className="flex-1 overflow-hidden">
         <MeetingsList
           meetings={meetings}
+          projects={projects}
+          bindings={bindings}
+          selectedProjectId={selectedProjectId}
+          onSelectProject={(id) => {
+            setSelectedProjectId(id);
+            clearSelection();
+          }}
           onSelect={handleMeetingSelected}
+          onAssignToProject={handleAssignToProject}
+          onCreateProject={handleCreateProject}
+          onDeleteProject={handleDeleteProject}
           onTagsUpdated={refresh}
           onDelete={handleDeleteMeeting}
           onTogglePin={handleTogglePin}
@@ -973,6 +1209,45 @@ function App() {
         </div>
       )}
 
+      {/* Project delete confirmation — meetings survive and become unfiled. */}
+      {deleteProjectPrompt && (
+        <div
+          className="modal-overlay open"
+          onClick={() => {
+            if (!deletingProject) setDeleteProjectPrompt(null);
+          }}
+        >
+          <div className="modal-box" onClick={(event) => event.stopPropagation()}>
+            <h3 className="modal-title" style={{ color: "var(--accent-red)" }}>
+              Delete project?
+            </h3>
+            <p className="modal-desc">
+              &quot;{deleteProjectPrompt.workspace.name}&quot; and its workspace
+              tasks, context, and overview will be permanently deleted. Meetings
+              stay in your library and become unfiled.
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                onClick={() => setDeleteProjectPrompt(null)}
+                className="btn-modal cancel"
+                disabled={deletingProject}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmDeleteProject()}
+                className="btn-modal delete"
+                disabled={deletingProject}
+              >
+                {deletingProject ? "Deleting…" : "Delete project"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Auto-detected meeting prompt */}
       {detectedApp && status === "idle" && (
         <div className="flex items-center justify-between gap-3 px-4 py-2 bg-blue-100 border-b border-blue-200 text-sm">
@@ -1064,7 +1339,7 @@ function App() {
               <GraphView meetings={meetings} onSelectMeeting={handleOpenFromTodos} />
             ) : view === "workspaces" ? (
               <WorkspacesView onOpenMeeting={handleOpenFromTodos} />
-            ) : isRecordingActive && !selectedMeeting ? (
+            ) : isRecordingActive && !selectedMeeting && !selectedProjectForView ? (
               companionActive ? (
                 <RecordingCompanion
                   variant={recordingView}
@@ -1072,6 +1347,16 @@ function App() {
                   onChange={setUserNotes}
                   status={status}
                   liveLines={liveLines}
+                  attachments={pendingAttachments}
+                  onAddAttachment={(attachment) =>
+                    setPendingAttachments((current) => [...current, attachment])
+                  }
+                  onRemoveAttachment={(index) =>
+                    setPendingAttachments((current) =>
+                      current.filter((_, itemIndex) => itemIndex !== index),
+                    )
+                  }
+                  recentMeetings={recentMeetings}
                   onStop={handleStopRecording}
                   onBrowse={() => setPeekBrowse(true)}
                 />
@@ -1090,6 +1375,20 @@ function App() {
                   <NoteViewerEmpty />
                 </>
               )
+            ) : selectedProjectForView ? (
+              <ProjectView
+                key={selectedProjectForView.workspace.id}
+                project={selectedProjectForView}
+                meetings={projectMeetings}
+                onOpenMeeting={(meeting) => {
+                  setSelectedProjectId(null);
+                  handleMeetingSelected(meeting);
+                }}
+                onProjectUpdated={refreshProjects}
+                onOpenWorkspaces={
+                  import.meta.env.DEV ? () => setView("workspaces") : undefined
+                }
+              />
             ) : selectedMeeting ? (
               <>
                 {isRecordingActive && (
@@ -1110,6 +1409,21 @@ function App() {
                 <NoteViewer
                   key={selectedMeeting.id}
                   meeting={selectedMeeting}
+                  projectChip={selectedProject ? {
+                    name: selectedProject.workspace.name,
+                    color: selectedProject.workspace.color,
+                  } : null}
+                  suggestion={selectedSuggestion}
+                  onAcceptSuggestion={(workspaceId) => {
+                    void handleAssignToProject(selectedMeeting, workspaceId);
+                  }}
+                  onDismissSuggestion={() => {
+                    setDismissedSuggestions((current) => {
+                      const next = new Set(current);
+                      next.add(selectedMeeting.id);
+                      return next;
+                    });
+                  }}
                   onMeetingUpdated={handleMeetingUpdated}
                   onTogglePin={handleTogglePin}
                   onToggleLock={handleToggleLock}

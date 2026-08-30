@@ -98,6 +98,15 @@ echo "==> [2/7] Freezing the pinned Rapid-MLX runtime…"
 ./rapid-runtime/build.sh
 
 echo "==> [3/7] Signing nested sidecar code (${SIGN_ID})…"
+# Hygiene: strip any Gatekeeper metadata (quarantine / com.apple.provenance)
+# from the frozen trees before signing. NOTE: during the 0.3.81 build a freshly
+# signed lib (av/codec/hwaccel.abi3.so) was refused at dlopen with "library
+# load disallowed by system policy" — that turned out NOT to be xattrs (the
+# dist copies carry none; PyInstaller doesn't propagate them) but a transient
+# syspolicyd trust-evaluation flake; a rebuild passed. Keep this line as cheap
+# insurance, but treat a one-off policy refusal as retryable (see
+# LESSONS_LEARNED "Gatekeeper can transiently refuse ONE freshly signed lib").
+xattr -cr dist/adversaria-service rapid-runtime/dist/rapid-mlx 2>/dev/null || true
 sign_macho_tree dist/adversaria-service
 sign_file --entitlements entitlements.plist \
   dist/adversaria-service/adversaria-service

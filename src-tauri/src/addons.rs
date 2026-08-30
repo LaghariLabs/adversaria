@@ -29,12 +29,33 @@ Output: a Markdown document with the sections Question, Sources used, Findings (
         name: "Draw.io diagram",
         description: "Produce an editable .drawio file (plus a short legend) that opens in draw.io desktop.",
         instructions: r###"## Draw.io diagram
-Write the diagram as an UNCOMPRESSED draw.io file named <topic>.drawio in the output directory:
-<mxfile host="app.diagrams.net"><diagram name="Page-1" id="page1"><mxGraphModel dx="1000" dy="700" grid="1" gridSize="10"><root><mxCell id="0"/><mxCell id="1" parent="0"/>
-…one <mxCell vertex="1" parent="1"> per component with a plain-text value, style="rounded=1;whiteSpace=wrap;html=1;" and an <mxGeometry x y width height as="geometry"/>…
-…one <mxCell edge="1" parent="1" source="<id>" target="<id>"> per relationship, with a short label in value and style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"…
+If a full `drawio-skill` is available in your environment (the claude CLI loads it from the user's skills directory), use IT to author, validate, and export the diagram; treat the rest of this section only as the output contract. Otherwise follow the rules below exactly.
+
+Deliverable: an UNCOMPRESSED draw.io file named <topic>.drawio in the output directory, plus <topic>.md with a one-paragraph legend explaining what the diagram shows and which sources it was drawn from.
+
+File skeleton (exactly this nesting):
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio"><diagram name="Page-1"><mxGraphModel><root>
+<mxCell id="0"/><mxCell id="1" parent="0"/>
+…your cells…
 </root></mxGraphModel></diagram></mxfile>
-Rules: unique ids (c1, c2, … for vertices; e1, e2, … for edges); lay components out on a grid left-to-right in the order data flows (x increases by 200, y by 120 per row); label every edge with a verb ("writes", "polls", "invalidates"); at most 25 cells. Also write <topic>.md with a one-paragraph legend explaining what the diagram shows and which sources it was drawn from. When you cannot write files directly (local model), emit the file as a "=== FILE: <name> ===" block."###,
+
+Rules:
+- ids "0" and "1" are required root cells; your shapes start at id "2" and increment (2, 3, 4, …). Every id unique.
+- One <mxCell vertex="1" parent="1"> per component: value is a short plain-text label, and a child <mxGeometry x="…" y="…" width="160" height="60" as="geometry"/>. Style is style="rounded=1;whiteSpace=wrap;html=1;fillColor=<fill>;strokeColor=<stroke>;" — ALWAYS colored, never left plain. Pick the pair by what the component IS, so color carries meaning:
+  · app / service / UI            fill #dae8fc  stroke #6c8ebf   (blue)
+  · datastore / database / cache  fill #d5e8d4  stroke #82b366   (green) — also use style prefix shape=cylinder3;
+  · queue / job / background work fill #fff2cc  stroke #d6b656   (yellow)
+  · gateway / entry point / API   fill #ffe6cc  stroke #d79b00   (orange)
+  · external / third-party        fill #f5f5f5  stroke #666666   (grey) — add dashed=1 to its edges
+  · error / risk / failure path   fill #f8cecc  stroke #b85450   (red)
+  · model / AI / inference        fill #e1d5e7  stroke #9673a6   (purple)
+  A decision point is style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;". Group related components in a titled container: style="swimlane;startSize=30;whiteSpace=wrap;html=1;fillColor=<the tier's fill>;strokeColor=<its stroke>;" with children using parent="<containerId>" and geometry RELATIVE to the container.
+- One <mxCell edge="1" parent="1" source="<id>" target="<id>"> per relationship: value is a verb ("writes", "polls", "invalidates"), style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#4d4d4d;", and a child <mxGeometry relative="1" as="geometry"/>. Add dashed=1 for anything optional, occasional, or crossing a trust boundary.
+- Lay components out on a grid in the order data flows: x increases by 220 per column, y by 120 per row. No overlapping geometry.
+- Escape &amp; &lt; &gt; &quot; inside attribute values; use &#xa; (never a literal \n) for line breaks in labels; never put -- inside an XML comment.
+- At most 25 cells. Close every tag: the file must be well-formed XML — it is machine-validated after the run, and an unparseable file counts as a failed deliverable.
+When you cannot write files directly (local model), emit each file as a "=== FILE: <name> ===" block."###,
     },
     BuiltinAddon {
         kind: "skill",

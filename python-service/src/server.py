@@ -1099,6 +1099,7 @@ def summarize(request: SummarizeRequest) -> SummarizeResponse:
             model=request.model,
             output_language=request.output_language,
             user_notes=request.user_notes,
+            attached_context=request.attached_context,
             base_url=request.llm_base_url,
             api_key=request.llm_api_key,
             known_attendees=request.known_attendees,
