@@ -26,6 +26,7 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 - **Smart note templates** — the app detects what a recording is (watched video, brainstorm, 1:1, **job interview — either side of the table**) and picks the matching notes template automatically; your manual template choice always wins.
 - **Meeting Insights** — on-device speaking stats per meeting (talk-time share, pace vs the 130–175 wpm target, filler-word rate, interruptions, longest monologue) computed with zero AI calls; transcripts carry **[MM:SS] timestamps** per turn.
 - **To-dos** — action items from every meeting on a **triage board** (Overdue / This week / Later lanes with **drag-and-drop** — drops edit the due date) or a **focus queue** (one next-up card at a time), with meeting-scope chips, editable due dates, and **twice-daily due/overdue notification digests**.
+- **Meeting projects** — file related meetings into colored project folders from the Meetings sidebar (menu or drag-and-drop), then open a project view with a source-grounded AI overview, attendee frequency, filed meetings, and open action items. Standing instructions guide both the overview and future workspace-task briefs; deleting a project leaves its meetings intact and unfiled.
 - **Weekly Briefing** — your week written by the local LLM ("your week in sixty seconds"), plus stats, decisions made, and open loops carried forward.
 - **Ask across meetings** — cross-meeting Q&A (SQLite FTS5 retrieval) answered by the local LLM.
 - **Knowledge Graph** — an interactive, physics-animated map of your meetings, people, tags, and action owners (built from local data, zero LLM). Click any node for a **side dossier**: meeting-notes previews, and **editable person profiles** (role, company, notes, aliases) that sync to your Obsidian vault alongside meeting notes.
@@ -278,3 +279,7 @@ remain available under those terms.
 
 - Email: [hamza@lagharilabs.com](mailto:hamza@lagharilabs.com) · [mhlaghari@gmail.com](mailto:mhlaghari@gmail.com)
 - LinkedIn: [linkedin.com/in/mhlaghari](https://www.linkedin.com/in/mhlaghari)
+
+## Documentation changelog
+
+- 2026-08-30 — Added the Meeting projects surface and its non-destructive deletion behavior to the user-facing feature list. The implementation is currently in the working tree and has not been committed or released.

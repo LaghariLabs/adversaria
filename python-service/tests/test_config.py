@@ -33,16 +33,20 @@ class TestBrainDumpTemplate:
     def test_names_an_actionable_section(self) -> None:
         """One declared section heading must match the to-do extractor's regex —
         without it the template produces no to-do rows at all."""
-        headings = re.findall(r'\*\*"([^"]+)"\*\*', config.load_prompt("brain-dump"))
+        headings = re.findall(
+            r'^\s*\d+\.\s+"([^"]+)"',
+            config.load_prompt("brain-dump"),
+            re.MULTILINE,
+        )
         assert headings, "template must declare its section headings"
         assert [h for h in headings if ACTIONABLE.search(h)] == ["Action Items"]
 
-    def test_pins_the_owner_prefixed_bullet_shape(self) -> None:
-        """`Owner: instruction` is what storage.rs `split_label` peels into the
-        assignee column; the template must dictate that exact shape."""
+    def test_pins_the_speaker_prefixed_bullet_shape(self) -> None:
+        """`Me: instruction` is what storage.rs `split_label` peels into the
+        assignee column; the template must dictate that shape."""
         content = config.load_prompt("brain-dump")
-        assert "`Owner: instruction`" in content
-        assert "`Me: Fix the Windows updater signing secret.`" in content
+        assert "beginning `Me:`" in content
+        assert "never write the literal word “Owner”" in content
 
 
 class TestPackagedPromptSeeding:

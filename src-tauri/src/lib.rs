@@ -31,6 +31,7 @@ pub mod local_output;
 pub mod meeting_reminders;
 pub mod ollama_engine;
 pub mod permissions;
+pub mod project_overview;
 pub mod recap;
 pub mod recording_spool;
 pub mod registration;
@@ -287,6 +288,10 @@ pub fn run() {
             commands::enqueue_recording,
             commands::import_audio,
             commands::pick_audio_file,
+            commands::pick_context_file,
+            commands::add_meeting_attachments,
+            commands::list_meeting_attachments,
+            commands::remove_meeting_attachment,
             commands::resummarize_meeting,
             commands::structure_note,
             commands::generate_template,
@@ -382,20 +387,27 @@ pub fn run() {
             commands::list_workspaces,
             commands::get_workspace,
             commands::list_workspace_addons,
+            commands::suggest_workspace_staffing,
             commands::create_workspace_addon,
             commands::delete_workspace_addon,
             commands::attach_workspace_addon,
             commands::detach_workspace_addon,
             commands::rename_workspace,
+            commands::set_workspace_instructions,
+            commands::set_workspace_network_allowed,
+            commands::set_workspace_color,
             commands::delete_workspace,
             commands::add_workspace_folder_context,
             commands::remove_workspace_context,
             commands::create_workspace_task,
+            commands::get_workspace_task_staffing,
+            commands::set_workspace_task_staffing,
             commands::set_workspace_task_agent_eligible,
             commands::delete_workspace_task,
             commands::pick_workspace_folder,
             commands::detect_workspace_engines,
             commands::set_workspace_engine,
+            commands::set_workspace_model,
             commands::get_latest_workspace_run,
             commands::open_workspace_artifact,
             commands::read_workspace_artifact,
@@ -411,6 +423,7 @@ pub fn run() {
             commands::get_agents_paused,
             commands::set_agents_paused,
             commands::suggest_workspace_for_meeting,
+            commands::get_project_overview,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

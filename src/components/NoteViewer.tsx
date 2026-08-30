@@ -30,6 +30,7 @@ import type {
   SummaryLanguage,
   Tag,
   TranscriptTurn,
+  WorkspaceSuggestion,
 } from "../types";
 import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { MeetingChat } from "./MeetingChat";
@@ -47,6 +48,7 @@ import { templateDisplayName } from "../lib/templateNames";
 import {
   Download,
   FileJson,
+  Folder,
   Lock,
   Pin,
   Presentation,
@@ -66,6 +68,14 @@ const LANGUAGE_OPTIONS: { value: SummaryLanguage; label: string }[] = [
   { value: "ur", label: "اردو" },
   { value: "auto", label: "Match spoken" },
 ];
+
+const PROJECT_COLORS: Record<string, string> = {
+  blue: "#8ec5ff",
+  purple: "#e1b3ff",
+  orange: "#ffd19a",
+  green: "#b7ffc6",
+  red: "#ffbcba",
+};
 
 interface NoteViewerProps {
   meeting: Meeting;
@@ -89,6 +99,10 @@ interface NoteViewerProps {
    *  Transcription: "Choose a notes model" landed on a section with no notes
    *  controls in it once Settings split the two. */
   onOpenNotesSettings?: () => void;
+  projectChip?: { name: string; color: string } | null;
+  suggestion?: WorkspaceSuggestion | null;
+  onAcceptSuggestion?: (workspaceId: number) => void;
+  onDismissSuggestion?: () => void;
 }
 
 type Tab = "transcript" | "summary" | "chat" | "notes" | "insights";
@@ -212,6 +226,10 @@ export function NoteViewer({
   transcriptionSetup,
   onOpenModelSettings,
   onOpenNotesSettings,
+  projectChip,
+  suggestion,
+  onAcceptSuggestion,
+  onDismissSuggestion,
 }: NoteViewerProps) {
   const [templateNames, setTemplateNames] = useState<string[]>([
     "general",
@@ -836,7 +854,55 @@ export function NoteViewer({
           <span className="badge-tag blue">
             {templateDisplayName(meeting.template_used)}
           </span>
+          {projectChip && (
+            <span className="attendee-badge">
+              <Folder
+                size={12}
+                aria-hidden="true"
+                style={{
+                  color: PROJECT_COLORS[projectChip.color] ?? PROJECT_COLORS.blue,
+                }}
+              />
+              {projectChip.name}
+            </span>
+          )}
         </div>
+
+        {!projectChip && suggestion && (
+          <div
+            style={{
+              alignItems: "center",
+              color: "var(--text-secondary)",
+              display: "flex",
+              fontSize: 12,
+              gap: 10,
+              marginBottom: 8,
+            }}
+          >
+            <span>
+              Looks like {suggestion.workspace_name}: {suggestion.related_meeting_count} related meetings
+              {suggestion.shared_attendee_count > 0
+                ? `, ${suggestion.shared_attendee_count} shared attendees`
+                : ""}
+            </span>
+            <button
+              type="button"
+              className="btn-popup-action confirm"
+              style={{ height: 24, fontSize: 11, padding: "0 10px" }}
+              onClick={() => onAcceptSuggestion?.(suggestion.workspace_id)}
+            >
+              Add to {suggestion.workspace_name}
+            </button>
+            <button
+              type="button"
+              className="btn-popup-action cancel"
+              style={{ height: 24, fontSize: 11, padding: "0 10px" }}
+              onClick={onDismissSuggestion}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         <div className="viewer-title-row">
           <h1
@@ -974,7 +1040,7 @@ export function NoteViewer({
                       cancelAttendeeEdit();
                     }
                   }}
-                  onBlur={cancelAttendeeEdit}
+                  onBlur={() => handleRenameAttendee(name)}
                   aria-label={`Rename ${name}`}
                 />
               ) : (

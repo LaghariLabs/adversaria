@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { RecordingStatus } from "../hooks/useRecording";
-import { getAudioLevel } from "../lib/tauri";
+import { getAudioLevel, pickContextFile } from "../lib/tauri";
+import type { AttachmentDraft } from "../types";
 
 interface RecordingCompanionProps {
   variant: string;
@@ -8,6 +9,10 @@ interface RecordingCompanionProps {
   onChange: (v: string) => void;
   status: RecordingStatus;
   liveLines: { text: string; source: string }[];
+  attachments: AttachmentDraft[];
+  onAddAttachment: (attachment: AttachmentDraft) => void;
+  onRemoveAttachment: (index: number) => void;
+  recentMeetings: { id: number; title: string }[];
   onStop: () => void;
   onBrowse: () => void;
 }
@@ -30,6 +35,10 @@ export function RecordingCompanion({
   onChange,
   status,
   liveLines,
+  attachments,
+  onAddAttachment,
+  onRemoveAttachment,
+  recentMeetings,
   onStop,
   onBrowse,
 }: RecordingCompanionProps) {
@@ -83,6 +92,22 @@ export function RecordingCompanion({
 
   const [footerFocused, setFooterFocused] = useState(false);
   const footerExpanded = footerFocused || value.length > 0;
+  const [meetingListOpen, setMeetingListOpen] = useState(false);
+  const [pickingFile, setPickingFile] = useState(false);
+
+  const handlePickFile = async () => {
+    setPickingFile(true);
+    try {
+      const picked = await pickContextFile();
+      if (!picked) return;
+      const [path, filename] = picked;
+      onAddAttachment({ kind: "file", value: path, label: filename });
+    } catch (error) {
+      console.warn("[recording] context file picker failed:", error);
+    } finally {
+      setPickingFile(false);
+    }
+  };
 
   // ---- auto-scroll transcript feed ----
 
@@ -163,7 +188,13 @@ export function RecordingCompanion({
       </div>
 
       {/* Body */}
-      <div className="companion-body">
+      <div
+        className={
+          layout === "balanced"
+            ? "companion-body balanced-wide"
+            : "companion-body"
+        }
+      >
         {/* Transcript pane */}
         <div className="companion-transcript">
           <div className="companion-section-label">
@@ -217,6 +248,92 @@ export function RecordingCompanion({
                 disabled={processing}
               />
             </div>
+            <aside className="companion-context" aria-label="Meeting context">
+              <div className="companion-section-label">THIS MEETING KNOWS</div>
+              <div className="companion-context-scroll">
+                {attachments.length > 0 ? (
+                  <ul className="companion-context-attachments" aria-live="polite">
+                    {attachments.map((attachment, index) => (
+                      <li className="companion-context-attachment" key={`${attachment.kind}-${attachment.value}-${index}`}>
+                        <span
+                          className="companion-context-attachment-label"
+                          dir="auto"
+                          title={attachment.label}
+                        >
+                          {attachment.label}
+                        </span>
+                        <button
+                          type="button"
+                          className="companion-context-remove"
+                          aria-label={`Remove ${attachment.label}`}
+                          onClick={() => onRemoveAttachment(index)}
+                          disabled={processing}
+                        >
+                          ×
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="companion-context-empty">
+                    Add reference material for the notes.
+                  </p>
+                )}
+
+                <div className="companion-context-actions">
+                  <button
+                    type="button"
+                    className="companion-context-action"
+                    onClick={() => void handlePickFile()}
+                    disabled={processing || pickingFile}
+                  >
+                    {pickingFile ? "Choosing…" : "+ Add file"}
+                  </button>
+                  <button
+                    type="button"
+                    className="companion-context-action"
+                    aria-expanded={meetingListOpen}
+                    aria-controls="companion-recent-meetings"
+                    onClick={() => setMeetingListOpen((open) => !open)}
+                    disabled={processing}
+                  >
+                    + Add meeting
+                  </button>
+                </div>
+
+                {meetingListOpen && (
+                  <div
+                    className="companion-context-meetings"
+                    id="companion-recent-meetings"
+                  >
+                    {recentMeetings.length > 0 ? (
+                      recentMeetings.slice(0, 10).map((meeting) => (
+                        <button
+                          type="button"
+                          className="companion-context-meeting"
+                          key={meeting.id}
+                          title={meeting.title}
+                          onClick={() => {
+                            onAddAttachment({
+                              kind: "meeting",
+                              value: String(meeting.id),
+                              label: meeting.title,
+                            });
+                            setMeetingListOpen(false);
+                          }}
+                        >
+                          <span dir="auto">{meeting.title}</span>
+                        </button>
+                      ))
+                    ) : (
+                      <p className="companion-context-empty">
+                        No previous meetings yet.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </aside>
           </>
         ) : (
           <div className="companion-notefoot">

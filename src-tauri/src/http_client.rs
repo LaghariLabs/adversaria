@@ -250,6 +250,8 @@ pub struct SummarizeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_api_key: Option<String>,

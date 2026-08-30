@@ -7,8 +7,9 @@ import {
   calendarEventAt,
   getConfig,
   getMeetings,
+  addMeetingAttachments,
 } from "../lib/tauri";
-import type { CalendarEvent } from "../types";
+import type { AttachmentDraft, CalendarEvent } from "../types";
 import { isUnrecoverable } from "../lib/recordingErrors";
 
 /** Capture status only. Transcription no longer blocks this — once a recording
@@ -43,7 +44,11 @@ interface UseRecordingReturn {
    *  pair with settledTick. */
   lastDiscardedId: number | null;
   start: () => Promise<void>;
-  stop: (templateName?: string, userNotes?: string) => Promise<void>;
+  stop: (
+    templateName?: string,
+    userNotes?: string,
+    attachments?: AttachmentDraft[],
+  ) => Promise<void>;
   dismissError: () => void;
   dismissRosterSuggestion: () => void;
 }
@@ -114,7 +119,11 @@ export function useRecording(): UseRecordingReturn {
   }, []);
 
   const stop = useCallback(
-    async (templateName?: string, userNotes?: string) => {
+    async (
+      templateName?: string,
+      userNotes?: string,
+      attachments?: AttachmentDraft[],
+    ) => {
       setStatus("stopping");
       try {
         const stopped = await stopRecording();
@@ -127,6 +136,16 @@ export function useRecording(): UseRecordingReturn {
           templateName ?? "general",
           userNotes,
         );
+        if (attachments && attachments.length > 0) {
+          try {
+            await addMeetingAttachments(pending.id, attachments);
+          } catch (attachmentError) {
+            console.warn(
+              "[recording] could not attach meeting context (non-fatal):",
+              attachmentError,
+            );
+          }
+        }
         setLastMeetingId(pending.id);
         setQueue((q) => [...q, { id: pending.id, recordedAt: pending.recorded_at }]);
         if (stopped.warning) {
