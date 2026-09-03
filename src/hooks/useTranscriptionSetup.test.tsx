@@ -23,6 +23,52 @@ const WHISPER_MODELS = [
 ];
 
 describe("useTranscriptionSetup download cadence", () => {
+  it("auto-starts a missing live-captions model once across health polls", async () => {
+    vi.useFakeTimers();
+    try {
+      let healthPolls = 0;
+      const started: string[] = [];
+      mockIPC((command, payload) => {
+        if (command === "check_service_health") {
+          healthPolls += 1;
+          return {
+            status: "ok",
+            whisper_model: "large-v3-turbo",
+            ollama_available: true,
+            transcriber_state: "ready",
+            transcriber_detail: "",
+            live_captions_state: "missing",
+          };
+        }
+        if (command === "get_config") return appConfig();
+        if (command === "list_whisper_models") return WHISPER_MODELS;
+        if (command === "get_model_download_status") {
+          const id = (payload as { profileId?: string }).profileId ?? "";
+          return status(id, "idle");
+        }
+        if (command === "start_model_download") {
+          const id = (payload as { profileId?: string }).profileId ?? "";
+          started.push(id);
+          return status(id, "preparing");
+        }
+        return null;
+      });
+
+      const { result } = renderHook(() => useTranscriptionSetup());
+      for (let i = 0; i < 8; i++) await act(async () => {});
+      expect(result.current.liveCaptionsState).toBe("missing");
+      expect(started).toEqual(["live-captions-en"]);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(healthPolls).toBeGreaterThanOrEqual(2);
+      expect(started).toEqual(["live-captions-en"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("idles at the slow poll and wakes instantly on the start event", async () => {
     vi.useFakeTimers();
     try {

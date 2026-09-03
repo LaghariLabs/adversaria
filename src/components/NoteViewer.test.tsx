@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { appConfig, pendingMeeting } from "../test/fixtures";
+import type { RelatedMeetingRef } from "../types";
 import { NoteViewer } from "./NoteViewer";
 
 function selectTranscriptText(container: HTMLElement, text: string) {
@@ -133,6 +134,7 @@ describe("NoteViewer pending meeting recovery", () => {
           percent: 62,
           detail: "",
           serviceOnline: true,
+          liveCaptionsState: undefined,
           refresh: vi.fn(),
           retry: vi.fn(),
         }}
@@ -652,5 +654,95 @@ describe("NoteViewer project context", () => {
     );
 
     expect(screen.queryByText(/Looks like Launch plan:/)).not.toBeInTheDocument();
+  });
+});
+
+describe("NoteViewer related meetings", () => {
+  const meetingWithSummary = pendingMeeting({
+    id: 1,
+    summary: "Discussion about project architecture and design.",
+  });
+
+  const sampleRelated: RelatedMeetingRef[] = [
+    {
+      meeting_id: 2,
+      title: "Sprint Planning",
+      recorded_at: "2026-08-01T10:00:00Z",
+      reason: "Mentions the same things",
+    },
+    {
+      meeting_id: 3,
+      title: "Roadmap Sync",
+      recorded_at: "2026-08-02T14:00:00Z",
+      reason: "Similar content (82% match)",
+    },
+  ];
+
+  it("renders the Related meetings card with titles + reasons when the mock resolves items", async () => {
+    mockIPC((command) => {
+      if (command === "list_templates") return [];
+      if (command === "get_action_items") return [];
+      if (command === "get_config") return appConfig();
+      if (command === "related_meetings") return sampleRelated;
+      return null;
+    });
+
+    render(
+      <NoteViewer
+        meeting={meetingWithSummary}
+        onMeetingUpdated={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Related meetings")).toBeVisible();
+    expect(screen.getByText("Sprint Planning")).toBeVisible();
+    expect(screen.getByText("Mentions the same things")).toBeVisible();
+    expect(screen.getByText("Roadmap Sync")).toBeVisible();
+    expect(screen.getByText("Similar content (82% match)")).toBeVisible();
+  });
+
+  it("clicking a row calls onOpenMeetingId with the id", async () => {
+    mockIPC((command) => {
+      if (command === "list_templates") return [];
+      if (command === "get_action_items") return [];
+      if (command === "get_config") return appConfig();
+      if (command === "related_meetings") return sampleRelated;
+      return null;
+    });
+    const onOpenMeetingId = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <NoteViewer
+        meeting={meetingWithSummary}
+        onMeetingUpdated={vi.fn()}
+        onOpenMeetingId={onOpenMeetingId}
+      />,
+    );
+
+    const rowButton = await screen.findByRole("button", { name: /Sprint Planning/ });
+    await user.click(rowButton);
+    expect(onOpenMeetingId).toHaveBeenCalledWith(2);
+  });
+
+  it("does not render the card when the mock resolves []", async () => {
+    mockIPC((command) => {
+      if (command === "list_templates") return [];
+      if (command === "get_action_items") return [];
+      if (command === "get_config") return appConfig();
+      if (command === "related_meetings") return [];
+      return null;
+    });
+
+    render(
+      <NoteViewer
+        meeting={meetingWithSummary}
+        onMeetingUpdated={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText("Related meetings")).not.toBeInTheDocument();
+    });
   });
 });

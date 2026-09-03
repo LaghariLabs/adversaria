@@ -3,14 +3,18 @@
  *
  * Every downloadable model — transcription and notes alike — goes through the
  * same `start_model_download` / `get_model_download_status` pair, keyed by a
- * profile id. Transcription ids are `whisper-main`, `whisper-live` and
- * `whisper-model:<key>`; anything else writes meeting notes.
+ * profile id. Transcription ids are `whisper-main`, `whisper-live`,
+ * `live-captions-en` and `whisper-model:<key>`; anything else writes meeting
+ * notes.
  */
 import type { ModelDownloadStatus } from "../types";
 import { startModelDownload } from "./tauri";
 
-/** The transcription engine's own pair (main pass + live captions). */
-export const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main"] as const;
+/** The English live-caption preview model (Moonshine v2 tiny via sherpa-onnx, ~44 MB). */
+export const LIVE_CAPTIONS_ID = "live-captions-en";
+
+/** The transcription engine's own profiles: main pass, live captions, and the streaming preview. */
+export const ENGINE_WHISPER_IDS = ["whisper-live", "whisper-main", LIVE_CAPTIONS_ID] as const;
 
 /** Prefix of the per-model transcription ids listed in Settings. */
 export const WHISPER_MODEL_PREFIX = "whisper-model:";
@@ -24,11 +28,12 @@ export function whisperModelId(key: string): string {
 }
 
 export function isTranscriptionProfile(profileId: string): boolean {
-  return profileId.startsWith("whisper");
+  return profileId.startsWith("whisper") || profileId === LIVE_CAPTIONS_ID;
 }
 
 /** What a person calls this download — never the profile id. */
 export function downloadLabel(profileId: string): string {
+  if (profileId === LIVE_CAPTIONS_ID) return "Live captions model";
   return isTranscriptionProfile(profileId)
     ? "Transcription model"
     : "Meeting notes model";

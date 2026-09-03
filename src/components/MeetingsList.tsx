@@ -16,14 +16,14 @@ import {
 import { formatDateTime, formatDate, dateLocale } from "../lib/dateFormat";
 import type {
   Meeting,
-  MeetingWorkspaceBinding,
+  MeetingFolder,
   Tag,
-  WorkspaceSuggestion,
-  WorkspaceSummary,
+  FolderSuggestion,
+  FolderSummary,
 } from "../types";
 import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { TAG_COLORS } from "../lib/tags";
-import { suggestWorkspaceForMeeting, updateMeetingTags } from "../lib/tauri";
+import { suggestFolderForMeeting, updateMeetingTags } from "../lib/tauri";
 import { cleanMeetingTitle } from "../lib/summary";
 import { DateHeatmap } from "./DateHeatmap";
 
@@ -36,13 +36,13 @@ function isGenericParticipant(name: string): boolean {
 
 interface MeetingsListProps {
   meetings: Meeting[];
-  projects?: WorkspaceSummary[];
-  bindings?: MeetingWorkspaceBinding[];
-  selectedProjectId?: number | null;
-  onSelectProject?: (workspaceId: number) => void;
-  onAssignToProject?: (meeting: Meeting, workspaceId: number | null) => void;
-  onCreateProject?: (name: string, color: string) => Promise<number | null>;
-  onDeleteProject?: (workspaceId: number) => void;
+  folders?: FolderSummary[];
+  meetingFolders?: MeetingFolder[];
+  selectedFolderId?: number | null;
+  onSelectFolder?: (folderId: number) => void;
+  onAssignToFolder?: (meeting: Meeting, folderId: number | null) => void;
+  onCreateFolder?: (name: string, color: string) => Promise<number | null>;
+  onDeleteFolder?: (folderId: number) => void;
   onSelect: (meeting: Meeting) => void;
   onTagsUpdated?: () => void;
   onDelete?: (meeting: Meeting) => void;
@@ -65,7 +65,7 @@ interface MeetingsListProps {
   transcriptionSetup?: TranscriptionSetup;
 }
 
-const PROJECT_COLORS: Record<string, string> = {
+const FOLDER_COLORS: Record<string, string> = {
   blue: "#8ec5ff",
   purple: "#e1b3ff",
   orange: "#ffd19a",
@@ -73,7 +73,7 @@ const PROJECT_COLORS: Record<string, string> = {
   red: "#ffbcba",
 };
 
-const PROJECT_COLOR_NAMES = ["blue", "purple", "orange", "green", "red"];
+const FOLDER_COLOR_NAMES = ["blue", "purple", "orange", "green", "red"];
 
 function formatDuration(seconds: number): string {
   const mins = Math.round(seconds / 60);
@@ -92,13 +92,13 @@ function snippetFor(summary: string): string {
 
 export function MeetingsList({
   meetings,
-  projects,
-  bindings,
-  selectedProjectId,
-  onSelectProject,
-  onAssignToProject,
-  onCreateProject,
-  onDeleteProject,
+  folders,
+  meetingFolders,
+  selectedFolderId,
+  onSelectFolder,
+  onAssignToFolder,
+  onCreateFolder,
+  onDeleteFolder,
   onSelect,
   onTagsUpdated,
   onDelete,
@@ -152,100 +152,100 @@ export function MeetingsList({
   const [mentionDismissed, setMentionDismissed] = useState("");
   const [tagMentionHighlight, setTagMentionHighlight] = useState(0);
   const [tagMentionDismissed, setTagMentionDismissed] = useState("");
-  const [expandedProjects, setExpandedProjects] = useState<Set<number>>(new Set());
-  const [projectMenuOpenId, setProjectMenuOpenId] = useState<number | null>(null);
-  const [dragOverProjectId, setDragOverProjectId] = useState<number | null>(null);
-  const [projectPopupOpen, setProjectPopupOpen] = useState(false);
-  const [projectName, setProjectName] = useState("");
-  const [projectColor, setProjectColor] = useState("blue");
-  const [creatingProject, setCreatingProject] = useState(false);
+  const [expandedFolders, setExpandedFolders] = useState<Set<number>>(new Set());
+  const [folderMenuOpenId, setFolderMenuOpenId] = useState<number | null>(null);
+  const [dragOverFolderId, setDragOverFolderId] = useState<number | null>(null);
+  const [folderPopupOpen, setFolderPopupOpen] = useState(false);
+  const [folderName, setFolderName] = useState("");
+  const [folderColor, setFolderColor] = useState("blue");
+  const [creatingFolder, setCreatingFolder] = useState(false);
   const [assignAfterCreateMeetingId, setAssignAfterCreateMeetingId] = useState<
     number | null
   >(null);
-  const [projectSuggestions, setProjectSuggestions] = useState<
-    Map<number, WorkspaceSuggestion | null>
+  const [folderSuggestions, setFolderSuggestions] = useState<
+    Map<number, FolderSuggestion | null>
   >(new Map());
 
-  const bindingByMeeting = new Map<number, number>();
-  for (const binding of bindings ?? []) {
-    if (binding.workspace_id !== null) {
-      bindingByMeeting.set(binding.meeting_id, binding.workspace_id);
+  const meetingFolderByMeeting = new Map<number, number>();
+  for (const meetingFolder of meetingFolders ?? []) {
+    if (meetingFolder.folder_id !== null) {
+      meetingFolderByMeeting.set(meetingFolder.meeting_id, meetingFolder.folder_id);
     }
   }
-  const sortedProjects = [...(projects ?? [])].sort((a, b) =>
-    a.workspace.name.localeCompare(b.workspace.name),
+  const sortedFolders = [...(folders ?? [])].sort((a, b) =>
+    a.folder.name.localeCompare(b.folder.name),
   );
-  const projectActionsAvailable =
-    projects !== undefined &&
-    onAssignToProject !== undefined &&
-    onCreateProject !== undefined;
+  const folderActionsAvailable =
+    folders !== undefined &&
+    onAssignToFolder !== undefined &&
+    onCreateFolder !== undefined;
 
   useEffect(() => {
     if (
-      !projectActionsAvailable ||
+      !folderActionsAvailable ||
       menuOpenId === null ||
-      bindingByMeeting.has(menuOpenId) ||
-      projectSuggestions.has(menuOpenId)
+      meetingFolderByMeeting.has(menuOpenId) ||
+      folderSuggestions.has(menuOpenId)
     ) {
       return;
     }
     const meetingId = menuOpenId;
-    setProjectSuggestions((current) => {
+    setFolderSuggestions((current) => {
       const next = new Map(current);
       next.set(meetingId, null);
       return next;
     });
-    void suggestWorkspaceForMeeting(meetingId)
+    void suggestFolderForMeeting(meetingId)
       .then((suggestion) => {
-        setProjectSuggestions((current) => {
+        setFolderSuggestions((current) => {
           const next = new Map(current);
           next.set(meetingId, suggestion);
           return next;
         });
       })
       .catch((error) => {
-        console.warn("Failed to suggest project:", error);
+        console.warn("Failed to suggest folder:", error);
       });
-  }, [bindings, menuOpenId, projectActionsAvailable, projectSuggestions]);
+  }, [meetingFolders, menuOpenId, folderActionsAvailable, folderSuggestions]);
 
-  const closeProjectPopup = () => {
-    if (creatingProject) return;
-    setProjectPopupOpen(false);
+  const closeFolderPopup = () => {
+    if (creatingFolder) return;
+    setFolderPopupOpen(false);
     setAssignAfterCreateMeetingId(null);
   };
 
-  const openProjectPopup = (meetingId: number | null) => {
-    if (!onCreateProject) return;
-    setProjectName("");
-    setProjectColor("blue");
+  const openFolderPopup = (meetingId: number | null) => {
+    if (!onCreateFolder) return;
+    setFolderName("");
+    setFolderColor("blue");
     setAssignAfterCreateMeetingId(meetingId);
-    setProjectPopupOpen(true);
+    setFolderPopupOpen(true);
   };
 
-  const submitProject = async () => {
-    const name = projectName.trim();
-    if (!name || !onCreateProject) return;
-    setCreatingProject(true);
+  const submitFolder = async () => {
+    const name = folderName.trim();
+    if (!name || !onCreateFolder) return;
+    setCreatingFolder(true);
     try {
-      const workspaceId = await onCreateProject(name, projectColor);
-      if (workspaceId !== null) {
-        setExpandedProjects((current) => {
+      const folderId = await onCreateFolder(name, folderColor);
+      if (folderId !== null) {
+        setExpandedFolders((current) => {
           const next = new Set(current);
-          next.add(workspaceId);
+          next.add(folderId);
           return next;
         });
-        if (assignAfterCreateMeetingId !== null && onAssignToProject) {
+        if (assignAfterCreateMeetingId !== null && onAssignToFolder) {
           const meeting = meetings.find(
             (item) => item.id === assignAfterCreateMeetingId,
           );
-          if (meeting) onAssignToProject(meeting, workspaceId);
+          if (meeting) onAssignToFolder(meeting, folderId);
         }
       }
     } catch (error) {
-      console.warn("Failed to create project:", error);
+      console.warn("Failed to create folder:", error);
     } finally {
-      setCreatingProject(false);
-      setProjectPopupOpen(false);
+      setCreatingFolder(false);
+      setFolderPopupOpen(false);
       setAssignAfterCreateMeetingId(null);
     }
   };
@@ -460,10 +460,10 @@ export function MeetingsList({
     return "var(--text-muted)";
   }
 
-  const renderProjectMenuItems = (meeting: Meeting) => {
-    if (!projectActionsAvailable || !onAssignToProject) return null;
-    const currentProjectId = bindingByMeeting.get(meeting.id);
-    const suggestion = projectSuggestions.get(meeting.id);
+  const renderFolderMenuItems = (meeting: Meeting) => {
+    if (!folderActionsAvailable || !onAssignToFolder) return null;
+    const currentFolderId = meetingFolderByMeeting.get(meeting.id);
+    const suggestion = folderSuggestions.get(meeting.id);
     return (
       <>
         <div
@@ -479,25 +479,25 @@ export function MeetingsList({
             textTransform: "uppercase",
           }}
         >
-          Move to project
+          Move to folder
         </div>
-        {sortedProjects.map((project) => {
-          const workspace = project.workspace;
-          const isCurrent = currentProjectId === workspace.id;
-          const isSuggested = suggestion?.workspace_id === workspace.id;
+        {sortedFolders.map((folder) => {
+          const folderDetails = folder.folder;
+          const isCurrent = currentFolderId === folderDetails.id;
+          const isSuggested = suggestion?.folder_id === folderDetails.id;
           return (
             <button
-              key={workspace.id}
+              key={folderDetails.id}
               onClick={() => {
                 setMenuOpenId(null);
-                if (!isCurrent) onAssignToProject(meeting, workspace.id);
+                if (!isCurrent) onAssignToFolder(meeting, folderDetails.id);
               }}
               className="settings-menu-item"
             >
               <Folder
                 size={13}
                 aria-hidden="true"
-                style={{ color: PROJECT_COLORS[workspace.color] ?? PROJECT_COLORS.blue }}
+                style={{ color: FOLDER_COLORS[folderDetails.color] ?? FOLDER_COLORS.blue }}
               />
               <span
                 style={{
@@ -508,7 +508,7 @@ export function MeetingsList({
                   whiteSpace: "nowrap",
                 }}
               >
-                {workspace.name}
+                {folderDetails.name}
               </span>
               {isSuggested && (
                 <span style={{ color: "#8ec5ff", fontSize: 10 }}>suggested</span>
@@ -517,25 +517,25 @@ export function MeetingsList({
             </button>
           );
         })}
-        {currentProjectId !== undefined && (
+        {currentFolderId !== undefined && (
           <button
             onClick={() => {
               setMenuOpenId(null);
-              onAssignToProject(meeting, null);
+              onAssignToFolder(meeting, null);
             }}
             className="settings-menu-item"
           >
-            Remove from project
+            Remove from folder
           </button>
         )}
         <button
           onClick={() => {
             setMenuOpenId(null);
-            openProjectPopup(meeting.id);
+            openFolderPopup(meeting.id);
           }}
           className="settings-menu-item"
         >
-          + New project…
+          + New folder…
         </button>
       </>
     );
@@ -584,8 +584,8 @@ export function MeetingsList({
         <div
           className={rowClass}
           onClick={() => onSelect(meeting)}
-          draggable={onAssignToProject ? true : undefined}
-          onDragStart={onAssignToProject ? (event) => {
+          draggable={onAssignToFolder ? true : undefined}
+          onDragStart={onAssignToFolder ? (event) => {
             event.dataTransfer.setData("text/plain", String(meeting.id));
             event.dataTransfer.effectAllowed = "move";
           } : undefined}
@@ -708,7 +708,7 @@ export function MeetingsList({
                     <Trash2 size={15} aria-hidden="true" />
                     Delete
                   </button>
-                  {renderProjectMenuItems(meeting)}
+                  {renderFolderMenuItems(meeting)}
                 </div>
               </>
             )}
@@ -896,7 +896,7 @@ export function MeetingsList({
                   <Trash2 size={15} aria-hidden="true" />
                   Delete
                 </button>
-                {renderProjectMenuItems(meeting)}
+                {renderFolderMenuItems(meeting)}
               </div>
             </>
           )}
@@ -1070,13 +1070,13 @@ export function MeetingsList({
 
   const [archiveOpen, setArchiveOpen] = useState(false);
 
-  const renderProjectPopup = () => (
+  const renderFolderPopup = () => (
     <>
       <div
         style={{ position: "fixed", inset: 0, zIndex: 20 }}
         onClick={(event) => {
           event.stopPropagation();
-          closeProjectPopup();
+          closeFolderPopup();
         }}
       />
       <div
@@ -1086,42 +1086,42 @@ export function MeetingsList({
       >
         <input
           autoFocus
-          value={projectName}
-          onChange={(event) => setProjectName(event.target.value)}
+          value={folderName}
+          onChange={(event) => setFolderName(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter") void submitProject();
-            if (event.key === "Escape") closeProjectPopup();
+            if (event.key === "Enter") void submitFolder();
+            if (event.key === "Escape") closeFolderPopup();
           }}
-          placeholder="Project name"
+          placeholder="Folder name"
           className="tag-popup-input"
-          disabled={creatingProject}
+          disabled={creatingFolder}
         />
         <div className="tag-color-dots">
-          {PROJECT_COLOR_NAMES.map((color) => (
+          {FOLDER_COLOR_NAMES.map((color) => (
             <button
               key={color}
               type="button"
-              onClick={() => setProjectColor(color)}
-              aria-label={`Project color ${color}`}
-              className={`color-dot ${color} ${projectColor === color ? "selected" : ""}`}
-              disabled={creatingProject}
+              onClick={() => setFolderColor(color)}
+              aria-label={`Folder color ${color}`}
+              className={`color-dot ${color} ${folderColor === color ? "selected" : ""}`}
+              disabled={creatingFolder}
             />
           ))}
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
           <button
             type="button"
-            onClick={closeProjectPopup}
+            onClick={closeFolderPopup}
             className="btn-popup-action cancel"
-            disabled={creatingProject}
+            disabled={creatingFolder}
           >
             Cancel
           </button>
           <button
             type="button"
-            onClick={() => void submitProject()}
+            onClick={() => void submitFolder()}
             className="btn-popup-action confirm"
-            disabled={creatingProject || projectName.trim() === ""}
+            disabled={creatingFolder || folderName.trim() === ""}
           >
             Create
           </button>
@@ -1130,8 +1130,8 @@ export function MeetingsList({
     </>
   );
 
-  const renderProjectsSection = () => {
-    if (projects === undefined) return null;
+  const renderFoldersSection = () => {
+    if (folders === undefined) return null;
     return (
       <div>
         <div
@@ -1142,18 +1142,18 @@ export function MeetingsList({
             position: "relative",
           }}
         >
-          <div className="list-section-cap">Projects</div>
+          <div className="list-section-cap">Folders</div>
           <button
             type="button"
-            onClick={() => openProjectPopup(null)}
-            aria-label="New project"
-            disabled={!onCreateProject}
+            onClick={() => openFolderPopup(null)}
+            aria-label="New folder"
+            disabled={!onCreateFolder}
             style={{
               alignItems: "center",
               background: "transparent",
               border: 0,
               color: "var(--text-muted)",
-              cursor: onCreateProject ? "pointer" : "default",
+              cursor: onCreateFolder ? "pointer" : "default",
               display: "flex",
               height: 20,
               justifyContent: "center",
@@ -1163,67 +1163,67 @@ export function MeetingsList({
           >
             <Plus size={13} aria-hidden="true" />
           </button>
-          {projectPopupOpen && !filtersActive && renderProjectPopup()}
+          {folderPopupOpen && !filtersActive && renderFolderPopup()}
         </div>
-        {sortedProjects.map((project) => {
-          const workspace = project.workspace;
-          const expanded = expandedProjects.has(workspace.id);
-          const projectMenuOpen = projectMenuOpenId === workspace.id;
-          const projectMeetings = sorted.filter(
-            (meeting) => bindingByMeeting.get(meeting.id) === workspace.id,
+        {sortedFolders.map((folder) => {
+          const folderDetails = folder.folder;
+          const expanded = expandedFolders.has(folderDetails.id);
+          const folderMenuOpen = folderMenuOpenId === folderDetails.id;
+          const folderMeetings = sorted.filter(
+            (meeting) => meetingFolderByMeeting.get(meeting.id) === folderDetails.id,
           );
-          const dragOver = dragOverProjectId === workspace.id;
-          const toggleProjectMeetings = () => {
-            setExpandedProjects((current) => {
+          const dragOver = dragOverFolderId === folderDetails.id;
+          const toggleFolderMeetings = () => {
+            setExpandedFolders((current) => {
               const next = new Set(current);
-              if (next.has(workspace.id)) next.delete(workspace.id);
-              else next.add(workspace.id);
+              if (next.has(folderDetails.id)) next.delete(folderDetails.id);
+              else next.add(folderDetails.id);
               return next;
             });
           };
-          const selectOrToggleProject = () => {
-            if (!onSelectProject) {
-              toggleProjectMeetings();
+          const selectOrToggleFolder = () => {
+            if (!onSelectFolder) {
+              toggleFolderMeetings();
               return;
             }
-            onSelectProject(workspace.id);
-            setExpandedProjects((current) => {
+            onSelectFolder(folderDetails.id);
+            setExpandedFolders((current) => {
               const next = new Set(current);
-              next.add(workspace.id);
+              next.add(folderDetails.id);
               return next;
             });
           };
           return (
-            <div key={workspace.id} className="mrow-wrap project-row-wrap">
+            <div key={folderDetails.id} className="mrow-wrap folder-row-wrap">
               <div
                 className={`mrow${
-                  selectedProjectId === workspace.id ? " mrow--selected" : ""
-                }${projectMenuOpen ? " mrow--peek-open" : ""}`}
+                  selectedFolderId === folderDetails.id ? " mrow--selected" : ""
+                }${folderMenuOpen ? " mrow--peek-open" : ""}`}
                 role="button"
                 tabIndex={0}
                 aria-expanded={expanded}
-                onClick={selectOrToggleProject}
+                onClick={selectOrToggleFolder}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault();
-                    selectOrToggleProject();
+                    selectOrToggleFolder();
                   }
                 }}
-                onDragOver={onAssignToProject ? (event) => {
+                onDragOver={onAssignToFolder ? (event) => {
                   event.preventDefault();
-                  setDragOverProjectId(workspace.id);
+                  setDragOverFolderId(folderDetails.id);
                 } : undefined}
-                onDragLeave={onAssignToProject ? () => {
-                  setDragOverProjectId((current) =>
-                    current === workspace.id ? null : current,
+                onDragLeave={onAssignToFolder ? () => {
+                  setDragOverFolderId((current) =>
+                    current === folderDetails.id ? null : current,
                   );
                 } : undefined}
-                onDrop={onAssignToProject ? (event) => {
+                onDrop={onAssignToFolder ? (event) => {
                   event.preventDefault();
                   const meetingId = Number(event.dataTransfer.getData("text/plain"));
                   const meeting = meetings.find((item) => item.id === meetingId);
-                  if (meeting) onAssignToProject(meeting, workspace.id);
-                  setDragOverProjectId(null);
+                  if (meeting) onAssignToFolder(meeting, folderDetails.id);
+                  setDragOverFolderId(null);
                 } : undefined}
                 style={dragOver ? {
                   background: "rgba(0,122,255,0.10)",
@@ -1232,10 +1232,10 @@ export function MeetingsList({
               >
                 <button
                   type="button"
-                  aria-label="Toggle project meetings"
+                  aria-label="Toggle folder meetings"
                   onClick={(event) => {
                     event.stopPropagation();
-                    toggleProjectMeetings();
+                    toggleFolderMeetings();
                   }}
                   onKeyDown={(event) => event.stopPropagation()}
                   style={{
@@ -1261,25 +1261,25 @@ export function MeetingsList({
                 <Folder
                   size={13}
                   aria-hidden="true"
-                  style={{ color: PROJECT_COLORS[workspace.color] ?? PROJECT_COLORS.blue }}
+                  style={{ color: FOLDER_COLORS[folderDetails.color] ?? FOLDER_COLORS.blue }}
                 />
                 <span className="mrow-title" style={{ fontWeight: 500 }}>
-                  {workspace.name}
+                  {folderDetails.name}
                 </span>
-                <span className="project-meeting-count">
-                  {projectMeetings.length}
+                <span className="folder-meeting-count">
+                  {folderMeetings.length}
                 </span>
-                {onDeleteProject && (
+                {onDeleteFolder && (
                   <button
                     className="mrow-menu-btn"
                     type="button"
-                    aria-label={`Actions for project ${workspace.name}`}
+                    aria-label={`Actions for folder ${folderDetails.name}`}
                     aria-haspopup="menu"
-                    aria-expanded={projectMenuOpen}
-                    title="Project actions"
+                    aria-expanded={folderMenuOpen}
+                    title="Folder actions"
                     onClick={(event) => {
                       event.stopPropagation();
-                      setProjectMenuOpenId(projectMenuOpen ? null : workspace.id);
+                      setFolderMenuOpenId(folderMenuOpen ? null : folderDetails.id);
                     }}
                     onKeyDown={(event) => event.stopPropagation()}
                   >
@@ -1287,17 +1287,17 @@ export function MeetingsList({
                   </button>
                 )}
               </div>
-              {projectMenuOpen && onDeleteProject && (
+              {folderMenuOpen && onDeleteFolder && (
                 <>
                   <div
-                    className="project-menu-overlay"
+                    className="folder-menu-overlay"
                     onClick={(event) => {
                       event.stopPropagation();
-                      setProjectMenuOpenId(null);
+                      setFolderMenuOpenId(null);
                     }}
                   />
                   <div
-                    className="tag-add-popup project-row-menu"
+                    className="tag-add-popup folder-row-menu"
                     role="menu"
                     onClick={(event) => event.stopPropagation()}
                   >
@@ -1307,20 +1307,20 @@ export function MeetingsList({
                       role="menuitem"
                       style={{ color: "var(--accent-red)" }}
                       onClick={() => {
-                        setProjectMenuOpenId(null);
-                        onDeleteProject(workspace.id);
+                        setFolderMenuOpenId(null);
+                        onDeleteFolder(folderDetails.id);
                       }}
                     >
                       <Trash2 size={15} aria-hidden="true" />
-                      Delete project
+                      Delete folder
                     </button>
                   </div>
                 </>
               )}
               {expanded && (
                 <div style={{ paddingLeft: 18 }}>
-                  {projectMeetings.map((meeting) =>
-                    renderMeeting(meeting, { bin: `project-${workspace.id}` }),
+                  {folderMeetings.map((meeting) =>
+                    renderMeeting(meeting, { bin: `folder-${folderDetails.id}` }),
                   )}
                 </div>
               )}
@@ -1530,8 +1530,8 @@ export function MeetingsList({
 
       {/* Meetings list */}
       <div className="meetings-list-wrapper">
-        {filtersActive && projectPopupOpen && (
-          <div style={{ position: "relative" }}>{renderProjectPopup()}</div>
+        {filtersActive && folderPopupOpen && (
+          <div style={{ position: "relative" }}>{renderFolderPopup()}</div>
         )}
         {filtersActive ? (
           /* ---- Filtered view: flat compact rows ---- */
@@ -1554,12 +1554,12 @@ export function MeetingsList({
             )
           )
         ) : (
-          /* ---- Resting view: projects + date bins ---- */
+          /* ---- Resting view: folders + date bins ---- */
           <>
-            {renderProjectsSection()}
+            {renderFoldersSection()}
             {(() => {
               const bins = buildBins(
-                sorted.filter((meeting) => !bindingByMeeting.has(meeting.id)),
+                sorted.filter((meeting) => !meetingFolderByMeeting.has(meeting.id)),
               );
               if (bins.length === 0) {
                 if (sorted.length > 0) return null;

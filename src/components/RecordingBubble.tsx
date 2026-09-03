@@ -136,8 +136,13 @@ export function RecordingBubble() {
       const text = e.payload?.text?.trim();
       if (text) setCaption(text);
     });
+    const unlistenPartial = listen<{ text: string }>("live-partial", (e) => {
+      const text = e.payload?.text?.trim();
+      if (text) setCaption(text);
+    });
     return () => {
       void unlisten.then((f) => f());
+      void unlistenPartial.then((f) => f());
     };
   }, [expressive]);
 

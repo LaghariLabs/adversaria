@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 import wave
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -16,7 +19,7 @@ import numpy as np
 import faster_whisper.audio  # noqa: F401
 
 from src import live
-from src.live import LiveCaptionSession, completed_utterances
+from src.live import LiveCaptionSession, completed_utterances, trim_repetition_loop
 
 SR = 16000
 
@@ -120,6 +123,117 @@ class TestLiveCaptionSession:
         assert s._emitted == 0
         assert len(s._buffer) == 3 * SR
 
+    def test_unconfirmed_tail_follows_watermark_and_caps_at_8s(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            live,
+            "_speech_timestamps",
+            lambda audio: [{"start": SR, "end": 12 * SR}],
+        )
+        delta = tmp_path / "delta.wav"
+        _write_wav(delta, 12.0)
+
+        session = LiveCaptionSession()
+        session.ingest(1, str(delta))
+        session.pending_utterances()
+        session.advance(2 * SR)
+
+        assert len(session.unconfirmed_tail()) == 8 * SR
+
+    def test_unconfirmed_tail_starts_at_speech_not_at_watermark(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            live,
+            "_speech_timestamps",
+            lambda audio: [{"start": 5 * SR, "end": 7 * SR}],
+        )
+        delta = tmp_path / "delta.wav"
+        _write_wav(delta, 8.0)
+
+        session = LiveCaptionSession()
+        session.ingest(1, str(delta))
+        session.pending_utterances()
+
+        assert len(session.unconfirmed_tail()) == 3 * SR
+
+    def test_unconfirmed_tail_empty_once_speech_is_confirmed(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            live,
+            "_speech_timestamps",
+            lambda audio: [{"start": SR, "end": 2 * SR}],
+        )
+        delta = tmp_path / "delta.wav"
+        _write_wav(delta, 5.0)
+
+        session = LiveCaptionSession()
+        session.ingest(1, str(delta))
+        session.pending_utterances()
+        session.advance(2 * SR)
+
+        assert len(session.unconfirmed_tail()) == 0
+
+    def test_confirmed_language_gates_partials(self):
+        session = LiveCaptionSession()
+        assert session.partials_enabled is True
+
+        session.note_confirmed_language("ar")
+        assert session.partials_enabled is False
+        session.note_confirmed_language("")
+        assert session.partials_enabled is False
+        session.note_confirmed_language("en")
+        assert session.partials_enabled is True
+
+
+class TestMoonshinePartialEngine:
+    @staticmethod
+    def _fake_module(monkeypatch):
+        recognizer = MagicMock()
+        factory = MagicMock(return_value=recognizer)
+        module = ModuleType("sherpa_onnx")
+        module.OfflineRecognizer = SimpleNamespace(from_moonshine_v2=factory)
+        monkeypatch.setitem(sys.modules, "sherpa_onnx", module)
+        return factory, recognizer
+
+    def test_builds_from_pinned_snapshot_files(self, tmp_path, monkeypatch):
+        factory, _ = self._fake_module(monkeypatch)
+
+        live.MoonshinePartialEngine(tmp_path)
+
+        factory.assert_called_once_with(
+            encoder=str(tmp_path / "encoder_model.ort"),
+            decoder=str(tmp_path / "decoder_model_merged.ort"),
+            tokens=str(tmp_path / "tokens.txt"),
+            num_threads=2,
+            provider="cpu",
+        )
+
+    def test_decode_returns_stripped_text_and_caps_input(
+        self, tmp_path, monkeypatch
+    ):
+        _, recognizer = self._fake_module(monkeypatch)
+        stream = MagicMock()
+        stream.result.text = "  hello wor "
+        recognizer.create_stream.return_value = stream
+        engine = live.MoonshinePartialEngine(tmp_path)
+
+        result = engine.decode(np.zeros(12 * SR, dtype="float32"))
+
+        assert result == "hello wor"
+        sample_rate, samples = stream.accept_waveform.call_args.args
+        assert sample_rate == SR
+        assert len(samples) == 8 * SR
+
+    def test_decode_swallows_failures(self, tmp_path, monkeypatch):
+        _, recognizer = self._fake_module(monkeypatch)
+        recognizer.decode_stream.side_effect = RuntimeError("boom")
+        engine = live.MoonshinePartialEngine(tmp_path)
+
+        assert engine.decode(np.zeros(SR, dtype="float32")) == ""
+
 
 class TestFillerHallucinationFilter:
     """Live-preview cosmetic gate: Whisper's canonical noise-fillers ("Thank
@@ -170,6 +284,32 @@ class TestRepetitionLoopFilter:
             "so you get a lot of like thank yous",
         ]:
             assert not live.is_repetition_loop(text), repr(text)
+
+
+class TestTrimRepetitionLoop:
+    def test_real_decoder_loops_trimmed(self):
+        cases = {
+            "The first milestone style style style style style style style style style style style style style": "The first milestone style",
+            "The first milestone is moving the data data data data data data data data data data data data data": "The first milestone is moving the data",
+            "The first milestone is moving the data base to the data base to the data base to the data base to the": "The first milestone is moving the data base to",
+            "The first, the first, the first, the": "The first",
+        }
+
+        for text, expected in cases.items():
+            assert trim_repetition_loop(text) == expected
+
+    def test_non_looping_speech_unchanged(self):
+        text = (
+            "Good morning everyone, thanks for joining, today we are going to "
+            "walk through the migration plan."
+        )
+        assert trim_repetition_loop(text) == text
+
+    def test_punctuation_insensitive_and_trailing_comma_stripped(self):
+        assert trim_repetition_loop("we will, we will, we will rock") == "we will"
+
+    def test_only_two_repeats_unchanged(self):
+        assert trim_repetition_loop("data data") == "data data"
 
 
 class TestDropNoSpeechRawSegments:

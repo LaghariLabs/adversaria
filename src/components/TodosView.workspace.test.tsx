@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -44,12 +44,64 @@ const workspace: WorkspaceSummary = {
 };
 
 describe("TodosView workspace menu", () => {
-  it("sends a triage item to the selected workspace", async () => {
+  it("shows four capability chips with the suggestion preselected", async () => {
+    const suggestionPayloads: unknown[] = [];
+    mockIPC((command, payload) => {
+      if (command === "get_action_items") return [actionItem];
+      if (command === "list_meeting_workspace_bindings") return [];
+      if (command === "list_workspaces") return [workspace];
+      if (command === "suggest_task_capability") {
+        suggestionPayloads.push(payload);
+        return "present";
+      }
+      return null;
+    });
+    const user = userEvent.setup();
+    render(
+      <TodosView
+        meetings={[pendingMeeting({ id: 12, title: "Client call" })]}
+        onOpenMeeting={vi.fn()}
+        scopeMeetingId={null}
+        onScopeChange={vi.fn()}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Workspace actions for Prepare proposal",
+      }),
+    );
+
+    const group = await screen.findByRole("group", {
+      name: "How should AI help",
+    });
+    const chips = within(group).getAllByRole("button");
+    expect(chips.map((chip) => chip.textContent)).toEqual([
+      "+ Research",
+      "+ Write",
+      "+ Visualize",
+      "+ Present",
+    ]);
+    for (const chip of chips) {
+      expect(chip.getAttribute("style")).not.toContain("dashed");
+    }
+    expect(screen.getByRole("button", { name: "+ Present" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByText("suggested")).toBeVisible();
+    expect(suggestionPayloads).toEqual([
+      { title: "Prepare proposal", details: "" },
+    ]);
+  });
+
+  it("sends the selected capability with a triage item", async () => {
     const taskPayloads: unknown[] = [];
     mockIPC((command, payload) => {
       if (command === "get_action_items") return [actionItem];
       if (command === "list_meeting_workspace_bindings") return [];
       if (command === "list_workspaces") return [workspace];
+      if (command === "suggest_task_capability") return "present";
       if (command === "create_workspace_task") {
         taskPayloads.push(payload);
         return null;
@@ -82,7 +134,57 @@ describe("TodosView workspace menu", () => {
           details: "",
           sourceMeetingId: 12,
           actionItemId: 9,
+          capability: "present",
         },
+      ]),
+    );
+  });
+
+  it("stages a workspace click until a capability is picked, then sends", async () => {
+    const taskPayloads: unknown[] = [];
+    mockIPC((command, payload) => {
+      if (command === "get_action_items") return [actionItem];
+      if (command === "list_meeting_workspace_bindings") return [];
+      if (command === "list_workspaces") return [workspace];
+      if (command === "suggest_task_capability") return null;
+      if (command === "create_workspace_task") {
+        taskPayloads.push(payload);
+        return null;
+      }
+      return null;
+    });
+    const user = userEvent.setup();
+    render(
+      <TodosView
+        meetings={[pendingMeeting({ id: 12, title: "Client call" })]}
+        onOpenMeeting={vi.fn()}
+        scopeMeetingId={null}
+        onScopeChange={vi.fn()}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Workspace actions for Prepare proposal",
+      }),
+    );
+
+    const row = await screen.findByRole("menuitem", { name: "Client launch" });
+    expect(row).toBeEnabled();
+    expect(screen.getByText("Pick how AI should help first")).toBeVisible();
+
+    // Clicking a workspace first stages the send instead of firing it.
+    await user.click(row);
+    expect(taskPayloads).toEqual([]);
+    expect(
+      screen.getByText("Pick how AI should help, then this sends to Client launch"),
+    ).toBeVisible();
+
+    // Picking a capability completes the staged send.
+    await user.click(screen.getByRole("button", { name: "+ Research" }));
+    await waitFor(() =>
+      expect(taskPayloads).toEqual([
+        expect.objectContaining({ workspaceId: 6, capability: "research" }),
       ]),
     );
   });

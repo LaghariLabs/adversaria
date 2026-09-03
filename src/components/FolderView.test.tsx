@@ -4,39 +4,29 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
 import { pendingMeeting } from "../test/fixtures";
-import type { ActionItem, ProjectOverview, WorkspaceSummary } from "../types";
-import { ProjectView } from "./ProjectView";
+import type { ActionItem, FolderOverview, FolderSummary } from "../types";
+import { FolderView } from "./FolderView";
 
 const tauriMocks = vi.hoisted(() => ({
   getActionItems: vi.fn(),
   setActionItemDone: vi.fn(),
-  setWorkspaceInstructions: vi.fn(),
+  setFolderInstructions: vi.fn(),
   setWorkspaceNetworkAllowed: vi.fn(),
-  getProjectOverview: vi.fn(),
+  getFolderOverview: vi.fn(),
 }));
 
 vi.mock("../lib/tauri", () => tauriMocks);
 
-const project: WorkspaceSummary = {
-  workspace: {
+const folder: FolderSummary = {
+  folder: {
     id: 4,
     name: "Launch planning",
-    engine: "local",
-    model: "",
-    network_allowed: false,
-    instructions: "Focus on launch risks.",
     color: "purple",
+    instructions: "Focus on launch risks.",
     created_at: "2026-08-17T10:00:00Z",
     updated_at: "2026-08-17T10:00:00Z",
   },
-  queued_task_count: 0,
-  needs_you_count: 0,
-  running_task_count: 0,
-  awaiting_review_count: 0,
-  approved_task_count: 0,
-  total_task_count: 0,
   meeting_count: 2,
-  folder_count: 0,
 };
 
 const meetings = [
@@ -73,11 +63,11 @@ function actionItem(overrides: Partial<ActionItem> = {}): ActionItem {
   };
 }
 
-function overviewFixture(overrides: Partial<ProjectOverview> = {}): ProjectOverview {
+function overviewFixture(overrides: Partial<FolderOverview> = {}): FolderOverview {
   return {
-    workspace_id: project.workspace.id,
+    folder_id: folder.folder.id,
     summary:
-      "This project is about launching the new product. It progressed from kickoff to design review. The current focus is finalizing messaging. The most important unresolved thread is pricing approval.",
+      "This folder is about launching the new product. It progressed from kickoff to design review. The current focus is finalizing messaging. The most important unresolved thread is pricing approval.",
     generated_at: "2026-08-20T12:00:00Z",
     source_meeting_count: meetings.length,
     stale: false,
@@ -85,15 +75,15 @@ function overviewFixture(overrides: Partial<ProjectOverview> = {}): ProjectOverv
   };
 }
 
-function renderProjectView(
-  overrides: Partial<ComponentProps<typeof ProjectView>> = {},
+function renderFolderView(
+  overrides: Partial<ComponentProps<typeof FolderView>> = {},
 ) {
   return render(
-    <ProjectView
-      project={project}
+    <FolderView
+      folder={folder}
       meetings={meetings}
       onOpenMeeting={vi.fn()}
-      onProjectUpdated={vi.fn()}
+      onFolderUpdated={vi.fn()}
       {...overrides}
     />,
   );
@@ -104,20 +94,20 @@ beforeEach(() => {
   tauriMocks.getActionItems.mockResolvedValue([]);
   tauriMocks.setActionItemDone.mockReset();
   tauriMocks.setActionItemDone.mockResolvedValue(undefined);
-  tauriMocks.setWorkspaceInstructions.mockReset();
-  tauriMocks.setWorkspaceInstructions.mockResolvedValue(undefined);
+  tauriMocks.setFolderInstructions.mockReset();
+  tauriMocks.setFolderInstructions.mockResolvedValue(undefined);
   tauriMocks.setWorkspaceNetworkAllowed.mockReset();
   tauriMocks.setWorkspaceNetworkAllowed.mockResolvedValue(undefined);
-  tauriMocks.getProjectOverview.mockReset();
+  tauriMocks.getFolderOverview.mockReset();
   // Default: return empty for zero? For meetings present, return ready overview.
-  tauriMocks.getProjectOverview.mockResolvedValue(overviewFixture());
+  tauriMocks.getFolderOverview.mockResolvedValue(overviewFixture());
 });
 
-describe("ProjectView", () => {
-  it("renders the project name, meeting rows, and knows-line counts", async () => {
+describe("FolderView", () => {
+  it("renders the folder name, meeting rows, and knows-line counts", async () => {
     tauriMocks.getActionItems.mockResolvedValue([actionItem()]);
 
-    renderProjectView();
+    renderFolderView();
 
     expect(screen.getByRole("heading", { name: "Launch planning" })).toBeVisible();
     expect(screen.getByText("Kickoff")).toBeVisible();
@@ -129,23 +119,23 @@ describe("ProjectView", () => {
 
   it("ready overview rendering and automatic initial load", async () => {
     const overview = overviewFixture();
-    tauriMocks.getProjectOverview.mockResolvedValue(overview);
+    tauriMocks.getFolderOverview.mockResolvedValue(overview);
 
-    renderProjectView();
+    renderFolderView();
 
-    // Automatic initial load calls getProjectOverview with refresh false.
+    // Automatic initial load calls getFolderOverview with refresh false.
     await waitFor(() =>
-      expect(tauriMocks.getProjectOverview).toHaveBeenCalledWith(
-        project.workspace.id,
+      expect(tauriMocks.getFolderOverview).toHaveBeenCalledWith(
+        folder.folder.id,
         false,
       ),
     );
 
-    expect(await screen.findByText(/This project is about launching/)).toBeVisible();
+    expect(await screen.findByText(/This folder is about launching/)).toBeVisible();
     // After de-duplication there is only one footer copy inside the timestamp line.
     expect(screen.getByText(/Generated with the Notes engine selected in Settings/)).toBeVisible();
     expect(screen.getByText(/No web browsing/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Refresh project overview" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh folder overview" })).toBeVisible();
   });
 
   it("deterministic attendee deduplication/count ordering and self filtering", async () => {
@@ -169,9 +159,9 @@ describe("ProjectView", () => {
         attendees: ["  ", "ME"],
       }),
     ];
-    renderProjectView({ meetings: dedupMeetings });
+    renderFolderView({ meetings: dedupMeetings });
 
-    await waitFor(() => expect(tauriMocks.getProjectOverview).toHaveBeenCalled());
+    await waitFor(() => expect(tauriMocks.getFolderOverview).toHaveBeenCalled());
 
     // Should show People across these meetings section
     expect(screen.getByText("People across these meetings")).toBeVisible();
@@ -205,119 +195,119 @@ describe("ProjectView", () => {
         attendees: ["Me", "You", "  "],
       }),
     ];
-    renderProjectView({ meetings: soloMeetings });
-    await waitFor(() => expect(tauriMocks.getProjectOverview).toHaveBeenCalled());
+    renderFolderView({ meetings: soloMeetings });
+    await waitFor(() => expect(tauriMocks.getFolderOverview).toHaveBeenCalled());
     expect(await screen.findByText("No other attendees identified yet.")).toBeVisible();
   });
 
   it("stale state plus Update calling refresh true", async () => {
     const staleOverview = overviewFixture({ stale: true });
-    tauriMocks.getProjectOverview.mockResolvedValueOnce(staleOverview);
+    tauriMocks.getFolderOverview.mockResolvedValueOnce(staleOverview);
     const refreshedOverview = overviewFixture({ stale: false, generated_at: "2026-08-21T10:00:00Z" });
-    tauriMocks.getProjectOverview.mockResolvedValueOnce(refreshedOverview);
+    tauriMocks.getFolderOverview.mockResolvedValueOnce(refreshedOverview);
 
     const user = userEvent.setup();
-    renderProjectView();
+    renderFolderView();
 
-    await waitFor(() => expect(tauriMocks.getProjectOverview).toHaveBeenCalledWith(project.workspace.id, false));
-    expect(await screen.findByText(/This project is about launching/)).toBeVisible();
+    await waitFor(() => expect(tauriMocks.getFolderOverview).toHaveBeenCalledWith(folder.folder.id, false));
+    expect(await screen.findByText(/This folder is about launching/)).toBeVisible();
     // Visible banner plus sr-only live region both contain the text – use getAllByText and check visible count
     expect(screen.getAllByText("New meeting context available").length).toBeGreaterThanOrEqual(1);
     // The visible banner is a span, not the sr-only div
-    const updateBtn = screen.getByRole("button", { name: "Update project overview" });
+    const updateBtn = screen.getByRole("button", { name: "Update folder overview" });
     expect(updateBtn).toBeVisible();
 
     await user.click(updateBtn);
 
     await waitFor(() =>
-      expect(tauriMocks.getProjectOverview).toHaveBeenCalledWith(project.workspace.id, true),
+      expect(tauriMocks.getFolderOverview).toHaveBeenCalledWith(folder.folder.id, true),
     );
     // After update, stale banner should disappear (mock second call returns stale false)
-    // sr-only will now say "Project overview ready", so no visible banner should remain
+    // sr-only will now say "Folder overview ready", so no visible banner should remain
     await waitFor(() => {
       // The visible banner is inside a span with specific style; sr-only is hidden but still in DOM.
       // After refresh, only sr-only remains with different text, so total count should be 1 (the sr-only now says ready) or 0 for visible.
       // Check that the Update button is gone and the banner text is not found in a visible span.
-      expect(screen.queryByRole("button", { name: "Update project overview" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Update folder overview" })).not.toBeInTheDocument();
     });
   });
 
   it("initial error with Retry", async () => {
-    tauriMocks.getProjectOverview.mockRejectedValueOnce(new Error("Notes engine down"));
+    tauriMocks.getFolderOverview.mockRejectedValueOnce(new Error("Notes engine down"));
     const retryOverview = overviewFixture();
-    tauriMocks.getProjectOverview.mockResolvedValueOnce(retryOverview);
+    tauriMocks.getFolderOverview.mockResolvedValueOnce(retryOverview);
 
     const user = userEvent.setup();
-    renderProjectView();
+    renderFolderView();
 
-    expect(await screen.findByText("Could not generate the project overview.")).toBeVisible();
+    expect(await screen.findByText("Could not generate the folder overview.")).toBeVisible();
     expect(screen.getByText(/Notes engine down/)).toBeVisible();
-    const retryBtn = screen.getByRole("button", { name: "Retry generating project overview" });
+    const retryBtn = screen.getByRole("button", { name: "Retry generating folder overview" });
     expect(retryBtn).toBeVisible();
 
     await user.click(retryBtn);
 
     await waitFor(() =>
-      expect(tauriMocks.getProjectOverview).toHaveBeenLastCalledWith(project.workspace.id, true),
+      expect(tauriMocks.getFolderOverview).toHaveBeenLastCalledWith(folder.folder.id, true),
     );
-    expect(await screen.findByText(/This project is about launching/)).toBeVisible();
+    expect(await screen.findByText(/This folder is about launching/)).toBeVisible();
   });
 
   it("existing overview retained when refresh fails", async () => {
     const initial = overviewFixture();
-    tauriMocks.getProjectOverview.mockResolvedValueOnce(initial);
-    renderProjectView();
+    tauriMocks.getFolderOverview.mockResolvedValueOnce(initial);
+    renderFolderView();
 
-    expect(await screen.findByText(/This project is about launching/)).toBeVisible();
+    expect(await screen.findByText(/This folder is about launching/)).toBeVisible();
 
     // Next refresh will fail
-    tauriMocks.getProjectOverview.mockRejectedValueOnce(new Error("Service unreachable"));
+    tauriMocks.getFolderOverview.mockRejectedValueOnce(new Error("Service unreachable"));
     const user = userEvent.setup();
-    const refreshBtn = screen.getByRole("button", { name: "Refresh project overview" });
+    const refreshBtn = screen.getByRole("button", { name: "Refresh folder overview" });
     await user.click(refreshBtn);
 
     await waitFor(() =>
-      expect(tauriMocks.getProjectOverview).toHaveBeenCalledWith(project.workspace.id, true),
+      expect(tauriMocks.getFolderOverview).toHaveBeenCalledWith(folder.folder.id, true),
     );
     // Prose still visible
-    expect(screen.getByText(/This project is about launching/)).toBeVisible();
+    expect(screen.getByText(/This folder is about launching/)).toBeVisible();
     // Inline error and Retry
     expect(await screen.findByText(/Service unreachable/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Retry generating project overview" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry generating folder overview" })).toBeVisible();
   });
 
   it("zero-meeting overview state without invoking generation refresh", async () => {
     const emptyMeetings: typeof meetings = [];
-    const emptyOverview: ProjectOverview = {
-      workspace_id: project.workspace.id,
+    const emptyOverview: FolderOverview = {
+      folder_id: folder.folder.id,
       summary: "",
       generated_at: "",
       source_meeting_count: 0,
       stale: false,
     };
-    tauriMocks.getProjectOverview.mockResolvedValue(emptyOverview);
+    tauriMocks.getFolderOverview.mockResolvedValue(emptyOverview);
 
-    renderProjectView({ meetings: emptyMeetings });
+    renderFolderView({ meetings: emptyMeetings });
 
     expect(
-      await screen.findByText(/No meetings filed yet\. File a meeting to this project/),
+      await screen.findByText(/No meetings filed yet\. File a meeting to this folder/),
     ).toBeVisible();
     expect(screen.getByText("No other attendees identified yet.")).toBeVisible();
-    // Should have called getProjectOverview once with false, not with true (no auto-refresh of empty)
-    await waitFor(() => expect(tauriMocks.getProjectOverview).toHaveBeenCalledWith(project.workspace.id, false));
-    expect(tauriMocks.getProjectOverview).not.toHaveBeenCalledWith(project.workspace.id, true);
+    // Should have called getFolderOverview once with false, not with true (no auto-refresh of empty)
+    await waitFor(() => expect(tauriMocks.getFolderOverview).toHaveBeenCalledWith(folder.folder.id, false));
+    expect(tauriMocks.getFolderOverview).not.toHaveBeenCalledWith(folder.folder.id, true);
     // No Refresh or Update button in zero state (or at least not the Update banner)
     expect(screen.queryByText("New meeting context available")).not.toBeInTheDocument();
   });
 
   it("saves edited standing instructions with new copy/layout", async () => {
-    const onProjectUpdated = vi.fn();
+    const onFolderUpdated = vi.fn();
     const user = userEvent.setup();
-    renderProjectView({ onProjectUpdated });
+    renderFolderView({ onFolderUpdated });
 
     // New copy checks
-    expect(screen.getByText("Rules and context used whenever AI summarizes this project or runs one of its workspace tasks.")).toBeVisible();
-    expect(screen.getByText("Saved on this device and applied across this project.")).toBeVisible();
+    expect(screen.getByText("Guides this folder's overview.")).toBeVisible();
+    expect(screen.getByText("Saved on this device and applied across this folder.")).toBeVisible();
     const textarea = screen.getByRole("textbox", { name: "Standing instructions" });
     expect(textarea).toHaveAttribute(
       "placeholder",
@@ -329,47 +319,28 @@ describe("ProjectView", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() =>
-      expect(tauriMocks.setWorkspaceInstructions).toHaveBeenCalledWith(
-        project.workspace.id,
+      expect(tauriMocks.setFolderInstructions).toHaveBeenCalledWith(
+        folder.folder.id,
         "Always include launch blockers.",
       ),
     );
-    expect(onProjectUpdated).toHaveBeenCalledTimes(1);
+    expect(onFolderUpdated).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Saved")).toBeVisible();
   });
 
-  it("web research switch still persists", async () => {
-    const user = userEvent.setup();
-    renderProjectView();
+  it("groups meetings and folder controls separately from action items", () => {
+    const { container } = renderFolderView();
+    const folderColumn = container.querySelector(".folder-view-primary");
+    const actionColumn = container.querySelector(".folder-view-secondary");
 
-    expect(screen.getByText("Web research")).toBeVisible();
-    expect(
-      screen.getByText(
-        "Controls whether workspace tasks may browse the web. Project overviews never browse. Meeting data follows the Notes engine selected in Settings.",
-      ),
-    ).toBeVisible();
-
-    await user.click(screen.getByRole("switch", { name: "Web research" }));
-
-    await waitFor(() =>
-      expect(tauriMocks.setWorkspaceNetworkAllowed).toHaveBeenCalledWith(project.workspace.id, true),
-    );
-  });
-
-  it("groups meetings and project controls separately from action items", () => {
-    const { container } = renderProjectView();
-    const projectColumn = container.querySelector(".project-view-primary");
-    const actionColumn = container.querySelector(".project-view-secondary");
-
-    expect(projectColumn).not.toBeNull();
+    expect(folderColumn).not.toBeNull();
     expect(actionColumn).not.toBeNull();
-    expect(projectColumn?.querySelector(".project-meetings-card")).not.toBeNull();
-    expect(projectColumn?.querySelector(".project-standing-card")).not.toBeNull();
-    expect(projectColumn?.querySelector(".project-webresearch-card")).not.toBeNull();
-    expect(projectColumn?.querySelector(".project-openitems-card")).toBeNull();
-    expect(actionColumn?.querySelector(".project-openitems-card")).not.toBeNull();
-    expect(actionColumn?.querySelector(".project-standing-card")).toBeNull();
-    expect(actionColumn?.querySelector(".project-webresearch-card")).toBeNull();
+    expect(folderColumn?.querySelector(".folder-meetings-card")).not.toBeNull();
+    expect(folderColumn?.querySelector(".folder-standing-card")).not.toBeNull();
+    expect(folderColumn?.querySelector(".folder-openitems-card")).toBeNull();
+    expect(actionColumn?.querySelector(".folder-openitems-card")).not.toBeNull();
+    expect(actionColumn?.querySelector(".folder-standing-card")).toBeNull();
+    expect(actionColumn?.querySelector(".folder-webresearch-card")).toBeNull();
   });
 
   it("shows only open action items and completes one from its checkbox", async () => {
@@ -379,7 +350,7 @@ describe("ProjectView", () => {
       actionItem({ id: 23, text: "Status done", status: "done" }),
     ]);
     const user = userEvent.setup();
-    renderProjectView();
+    renderFolderView();
 
     expect(await screen.findByText("Send recap")).toBeVisible();
     expect(screen.queryByText("Already done")).not.toBeInTheDocument();
@@ -395,13 +366,13 @@ describe("ProjectView", () => {
     const onOpenMeeting = vi.fn();
     const user = userEvent.setup();
 
-    renderProjectView({ onOpenMeeting });
+    renderFolderView({ onOpenMeeting });
 
     const source = await screen.findByRole("button", {
       name: "Open source meeting Kickoff",
     });
-    expect(source).toHaveClass("project-action-source");
-    expect(screen.getByText("Send recap")).toHaveClass("project-action-text");
+    expect(source).toHaveClass("folder-action-source");
+    expect(screen.getByText("Send recap")).toHaveClass("folder-action-text");
 
     await user.click(source);
     expect(onOpenMeeting).toHaveBeenCalledWith(meetings[0]);
@@ -410,40 +381,31 @@ describe("ProjectView", () => {
   it("opens a meeting from its row", async () => {
     const onOpenMeeting = vi.fn();
     const user = userEvent.setup();
-    renderProjectView({ onOpenMeeting });
+    renderFolderView({ onOpenMeeting });
 
     await user.click(screen.getByText("Kickoff"));
 
     expect(onOpenMeeting).toHaveBeenCalledWith(meetings[0]);
   });
 
-  it("only shows the Workspaces link when its callback is provided", () => {
-    const firstRender = renderProjectView();
-    expect(screen.queryByRole("button", { name: "Open in Workspaces" })).not.toBeInTheDocument();
-    firstRender.unmount();
-
-    renderProjectView({ onOpenWorkspaces: vi.fn() });
-    expect(screen.getByRole("button", { name: "Open in Workspaces" })).toBeVisible();
-  });
-
   it("shows ThinkingIndicator while generating initial overview", async () => {
     // Never-resolving promise to keep loading
-    let resolveOverview: (v: ProjectOverview) => void = () => {};
-    tauriMocks.getProjectOverview.mockImplementation(
+    let resolveOverview: (v: FolderOverview) => void = () => {};
+    tauriMocks.getFolderOverview.mockImplementation(
       () =>
-        new Promise<ProjectOverview>((resolve) => {
+        new Promise<FolderOverview>((resolve) => {
           resolveOverview = resolve;
         }),
     );
-    renderProjectView();
+    renderFolderView();
 
-    // ThinkingIndicator should appear (words cycle randomly, so match any of the project words)
+    // ThinkingIndicator should appear (words cycle randomly, so match any of the folder words)
     expect(
-      await screen.findByText(/Reading project meetings|Tracing how it progressed|Finding the current focus|Spotting unresolved/),
+      await screen.findByText(/Reading folder meetings|Tracing how it progressed|Finding the current focus|Spotting unresolved/),
     ).toBeVisible();
 
     // Resolve to finish loading
     resolveOverview(overviewFixture());
-    expect(await screen.findByText(/This project is about launching/)).toBeVisible();
+    expect(await screen.findByText(/This folder is about launching/)).toBeVisible();
   });
 });

@@ -518,6 +518,7 @@ describe("Welcome", () => {
       percent: 42,
       detail: "",
       serviceOnline: true,
+      liveCaptionsState: undefined,
       refresh: () => {},
       retry: () => {},
     };

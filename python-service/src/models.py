@@ -385,6 +385,10 @@ class LiveFeedRequest(BaseModel):
 
 class LiveFeedResponse(BaseModel):
     captions: list[str] = Field(default_factory=list)
+    partial: str = Field(
+        "",
+        description="Best-effort text for audio after the last confirmed utterance of this source (streaming preview; replaced each feed, empty when idle or when no streaming engine is available)",
+    )
 
 
 class AttendeeDetail(BaseModel):
@@ -443,3 +447,6 @@ class HealthResponse(BaseModel):
     transcriber_detail: str | None = None
     embedder_state: str | None = None
     embedder_detail: str | None = None
+    # English live-caption preview engine: missing | loading | ready | error
+    # (None from a service predating it).
+    live_captions_state: str | None = None

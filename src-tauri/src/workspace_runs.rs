@@ -41,6 +41,8 @@ pub fn compose_task_brief(
     vault_hits: &[ContextHit],
     project_hits: &[ContextHit],
     workspace_instructions: &str,
+    network_allowed: bool,
+    folder_excerpts: &[(String, String)],
 ) -> String {
     let mut brief = format!("# Task\n\n{}", task.title);
     if !task.details.trim().is_empty() {
@@ -61,6 +63,35 @@ pub fn compose_task_brief(
     if !workspace_instructions.trim().is_empty() {
         brief.push_str("\n\n# Project instructions\n\n");
         brief.push_str(workspace_instructions.trim());
+    }
+
+    let deliverable = match task.capability.as_str() {
+        "research" => Some(
+            "Produce a Markdown report. End with a Sources section listing everything you used.",
+        ),
+        "write" => Some(
+            "Produce the document as Markdown, or one self-contained HTML file when layout matters.",
+        ),
+        "visualize" => Some(
+            "Produce ONE self-contained HTML file embedding a semantic inline SVG diagram with real labels and no external assets. The SVG must stand alone when extracted.",
+        ),
+        "present" => Some(
+            "Produce the deck as ONE self-contained HTML file, one section element per slide, readable without a network.",
+        ),
+        _ => None,
+    };
+    if let Some(deliverable) = deliverable {
+        brief.push_str("\n\n# Deliverable\n\n");
+        brief.push_str(deliverable);
+    }
+
+    if network_allowed {
+        brief.push_str("\n\n# Network access\n\n");
+        brief.push_str(
+            "Network access is allowed for this task. You may fetch from the web. List\n",
+        );
+        brief.push_str("every URL you actually used at the end of your output under a \"Sources\n");
+        brief.push_str("fetched\" heading.");
     }
 
     if let Some(agent) = agent {
@@ -93,6 +124,16 @@ pub fn compose_task_brief(
             brief.push_str("`\n");
         }
         brief.pop();
+    }
+
+    if !folder_excerpts.is_empty() {
+        brief.push_str("\n\n# Attached folder contents (excerpts)");
+        for (folder, excerpt) in folder_excerpts {
+            brief.push_str("\n\n## ");
+            brief.push_str(folder);
+            brief.push_str("\n\n");
+            brief.push_str(excerpt);
+        }
     }
 
     brief.push_str("\n\n# Meeting context");
@@ -155,7 +196,200 @@ pub fn compose_task_brief(
         }
     }
 
+    brief.push_str("\n\n# Grounding rule\n\n");
+    if meetings.is_empty()
+        && related.is_empty()
+        && vault_hits.is_empty()
+        && project_hits.is_empty()
+        && folder_excerpts.is_empty()
+    {
+        brief.push_str(
+            "No meeting, vault, or project context was found for this task. Do NOT invent \
+             a premise: work only from the task text, state plainly that no source \
+             material was available, and list the open questions someone must answer.",
+        );
+    } else {
+        brief.push_str(
+            "Ground your work ONLY in the context above. If a detail is not in the \
+             context, say so or leave it as an open question instead of inventing \
+             facts, names, or premises.",
+        );
+    }
+
     brief
+}
+
+const FOLDER_EXCERPT_FILE_CHAR_CAP: usize = 4_000;
+const FOLDER_EXCERPT_FILE_SIZE_CAP: u64 = 512 * 1024;
+
+#[derive(Debug)]
+struct FolderExcerptCandidate {
+    priority: u8,
+    relative_path: String,
+    path: PathBuf,
+}
+
+fn folder_excerpt_priority(path: &Path, at_root: bool) -> Option<u8> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let lower_name = file_name.to_ascii_lowercase();
+    if at_root && lower_name.starts_with("readme") {
+        return Some(0);
+    }
+
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())?;
+    if extension == "md" {
+        return Some(if at_root { 1 } else { 2 });
+    }
+    if matches!(
+        extension.as_str(),
+        "rs" | "ts"
+            | "tsx"
+            | "py"
+            | "js"
+            | "go"
+            | "java"
+            | "swift"
+            | "kt"
+            | "toml"
+            | "json"
+            | "yaml"
+            | "yml"
+    ) {
+        return Some(3);
+    }
+    None
+}
+
+fn skipped_excerpt_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules" | "target" | "dist" | "build" | "__pycache__" | "venv" | ".git"
+        )
+}
+
+fn is_excerpt_candidate(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > FOLDER_EXCERPT_FILE_SIZE_CAP {
+        return false;
+    }
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = Vec::with_capacity(4_096);
+    if file.take(4_096).read_to_end(&mut prefix).is_err() {
+        return false;
+    }
+    !prefix.contains(&0)
+}
+
+fn collect_folder_excerpt_candidates(root: &Path) -> Vec<FolderExcerptCandidate> {
+    let mut candidates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return candidates;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(priority) = folder_excerpt_priority(&path, true) {
+                if is_excerpt_candidate(&path) {
+                    candidates.push(FolderExcerptCandidate {
+                        priority,
+                        relative_path: entry.file_name().to_string_lossy().into_owned(),
+                        path,
+                    });
+                }
+            }
+            continue;
+        }
+        if !path.is_dir() || skipped_excerpt_directory(&path) {
+            continue;
+        }
+
+        let Ok(children) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let child_path = child.path();
+            let Some(priority) = folder_excerpt_priority(&child_path, false) else {
+                continue;
+            };
+            if !is_excerpt_candidate(&child_path) {
+                continue;
+            }
+            let relative_path = child_path
+                .strip_prefix(root)
+                .unwrap_or(&child_path)
+                .to_string_lossy()
+                .into_owned();
+            candidates.push(FolderExcerptCandidate {
+                priority,
+                relative_path,
+                path: child_path,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates
+}
+
+/// Read a bounded, prioritized excerpt of a context folder for the brief.
+pub fn folder_excerpt(root: &Path, char_cap: usize) -> String {
+    let candidates = collect_folder_excerpt_candidates(root);
+    let candidate_count = candidates.len();
+    let root_name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let reserved_header = format!(
+        "# Folder: {root_name} - {candidate_count} files excerpted of {candidate_count} candidates"
+    );
+    let body_cap = char_cap.saturating_sub(reserved_header.chars().count());
+    let mut body = String::new();
+    let mut excerpted_count = 0;
+
+    for candidate in candidates {
+        let Ok(content) = std::fs::read_to_string(&candidate.path) else {
+            continue;
+        };
+        let content =
+            crate::project_overview::truncate_chars(&content, FOLDER_EXCERPT_FILE_CHAR_CAP);
+        let section_header = format!("\n\n## {}\n\n", candidate.relative_path);
+        let used = body.chars().count();
+        if used + section_header.chars().count() > body_cap {
+            break;
+        }
+        body.push_str(&section_header);
+        let remaining = body_cap.saturating_sub(body.chars().count());
+        let content_chars = content.chars().count();
+        body.push_str(&crate::project_overview::truncate_chars(
+            &content, remaining,
+        ));
+        excerpted_count += 1;
+        if content_chars > remaining {
+            break;
+        }
+    }
+
+    let header = format!(
+        "# Folder: {root_name} - {excerpted_count} files excerpted of {candidate_count} candidates"
+    );
+    format!("{header}{body}")
 }
 
 /// Write engine-native role and skill files into a workspace run directory.
@@ -241,6 +475,64 @@ const RESEARCH_DOMAIN_WORDS: &[&str] = &["research", "investigate", "compare", "
 const ARCHITECTURE_DOMAIN_WORDS: &[&str] = &["architecture", "design doc", "technical doc"];
 const MARKETING_DOMAIN_WORDS: &[&str] = &["copy", "marketing", "launch", "announcement", "landing"];
 const REVIEW_DOMAIN_WORDS: &[&str] = &["review", "critique", "feedback"];
+
+const CAPABILITY_KEYWORDS: &[(&str, &[&str])] = &[
+    (
+        "research",
+        &[
+            "research",
+            "investigate",
+            "compare",
+            "competitor",
+            "competitors",
+            "pricing",
+            "market",
+            "find out",
+            "evaluate",
+            "benchmark",
+        ],
+    ),
+    (
+        "write",
+        &[
+            "write", "draft", "doc", "document", "spec", "memo", "rfc", "proposal", "summary",
+            "brief",
+        ],
+    ),
+    (
+        "visualize",
+        &[
+            "diagram",
+            "architecture",
+            "chart",
+            "flow",
+            "flowchart",
+            "pipeline",
+            "graph",
+            "visualize",
+            "map",
+        ],
+    ),
+    (
+        "present",
+        &["slides", "deck", "presentation", "present", "keynote"],
+    ),
+];
+
+/// The optional installed-skill slugs that can upgrade each capability.
+pub fn adapter_slugs_for_capability(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "research" => &["deep-research"],
+        "write" => &[
+            "meeting-grounded-writing",
+            "architecture-doc",
+            "marketing-copy",
+        ],
+        "visualize" => &["drawio-diagram"],
+        "present" => &["slides-deck"],
+        _ => &[],
+    }
+}
 
 fn staffing_keywords(addon: &WorkspaceAddon) -> BTreeSet<String> {
     fn add_keyword(keywords: &mut BTreeSet<String>, word: &str) {
@@ -342,6 +634,84 @@ fn staffing_score(
     (score, reason)
 }
 
+fn staffing_inputs(title: &str, details: &str) -> (String, String, String) {
+    let lower_title = title.to_lowercase();
+    let lower_details = details.to_lowercase();
+    let title_words = normalized_staffing_words(&lower_title);
+    let bounded_title_words = format!(" {title_words} ");
+    (lower_title, lower_details, bounded_title_words)
+}
+
+/// Pick the strongest installed adapter for a capability, preserving catalog
+/// order when scores tie.
+pub fn best_adapter_for_capability<'a>(
+    title: &str,
+    details: &str,
+    capability: &str,
+    catalog: &'a [WorkspaceAddon],
+) -> Option<&'a WorkspaceAddon> {
+    let slugs = adapter_slugs_for_capability(capability);
+    let (lower_title, lower_details, bounded_title_words) = staffing_inputs(title, details);
+    let mut best: Option<(&WorkspaceAddon, u32)> = None;
+
+    for addon in catalog
+        .iter()
+        .filter(|addon| addon.kind == "skill" && slugs.contains(&addon.slug.as_str()))
+    {
+        let score = staffing_score(&lower_title, &lower_details, &bounded_title_words, addon).0;
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((addon, score));
+        }
+    }
+
+    best.map(|(addon, _)| addon)
+}
+
+fn capability_keyword_matches(value: &str, keyword: &str) -> bool {
+    let normalized_value = format!(" {} ", normalized_staffing_words(value));
+    let normalized_keyword = normalized_staffing_words(keyword);
+    // Tolerate simple plurals: "diagrams" must match the "diagram" keyword.
+    [
+        normalized_keyword.clone(),
+        format!("{normalized_keyword}s"),
+        format!("{normalized_keyword}es"),
+    ]
+    .iter()
+    .any(|form| normalized_value.contains(&format!(" {form} ")))
+}
+
+/// Suggest what the AI should do only when one capability clears the confidence
+/// floor and strictly beats every alternative.
+pub fn suggest_capability(title: &str, details: &str) -> Option<String> {
+    let lower_title = title.to_lowercase();
+    let lower_details = details.to_lowercase();
+    let mut scored = CAPABILITY_KEYWORDS
+        .iter()
+        .map(|(capability, keywords)| {
+            let score = keywords.iter().fold(0, |score, keyword| {
+                score
+                    + if capability_keyword_matches(&lower_title, keyword) {
+                        3
+                    } else if capability_keyword_matches(&lower_details, keyword) {
+                        1
+                    } else {
+                        0
+                    }
+            });
+            (*capability, score)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|item| std::cmp::Reverse(item.1));
+
+    let (best_capability, best_score) = scored[0];
+    let runner_up_score = scored[1].1;
+    if best_score >= 3 && best_score > runner_up_score {
+        Some(best_capability.to_string())
+    } else {
+        None
+    }
+}
+
 /// Choose an agent and up to `max_skills` skills from `catalog` for one task.
 /// Scores each addon by how well its slug/name/description matches the task's
 /// title and details. Returns empty staffing when nothing scores above zero.
@@ -357,10 +727,7 @@ pub fn suggest_staffing(
         reason: String,
     }
 
-    let lower_title = title.to_lowercase();
-    let lower_details = details.to_lowercase();
-    let title_words = normalized_staffing_words(&lower_title);
-    let bounded_title_words = format!(" {title_words} ");
+    let (lower_title, lower_details, bounded_title_words) = staffing_inputs(title, details);
     let mut agents = Vec::new();
     let mut skills = Vec::new();
 
@@ -428,6 +795,7 @@ pub fn context_receipt(
     project_hits: &[ContextHit],
     agent: Option<&WorkspaceAddon>,
     skills: &[WorkspaceAddon],
+    folder_excerpts_inlined: bool,
 ) -> String {
     let meeting_word = if meetings.len() == 1 {
         "meeting"
@@ -454,6 +822,9 @@ pub fn context_receipt(
         related.len(),
         folders.len()
     );
+    if folder_excerpts_inlined {
+        receipt.push_str(", folder excerpts inlined");
+    }
     if !sources.vault_path.is_empty() {
         let titles = if vault_hits.is_empty() {
             "none".to_string()
@@ -902,6 +1273,7 @@ mod tests {
             workspace_id: 2,
             title: "Write the launch memo".to_string(),
             details: "Cover decisions and next steps.".to_string(),
+            capability: String::new(),
             status: "queued".to_string(),
             source_meeting_id: None,
             source_meeting_title: String::new(),
@@ -1044,6 +1416,179 @@ mod tests {
 <mxCell id="2" value="A" style="rounded=1" vertex="1" parent="1"><mxGeometry x="0" y="0" width="160" height="60" as="geometry"/></mxCell>
 <mxCell id="3" value="writes" style="edgeStyle=orthogonalEdgeStyle" edge="1" parent="1" source="2" target="2"><mxGeometry relative="1" as="geometry"/></mxCell>
 </root></mxGraphModel></diagram></mxfile>"#
+    }
+
+    #[test]
+    fn empty_context_brief_forbids_invented_premises() {
+        let brief = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            4_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "",
+            false,
+            &[],
+        );
+        assert!(brief.contains("# Grounding rule"));
+        assert!(brief.contains("No meeting, vault, or project context was found"));
+        assert!(brief.contains("Do NOT invent"));
+    }
+
+    #[test]
+    fn task_brief_includes_folder_excerpt_section_only_when_provided() {
+        let folder_excerpts = vec![(
+            "/tmp/reference".to_string(),
+            "# Folder: reference - 1 files excerpted of 1 candidates\n\n## README.md\n\nProject overview."
+                .to_string(),
+        )];
+        let with_excerpt = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &["/tmp/reference".to_string()],
+            "/tmp/output",
+            4_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "",
+            false,
+            &folder_excerpts,
+        );
+        let without_excerpt = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &["/tmp/reference".to_string()],
+            "/tmp/output",
+            4_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "",
+            false,
+            &[],
+        );
+
+        assert!(with_excerpt.contains(
+            "# Attached folder contents (excerpts)\n\n## /tmp/reference\n\n# Folder: reference"
+        ));
+        assert!(!without_excerpt.contains("# Attached folder contents (excerpts)"));
+        assert!(!with_excerpt.contains("No meeting, vault, or project context was found"));
+    }
+
+    #[test]
+    fn folder_excerpt_prioritizes_root_readme() {
+        let dir = addon_temp_dir("folder-excerpt-priority");
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("notes.md"), "Root notes").unwrap();
+        std::fs::write(dir.join("README.MD"), "Read me first").unwrap();
+        std::fs::write(dir.join("docs/guide.md"), "Nested guide").unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+
+        let excerpt = folder_excerpt(&dir, 20_000);
+
+        assert!(excerpt.starts_with("# Folder:"));
+        let readme = excerpt.find("## README.MD").unwrap();
+        let root_markdown = excerpt.find("## notes.md").unwrap();
+        let nested_markdown = excerpt.find("## docs/guide.md").unwrap();
+        let source = excerpt.find("## main.rs").unwrap();
+        assert!(readme < root_markdown);
+        assert!(root_markdown < nested_markdown);
+        assert!(nested_markdown < source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_excerpt_respects_unicode_character_cap() {
+        let dir = addon_temp_dir("folder-excerpt-cap");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "é".repeat(5_000)).unwrap();
+
+        let excerpt = folder_excerpt(&dir, 180);
+
+        assert!(excerpt.chars().count() <= 180);
+        assert!(excerpt.contains("## README.md"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_excerpt_skips_node_modules() {
+        let dir = addon_temp_dir("folder-excerpt-node-modules");
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("visible.md"), "Visible").unwrap();
+        std::fs::write(dir.join("node_modules/hidden.md"), "Hidden dependency").unwrap();
+
+        let excerpt = folder_excerpt(&dir, 20_000);
+
+        assert!(excerpt.contains("## visible.md"));
+        assert!(!excerpt.contains("hidden.md"));
+        assert!(!excerpt.contains("Hidden dependency"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_excerpt_skips_binary_files() {
+        let dir = addon_temp_dir("folder-excerpt-binary");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("good.md"), "Readable text").unwrap();
+        std::fs::write(dir.join("binary.md"), b"binary\0payload").unwrap();
+
+        let excerpt = folder_excerpt(&dir, 20_000);
+
+        assert!(excerpt.contains("1 files excerpted of 1 candidates"));
+        assert!(excerpt.contains("## good.md"));
+        assert!(!excerpt.contains("binary.md"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plural_keywords_still_suggest() {
+        assert_eq!(
+            suggest_capability(
+                "Create full low-level and high-level diagrams for the MIQ project",
+                ""
+            )
+            .as_deref(),
+            Some("visualize")
+        );
+    }
+
+    #[test]
+    fn capabilities_map_to_their_optional_adapters() {
+        assert_eq!(adapter_slugs_for_capability("research"), &["deep-research"]);
+        assert_eq!(
+            adapter_slugs_for_capability("write"),
+            &[
+                "meeting-grounded-writing",
+                "architecture-doc",
+                "marketing-copy"
+            ]
+        );
+        assert_eq!(
+            adapter_slugs_for_capability("visualize"),
+            &["drawio-diagram"]
+        );
+        assert_eq!(adapter_slugs_for_capability("present"), &["slides-deck"]);
+        assert!(adapter_slugs_for_capability("unknown").is_empty());
+    }
+
+    #[test]
+    fn task_capability_suggestion_requires_a_unique_confident_match() {
+        assert_eq!(
+            suggest_capability("Diagram the auth flow", "").as_deref(),
+            Some("visualize")
+        );
+        assert_eq!(suggest_capability("call that guy back", ""), None);
+        assert_eq!(suggest_capability("prepare the client briefing", ""), None);
     }
 
     #[test]
@@ -1216,6 +1761,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
 
         assert!(brief.contains("Write the launch memo"));
@@ -1242,6 +1789,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(brief.contains("### Transcript\n\n1234567890\n[transcript truncated]"));
         assert!(!brief.contains("1234567890e"));
@@ -1261,6 +1810,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(!without_notes.contains("# Previous attempts were rejected because"));
 
@@ -1278,6 +1829,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(with_notes.contains(
             "# Previous attempts were rejected because\n\n- Too long\n- Cite the source"
@@ -1303,6 +1856,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(with_related.contains(
             "# Related meetings (from your meeting graph)\n\n## Pricing follow-up\n\nThe team agreed on the enterprise tier."
@@ -1321,6 +1876,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(without_related.contains("# Related meetings (from your meeting graph)\n\n(none)"));
     }
@@ -1354,6 +1911,8 @@ mod tests {
             &[vault],
             &[project],
             "",
+            false,
+            &[],
         );
 
         assert!(brief.contains(
@@ -1390,6 +1949,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
 
         assert!(brief.contains(
@@ -1417,6 +1978,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(!brief.contains("# Agent"));
         assert!(brief.contains("# Skills\n\n## Deep research\n\nShow confidence."));
@@ -1436,6 +1999,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(!brief.contains("# Agent"));
         assert!(!brief.contains("# Skills"));
@@ -1455,6 +2020,8 @@ mod tests {
             &[],
             &[],
             "Prioritize technical risks.",
+            false,
+            &[],
         );
         assert!(brief.contains("# Project instructions\n\nPrioritize technical risks."));
         // Must be before Agent/Skills and after rejection notes.
@@ -1471,10 +2038,76 @@ mod tests {
             &[],
             &[],
             "Keep decisions concise.",
+            false,
+            &[],
         );
         let instr_pos = with_agent.find("# Project instructions").unwrap();
         let agent_pos = with_agent.find("# Agent").unwrap();
         assert!(instr_pos < agent_pos);
+    }
+
+    #[test]
+    fn task_brief_includes_each_capability_deliverable_contract() {
+        let contracts = [
+            (
+                "research",
+                "Produce a Markdown report. End with a Sources section listing everything you used.",
+            ),
+            (
+                "write",
+                "Produce the document as Markdown, or one self-contained HTML file when layout matters.",
+            ),
+            (
+                "visualize",
+                "Produce ONE self-contained HTML file embedding a semantic inline SVG diagram with real labels and no external assets. The SVG must stand alone when extracted.",
+            ),
+            (
+                "present",
+                "Produce the deck as ONE self-contained HTML file, one section element per slide, readable without a network.",
+            ),
+        ];
+
+        for (capability, contract) in contracts {
+            let mut capability_task = task();
+            capability_task.capability = capability.to_string();
+            let brief = compose_task_brief(
+                &capability_task,
+                &[],
+                &[],
+                &[],
+                "/tmp/output",
+                20_000,
+                None,
+                &[],
+                &[],
+                &[],
+                "Keep decisions concise.",
+                false,
+                &[],
+            );
+            assert!(brief.contains(&format!("# Deliverable\n\n{contract}")));
+            assert!(
+                brief.find("# Project instructions").unwrap()
+                    < brief.find("# Deliverable").unwrap()
+            );
+        }
+
+        let brief = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "",
+            false,
+            &[],
+        );
+        assert!(!brief.contains("# Deliverable"));
     }
 
     #[test]
@@ -1491,6 +2124,8 @@ mod tests {
             &[],
             &[],
             "",
+            false,
+            &[],
         );
         assert!(!brief_empty.contains("# Project instructions"));
         let brief_whitespace = compose_task_brief(
@@ -1505,6 +2140,8 @@ mod tests {
             &[],
             &[],
             "   \n\t  ",
+            false,
+            &[],
         );
         assert!(!brief_whitespace.contains("# Project instructions"));
         // Trimming
@@ -1520,8 +2157,52 @@ mod tests {
             &[],
             &[],
             "  keep decisions concise  ",
+            false,
+            &[],
         );
         assert!(brief_trimmed.contains("# Project instructions\n\nkeep decisions concise"));
+    }
+
+    #[test]
+    fn task_brief_states_when_network_access_is_allowed() {
+        let allowed = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "Keep decisions concise.",
+            true,
+            &[],
+        );
+        let forbidden = compose_task_brief(
+            &task(),
+            &[],
+            &[],
+            &[],
+            "/tmp/output",
+            20_000,
+            None,
+            &[],
+            &[],
+            &[],
+            "Keep decisions concise.",
+            false,
+            &[],
+        );
+        let section = "# Network access\n\nNetwork access is allowed for this task. You may fetch from the web. List\nevery URL you actually used at the end of your output under a \"Sources\nfetched\" heading.";
+
+        assert!(allowed.contains(section));
+        assert!(!forbidden.contains("# Network access"));
+        assert!(
+            allowed.find("# Project instructions").unwrap()
+                < allowed.find("# Network access").unwrap()
+        );
     }
 
     #[test]
@@ -1578,7 +2259,7 @@ mod tests {
     fn context_receipt_handles_zero_one_and_many_sources() {
         let sources_off = crate::types::ContextSources::default();
         assert_eq!(
-            context_receipt(&[], &[], &[], &sources_off, &[], &[], None, &[]),
+            context_receipt(&[], &[], &[], &sources_off, &[], &[], None, &[], false),
             "Context: 0 bound meetings · 0 related via graph (none) · 0 folders"
         );
 
@@ -1595,9 +2276,10 @@ mod tests {
                 &[],
                 &[],
                 None,
-                &[]
+                &[],
+                true,
             ),
-            "Context: 1 bound meeting · 1 related via graph (Pricing follow-up [text match]) · 1 folder"
+            "Context: 1 bound meeting · 1 related via graph (Pricing follow-up [text match]) · 1 folder, folder excerpts inlined"
         );
 
         let mut related_two_meeting = meeting(String::new());
@@ -1612,7 +2294,8 @@ mod tests {
                 &[],
                 &[],
                 None,
-                &[]
+                &[],
+                false,
             ),
             "Context: 2 bound meetings · 2 related via graph (Pricing follow-up [text match], Launch retrospective [0.71]) · 2 folders"
         );
@@ -1631,7 +2314,8 @@ mod tests {
                 &[],
                 &[],
                 Some(&agent),
-                &skills
+                &skills,
+                false,
             ),
             "Context: 0 bound meetings · 0 related via graph (none) · 0 folders · agent: Researcher · skills: Citations, Brief"
         );
@@ -1656,7 +2340,8 @@ mod tests {
                 &vault_hits,
                 &[],
                 None,
-                &[]
+                &[],
+                false,
             ),
             "Context: 0 bound meetings · 0 related via graph (none) · 0 folders · vault: 1 (MIQ [text match]) · projects: 0 (none)"
         );

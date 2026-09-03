@@ -30,8 +30,12 @@ const TRANSCRIBER_LOADING: &str = "The transcription engine is still starting up
 /// Anything else that went wrong while transcribing.
 const TRANSCRIBE_FAILED: &str =
     "Transcription didn't finish. Your recording is saved — try again in a moment.";
+const TRANSCRIBE_TIMEOUT: &str = "The transcription service did not respond within 30 minutes. \
+     The request was abandoned so the queue can continue; the recording is kept for retry.";
 /// The notes (summarization) engine could not be reached or used.
 const NOTES_UNREACHABLE: &str = "The notes model isn't reachable. Check Settings → Notes.";
+const NOTES_TIMEOUT: &str = "The notes service did not respond within 10 minutes. The request was \
+     abandoned; the recording and transcript are kept for retry.";
 /// A grounded question couldn't be answered because the notes engine is down.
 const ANSWER_UNREACHABLE: &str =
     "That question couldn't be answered — the notes model isn't reachable. \
@@ -270,6 +274,15 @@ pub struct SummarizeParams {
     pub meeting_date: Option<String>,
 }
 
+/// One `/live_feed` reply: finished utterances plus the streaming preview
+/// of what is being said right now (empty when idle or unsupported).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct LiveFeedResult {
+    pub captions: Vec<String>,
+    #[serde(default)]
+    pub partial: String,
+}
+
 /// Typed client for the Python ML service running on localhost.
 pub struct HttpClient {
     client: reqwest::Client,
@@ -297,9 +310,16 @@ impl HttpClient {
         let resp = self
             .client
             .get(format!("{}/health", base_url))
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|_| SERVICE_DOWN.to_string())?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "The local AI service did not respond within 5 seconds.".to_string()
+                } else {
+                    SERVICE_DOWN.to_string()
+                }
+            })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -323,9 +343,16 @@ impl HttpClient {
             .client
             .post(format!("{}/transcribe", base_url))
             .json(&params)
+            .timeout(std::time::Duration::from_secs(30 * 60))
             .send()
             .await
-            .map_err(|_| SERVICE_DOWN.to_string())?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    TRANSCRIBE_TIMEOUT.to_string()
+                } else {
+                    SERVICE_DOWN.to_string()
+                }
+            })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -353,9 +380,16 @@ impl HttpClient {
                 audio_path: audio_path.to_string(),
                 single_file: true,
             })
+            .timeout(std::time::Duration::from_secs(30 * 60))
             .send()
             .await
-            .map_err(|_| SERVICE_DOWN.to_string())?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    TRANSCRIBE_TIMEOUT.to_string()
+                } else {
+                    SERVICE_DOWN.to_string()
+                }
+            })?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(transcribe_error(&body));
@@ -540,23 +574,19 @@ impl HttpClient {
     }
 
     /// Feed a delta of new recording audio to the VAD-gated live-caption
-    /// session; returns captions for utterances that just finished (usually
-    /// empty). Best-effort — errors surface as an empty list at the caller.
+    /// session; returns finished utterances plus the current streaming preview.
+    /// Best-effort — non-2xx and parse failures return an empty result.
     pub async fn live_feed(
         &self,
         audio_path: &str,
         session: u64,
         source: &str,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<LiveFeedResult, String> {
         #[derive(serde::Serialize)]
         struct FeedRequest {
             audio_path: String,
             session: u64,
             source: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct FeedResp {
-            captions: Vec<String>,
         }
 
         let base_url = self.base_url.read().unwrap().clone();
@@ -573,11 +603,11 @@ impl HttpClient {
             .map_err(|e| format!("Live feed request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Ok(Vec::new());
+            return Ok(LiveFeedResult::default());
         }
-        match resp.json::<FeedResp>().await {
-            Ok(parsed) => Ok(parsed.captions),
-            Err(_) => Ok(Vec::new()),
+        match resp.json::<LiveFeedResult>().await {
+            Ok(parsed) => Ok(parsed),
+            Err(_) => Ok(LiveFeedResult::default()),
         }
     }
 
@@ -589,9 +619,16 @@ impl HttpClient {
             .client
             .post(format!("{}/summarize", base_url))
             .json(&params)
+            .timeout(std::time::Duration::from_secs(10 * 60))
             .send()
             .await
-            .map_err(|_| SERVICE_DOWN.to_string())?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    NOTES_TIMEOUT.to_string()
+                } else {
+                    SERVICE_DOWN.to_string()
+                }
+            })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();

@@ -5,19 +5,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import { pendingMeeting } from "../test/fixtures";
-import type { WorkspaceSummary } from "../types";
+import type { FolderSummary } from "../types";
 import { MeetingsList } from "./MeetingsList";
 
 const tauriMocks = vi.hoisted(() => ({
-  suggestWorkspaceForMeeting: vi.fn(),
+  suggestFolderForMeeting: vi.fn(),
   updateMeetingTags: vi.fn(),
 }));
 
 vi.mock("../lib/tauri", () => tauriMocks);
 
 beforeEach(() => {
-  tauriMocks.suggestWorkspaceForMeeting.mockReset();
-  tauriMocks.suggestWorkspaceForMeeting.mockResolvedValue(null);
+  tauriMocks.suggestFolderForMeeting.mockReset();
+  tauriMocks.suggestFolderForMeeting.mockResolvedValue(null);
   tauriMocks.updateMeetingTags.mockReset();
 });
 
@@ -29,6 +29,7 @@ const setup = (
   percent,
   detail: "",
   serviceOnline: true,
+  liveCaptionsState: undefined,
   refresh: vi.fn(),
   retry: vi.fn(),
 });
@@ -47,27 +48,17 @@ function renderList(
   );
 }
 
-function project(id: number, name: string, color: string): WorkspaceSummary {
+function folder(id: number, name: string, color: string): FolderSummary {
   return {
-    workspace: {
+    folder: {
       id,
       name,
-      engine: "local",
-      model: "",
-      network_allowed: false,
-      instructions: "",
       color,
+      instructions: "",
       created_at: "2026-08-17T10:00:00Z",
       updated_at: "2026-08-17T10:00:00Z",
     },
-    queued_task_count: 0,
-    needs_you_count: 0,
-    running_task_count: 0,
-    awaiting_review_count: 0,
-    approved_task_count: 0,
-    total_task_count: 0,
     meeting_count: 0,
-    folder_count: 0,
   };
 }
 
@@ -101,41 +92,41 @@ describe("MeetingsList transcription badge", () => {
   });
 });
 
-describe("MeetingsList projects", () => {
-  const alpha = project(4, "Alpha", "purple");
-  const beta = project(5, "Beta", "green");
+describe("MeetingsList folders", () => {
+  const alpha = folder(4, "Alpha", "purple");
+  const beta = folder(5, "Beta", "green");
   const boundMeeting = pendingMeeting({ id: 41, title: "Bound meeting" });
   const unboundMeeting = pendingMeeting({ id: 42, title: "Unbound meeting" });
-  const binding = {
+  const meetingFolder = {
     meeting_id: boundMeeting.id,
-    workspace_id: alpha.workspace.id,
-    workspace_name: alpha.workspace.name,
+    folder_id: alpha.folder.id,
+    folder_name: alpha.folder.name,
   };
 
-  it("shows projects and excludes bound meetings from date bins", () => {
+  it("shows folders and excludes bound meetings from date bins", () => {
     render(
       <MeetingsList
         meetings={[boundMeeting, unboundMeeting]}
-        projects={[beta, alpha]}
-        bindings={[binding]}
+        folders={[beta, alpha]}
+        meetingFolders={[meetingFolder]}
         onSelect={vi.fn()}
       />,
     );
 
-    expect(screen.getByText("Projects")).toBeVisible();
+    expect(screen.getByText("Folders")).toBeVisible();
     expect(screen.getByText("Alpha")).toBeVisible();
     expect(screen.getByText("Beta")).toBeVisible();
     expect(screen.queryByText("Bound meeting")).not.toBeInTheDocument();
     expect(screen.getByText("Unbound meeting")).toBeVisible();
   });
 
-  it("shows a project's bound meeting when expanded", async () => {
+  it("shows a folder's bound meeting when expanded", async () => {
     const user = userEvent.setup();
     render(
       <MeetingsList
         meetings={[boundMeeting, unboundMeeting]}
-        projects={[alpha, beta]}
-        bindings={[binding]}
+        folders={[alpha, beta]}
+        meetingFolders={[meetingFolder]}
         onSelect={vi.fn()}
       />,
     );
@@ -144,97 +135,97 @@ describe("MeetingsList projects", () => {
     expect(screen.getByText("Bound meeting")).toBeVisible();
   });
 
-  it("selects a project from its row while the chevron only expands it", async () => {
-    const onSelectProject = vi.fn();
+  it("selects a folder from its row while the chevron only expands it", async () => {
+    const onSelectFolder = vi.fn();
     const user = userEvent.setup();
     render(
       <MeetingsList
         meetings={[boundMeeting, unboundMeeting]}
-        projects={[alpha, beta]}
-        bindings={[binding]}
+        folders={[alpha, beta]}
+        meetingFolders={[meetingFolder]}
         onSelect={vi.fn()}
-        onSelectProject={onSelectProject}
+        onSelectFolder={onSelectFolder}
       />,
     );
 
     const alphaRow = screen.getByText("Alpha").closest('[role="button"]');
     if (!(alphaRow instanceof HTMLElement)) {
-      throw new Error("Alpha project row not found");
+      throw new Error("Alpha folder row not found");
     }
     await user.click(
-      within(alphaRow).getByRole("button", { name: "Toggle project meetings" }),
+      within(alphaRow).getByRole("button", { name: "Toggle folder meetings" }),
     );
     expect(screen.getByText("Bound meeting")).toBeVisible();
-    expect(onSelectProject).not.toHaveBeenCalled();
+    expect(onSelectFolder).not.toHaveBeenCalled();
 
     await user.click(alphaRow);
-    expect(onSelectProject).toHaveBeenCalledWith(alpha.workspace.id);
+    expect(onSelectFolder).toHaveBeenCalledWith(alpha.folder.id);
   });
 
   it("assigns an unbound meeting from the row menu", async () => {
-    const onAssignToProject = vi.fn();
+    const onAssignToFolder = vi.fn();
     const user = userEvent.setup();
     render(
       <MeetingsList
         meetings={[unboundMeeting]}
-        projects={[alpha, beta]}
-        bindings={[]}
+        folders={[alpha, beta]}
+        meetingFolders={[]}
         onSelect={vi.fn()}
-        onAssignToProject={onAssignToProject}
-        onCreateProject={vi.fn().mockResolvedValue(null)}
+        onAssignToFolder={onAssignToFolder}
+        onCreateFolder={vi.fn().mockResolvedValue(null)}
       />,
     );
 
     await user.click(screen.getByRole("button", { name: "Meeting actions" }));
-    const menuLabel = await screen.findByText("Move to project");
+    const menuLabel = await screen.findByText("Move to folder");
     const menu = menuLabel.parentElement;
-    if (!menu) throw new Error("Project menu not found");
+    if (!menu) throw new Error("Folder menu not found");
     expect(within(menu).getByRole("button", { name: "Alpha" })).toBeVisible();
     expect(within(menu).getByRole("button", { name: "Beta" })).toBeVisible();
     await user.click(within(menu).getByRole("button", { name: "Beta" }));
 
-    expect(onAssignToProject).toHaveBeenCalledWith(unboundMeeting, beta.workspace.id);
+    expect(onAssignToFolder).toHaveBeenCalledWith(unboundMeeting, beta.folder.id);
   });
 
-  it("creates a project from the Projects cap with the default blue color", async () => {
-    const onCreateProject = vi.fn().mockResolvedValue(8);
+  it("creates a folder from the Folders cap with the default blue color", async () => {
+    const onCreateFolder = vi.fn().mockResolvedValue(8);
     const user = userEvent.setup();
     render(
       <MeetingsList
         meetings={[unboundMeeting]}
-        projects={[]}
-        bindings={[]}
+        folders={[]}
+        meetingFolders={[]}
         onSelect={vi.fn()}
-        onCreateProject={onCreateProject}
+        onCreateFolder={onCreateFolder}
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "New project" }));
-    await user.type(screen.getByPlaceholderText("Project name"), "Launch plan");
+    await user.click(screen.getByRole("button", { name: "New folder" }));
+    await user.type(screen.getByPlaceholderText("Folder name"), "Launch plan");
     await user.click(screen.getByRole("button", { name: "Create" }));
 
-    expect(onCreateProject).toHaveBeenCalledWith("Launch plan", "blue");
+    expect(onCreateFolder).toHaveBeenCalledWith("Launch plan", "blue");
   });
 
-  it("opens a project actions menu and requests deletion", async () => {
-    const onDeleteProject = vi.fn();
+  it("opens a folder actions menu and requests deletion", async () => {
+    const onDeleteFolder = vi.fn();
     const user = userEvent.setup();
     render(
       <MeetingsList
         meetings={[]}
-        projects={[alpha, beta]}
-        bindings={[]}
+        folders={[alpha, beta]}
+        meetingFolders={[]}
         onSelect={vi.fn()}
-        onDeleteProject={onDeleteProject}
+        onDeleteFolder={onDeleteFolder}
       />,
     );
 
     await user.click(
-      screen.getByRole("button", { name: "Actions for project Alpha" }),
+      screen.getByRole("button", { name: "Actions for folder Alpha" }),
     );
-    await user.click(screen.getByRole("menuitem", { name: "Delete project" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete folder" }));
 
-    expect(onDeleteProject).toHaveBeenCalledWith(alpha.workspace.id);
-    expect(onDeleteProject).toHaveBeenCalledTimes(1);
+    expect(onDeleteFolder).toHaveBeenCalledWith(alpha.folder.id);
+    expect(onDeleteFolder).toHaveBeenCalledTimes(1);
   });
 });

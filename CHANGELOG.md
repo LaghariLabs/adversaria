@@ -5,6 +5,40 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.83] - 2026-09-02
+
+### Added
+- **Live captions preview.** While you speak, grey English words appear within
+  about half a second and revise as you go; at each pause the confirmed Whisper
+  caption replaces them. Runs fully on-device on a 44 MB Moonshine model
+  (sherpa-onnx) that downloads once on first launch; Settings → Transcription
+  gains a "Live captions preview" row with download progress and status. The
+  preview is English-only for now; other languages keep the confirmed captions.
+- **Related meetings.** The Summary tab of a note lists up to three related
+  past meetings with the reason they match; click one to open it.
+- **Done view in To-dos.** A Done chip next to search flips the board into a
+  done-only list, newest first, with the source meeting and completion date;
+  unchecking an item reopens it.
+
+### Changed
+- **Folders replace Projects in the Meetings tab.** The sidebar section is now
+  Folders; filing, drag-to-file, colours, standing instructions, and the AI
+  overview carry over. Existing projects are migrated into folders once,
+  automatically, on first launch. The web-research switch is no longer shown
+  on the folder screen (it only affected development-only workspace runs).
+
+### Fixed
+- **A hung transcription no longer wedges the background queue.** Requests to
+  the local service now carry per-request timeouts (health 5 s, transcribe
+  30 min, summarize 10 min) and the queue has a 45-minute watchdog that fails
+  the stuck job and moves on.
+
+### Added (dev-gated: visible only in development builds)
+- Workspace rebuild: capability chips (Research / Write / Visualize / Present),
+  two-pane project screen with a drafted-task grounding preview, compact task
+  rows, run reports, network-access statement in briefs, attached-folder
+  excerpts in local briefs, source-meeting grounding for pushed to-dos.
+
 ## [0.3.82] - 2026-08-30
 
 ### Added
