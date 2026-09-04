@@ -9,6 +9,7 @@ interface RecordingCompanionProps {
   onChange: (v: string) => void;
   status: RecordingStatus;
   liveLines: { text: string; source: string }[];
+  livePartials?: { me: string; them: string };
   attachments: AttachmentDraft[];
   onAddAttachment: (attachment: AttachmentDraft) => void;
   onRemoveAttachment: (index: number) => void;
@@ -35,6 +36,7 @@ export function RecordingCompanion({
   onChange,
   status,
   liveLines,
+  livePartials = { me: "", them: "" },
   attachments,
   onAddAttachment,
   onRemoveAttachment,
@@ -128,7 +130,7 @@ export function RecordingCompanion({
     const feed = feedRef.current;
     if (!feed || !stuckRef.current) return;
     feed.scrollTop = feed.scrollHeight;
-  }, [liveLines]);
+  }, [liveLines, livePartials]);
 
   const jumpToLatest = () => {
     const feed = feedRef.current;
@@ -141,6 +143,9 @@ export function RecordingCompanion({
   // ---- render helpers ----
 
   const lines = liveLines.filter((l) => l.text.trim() !== "");
+  const partials = (["them", "me"] as const)
+    .filter((s) => livePartials[s].trim() !== "")
+    .map((s) => ({ source: s, text: livePartials[s] }));
 
   return (
     <div className="companion-layout">
@@ -210,20 +215,31 @@ export function RecordingCompanion({
             ref={feedRef}
             onScroll={handleFeedScroll}
           >
-            {lines.length === 0 ? (
+            {lines.length === 0 && partials.length === 0 ? (
               <p className="companion-feed-empty">Listening…</p>
             ) : (
-              lines.map((line, i) => (
-                <p
-                  key={i}
-                  dir="auto"
-                  className={`companion-feed-line ${line.source === "me" ? "me" : "them"}${
-                    i === lines.length - 1 ? " now" : ""
-                  }`}
-                >
-                  {line.text}
-                </p>
-              ))
+              <>
+                {lines.map((line, i) => (
+                  <p
+                    key={i}
+                    dir="auto"
+                    className={`companion-feed-line ${line.source === "me" ? "me" : "them"}${
+                      i === lines.length - 1 ? " now" : ""
+                    }`}
+                  >
+                    {line.text}
+                  </p>
+                ))}
+                {partials.map((p) => (
+                  <p
+                    key={`partial-${p.source}`}
+                    dir="auto"
+                    className={`companion-feed-line partial ${p.source}`}
+                  >
+                    {p.text}
+                  </p>
+                ))}
+              </>
             )}
           </div>
           {!stuck && lines.length > 0 && (

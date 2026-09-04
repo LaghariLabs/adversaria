@@ -34,6 +34,7 @@ export interface TemplateInfo {
 /** On-device transcription engine state, reported by `/health` (SPEC V3). */
 export type TranscriberState = "loading" | "ready" | "missing" | "error";
 export type EmbedderState = "ready" | "missing" | "unavailable";
+export type LiveCaptionsState = "loading" | "ready" | "missing" | "error";
 
 export interface HealthResponse {
   status: string;
@@ -47,6 +48,8 @@ export interface HealthResponse {
   embedder_state?: EmbedderState;
   /** Human sentence explaining the semantic-search state. */
   embedder_detail?: string | null;
+  /** English live-caption preview engine; absent on older service builds. */
+  live_captions_state?: LiveCaptionsState;
 }
 
 // ---- Meeting (stored in SQLite, exposed via IPC) ----
@@ -541,6 +544,37 @@ export interface ContextIndexStatus {
   last_synced_at: string;
 }
 
+/** A user-defined collection used only to organize meetings. */
+export interface Folder {
+  id: number;
+  name: string;
+  color: string;
+  instructions: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A folder plus its number of explicitly filed meetings. */
+export interface FolderSummary {
+  folder: Folder;
+  meeting_count: number;
+}
+
+/** Which folder contains a meeting. `folder_id === null` means explicitly unfiled. */
+export interface MeetingFolder {
+  meeting_id: number;
+  folder_id: number | null;
+  folder_name: string;
+}
+
+/** The folder proposed for a meeting, with the evidence. */
+export interface FolderSuggestion {
+  folder_id: number;
+  folder_name: string;
+  related_meeting_count: number;
+  shared_attendee_count: number;
+}
+
 /** A long-lived project container for meeting work. */
 export interface Workspace {
   id: number;
@@ -582,6 +616,15 @@ export interface WorkspaceSuggestion {
   shared_attendee_count: number;
 }
 
+/** What would ground a drafted task, shown before it runs. */
+export interface TaskGroundingPreview {
+  related_meeting_count: number;
+  latest_related_title: string;
+  vault_hit_count: number;
+  top_vault_label: string;
+  project_hit_count: number;
+}
+
 /** One meeting, folder, or file made available to a workspace. */
 export interface WorkspaceContextItem {
   id: number;
@@ -598,6 +641,7 @@ export interface WorkspaceTask {
   workspace_id: number;
   title: string;
   details: string;
+  capability: string;
   status: string;
   source_meeting_id: number | null;
   /** Resolved at read time; empty when the task has no source meeting. */
@@ -620,7 +664,7 @@ export interface TaskStaffing {
   mode: string;
   agent_id: number | null;
   skill_ids: number[];
-  /** Human-readable explanation, empty for manual. */
+  /** Selection explanation or a machine-readable baseline capability. */
   reason: string;
   resolved_at: string;
 }
@@ -633,6 +677,7 @@ export interface WorkspaceRun {
   engine: string;
   status: string;
   log: string;
+  report: string;
   error: string;
   started_at: string;
   finished_at: string;
@@ -686,4 +731,20 @@ export interface ProjectOverview {
   generated_at: string;
   source_meeting_count: number;
   stale: boolean;
+}
+
+export interface FolderOverview {
+  folder_id: number;
+  summary: string;
+  generated_at: string;
+  source_meeting_count: number;
+  stale: boolean;
+}
+
+/** A related meeting surfaced under a note, with the reason it matched. */
+export interface RelatedMeetingRef {
+  meeting_id: number;
+  title: string;
+  recorded_at: string;
+  reason: string;
 }

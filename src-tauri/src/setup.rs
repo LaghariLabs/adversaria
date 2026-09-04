@@ -115,7 +115,11 @@ pub fn downloadable_profile(profile_id: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
     }
-    profile_alias(profile_id).is_some() || matches!(profile_id, "whisper-main" | "whisper-live")
+    profile_alias(profile_id).is_some()
+        || matches!(
+            profile_id,
+            "whisper-main" | "whisper-live" | "live-captions-en"
+        )
 }
 
 pub(crate) fn cache_root() -> Option<PathBuf> {
@@ -924,6 +928,7 @@ mod tests {
     fn whisper_models_are_downloadable_profiles() {
         assert!(downloadable_profile("whisper-main"));
         assert!(downloadable_profile("whisper-live"));
+        assert!(downloadable_profile("live-captions-en"));
         assert!(downloadable_profile("qwen-9b-balanced"));
         assert!(!downloadable_profile("unknown"));
     }

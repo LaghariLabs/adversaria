@@ -39,6 +39,36 @@ describe("RecordingCompanion", () => {
     expect(screen.getByText("I will review it tomorrow.")).toHaveClass("them");
   });
 
+  it("renders the streaming partial after confirmed lines", () => {
+    const { container } = render(
+      <RecordingCompanion
+        {...defaultProps}
+        liveLines={[{ text: "We shipped it.", source: "them" }]}
+        livePartials={{ me: "and I think we", them: "" }}
+      />,
+    );
+
+    expect(screen.getByText("and I think we")).toHaveClass("partial", "me");
+    expect(
+      Array.from(container.querySelectorAll(".companion-feed-line")).map(
+        (line) => line.textContent,
+      ),
+    ).toEqual(["We shipped it.", "and I think we"]);
+  });
+
+  it("shows the partial instead of Listening… when nothing is confirmed yet", () => {
+    render(
+      <RecordingCompanion
+        {...defaultProps}
+        liveLines={[]}
+        livePartials={{ me: "", them: "hello every" }}
+      />,
+    );
+
+    expect(screen.queryByText("Listening…")).toBeNull();
+    expect(screen.getByText("hello every")).toBeInTheDocument();
+  });
+
   it("calls onChange when typing balanced notes", async () => {
     const onChange = vi.fn();
     const user = userEvent.setup();

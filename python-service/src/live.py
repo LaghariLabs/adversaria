@@ -12,6 +12,12 @@ VAD constants follow Meetily's field-tuned values (MIT, verified 2026-07-06:
 ``frontend/src-tauri/src/audio/vad.rs`` — positive 0.5 / negative 0.35 /
 redemption 2000 ms / min speech 250 ms / pad ~300 ms), which their comments
 document as the fix for fragmented sentences.
+
+Preview tier (2026-09-01): while an utterance is still being spoken, the
+not-yet-confirmed audio tail is re-decoded every poll by
+``MoonshinePartialEngine`` (sherpa-onnx Moonshine v2 tiny, English) and shown
+grey; the confirmed Whisper caption replaces it. The engine never holds the
+Whisper lock.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
+import threading
 import wave
 from pathlib import Path
 
@@ -62,6 +69,39 @@ def is_repetition_loop(text: str) -> bool:
     return len(set(tokens)) <= 2
 
 
+def _loop_token(token: str) -> str:
+    """Comparison form of a token for loop detection: case- and punctuation-insensitive."""
+    return re.sub(r"[^\w]", "", token, flags=re.UNICODE).lower()
+
+
+def trim_repetition_loop(text: str, max_ngram: int = 4, min_repeats: int = 3) -> str:
+    """Cut a PREVIEW at the point where the decoder started looping.
+
+    Re-decoding a short, mid-word audio tail makes Moonshine repeat a token or
+    phrase ("the data base to the data base to …"). `is_repetition_loop` only
+    catches whole-caption loops; this keeps the sane prefix, keeps ONE copy of
+    the looped unit, and drops the rest. Pure and cheap: for each position it
+    checks 1..max_ngram-word units for min_repeats consecutive identical runs
+    (comparison is case- and punctuation-insensitive). Unchanged text when no
+    loop is found. Preview-only — the confirmed transcript never passes here.
+    """
+    tokens = text.split()
+    norm = [_loop_token(t) for t in tokens]
+    for i in range(len(tokens)):
+        for n in range(1, max_ngram + 1):
+            if i + n * min_repeats > len(tokens):
+                break
+            unit = norm[i : i + n]
+            if not any(unit):
+                continue
+            if all(
+                norm[i + k * n : i + (k + 1) * n] == unit
+                for k in range(1, min_repeats)
+            ):
+                return " ".join(tokens[: i + n]).rstrip(" ,;:")
+    return text
+
+
 _SAMPLE_RATE = 16000
 _VAD_THRESHOLD = 0.5
 _VAD_NEG_THRESHOLD = 0.35
@@ -79,6 +119,12 @@ _SPEECH_PAD_MS = 300
 _MAX_UTTERANCE_S = 8.0
 # Keep this much audio behind the emitted watermark so VAD has left context.
 _TRIM_MARGIN_S = 2.0
+# Moonshine v2's ORT export throws inside ONNX Runtime for inputs >= 10 s
+# (probed 2026-09-01), so the preview decodes at most the LAST 8 s of the
+# unconfirmed tail — which also matches _MAX_UTTERANCE_S.
+LIVE_PARTIAL_MAX_S = 8.0
+# Below this much unconfirmed speech there is nothing worth previewing.
+LIVE_PARTIAL_MIN_S = 0.3
 
 
 def completed_utterances(
@@ -151,6 +197,11 @@ class LiveCaptionSession:
         self._buffer = np.zeros(0, dtype="float32")
         self._base = 0  # absolute sample index of _buffer[0]
         self._emitted = 0  # absolute watermark of captioned audio
+        self._last_speech: list[dict] = []
+        # Preview is English-only; a confirmed utterance in another language
+        # pauses it for this source until English returns (see
+        # note_confirmed_language).
+        self.partials_enabled = True
 
     def ingest(self, session: int, audio_path: str) -> None:
         """Append a delta WAV (any rate/layout — decoded to 16 kHz mono)."""
@@ -167,15 +218,48 @@ class LiveCaptionSession:
     def pending_utterances(self) -> tuple[list[tuple[int, int]], int]:
         """Absolute (start, end) of utterances ready to caption + new watermark."""
         if not len(self._buffer):
+            self._last_speech = []
             return [], self._emitted
         speech = _speech_timestamps(self._buffer)
         absolute = [
             {"start": s["start"] + self._base, "end": s["end"] + self._base}
             for s in speech
         ]
+        self._last_speech = absolute
         return completed_utterances(
             absolute, self._base + len(self._buffer), self._emitted
         )
+
+    def unconfirmed_tail(self, max_seconds: float = LIVE_PARTIAL_MAX_S):
+        """Float32 samples of speech not yet confirmed by Whisper: from the
+        first VAD speech region at/after the watermark to the end of the
+        buffer, capped to the LAST ``max_seconds``. Empty when no speech follows
+        the watermark or the span is under LIVE_PARTIAL_MIN_S."""
+        import numpy as np
+
+        end = self._base + len(self._buffer)
+        starts = [
+            max(int(seg["start"]), self._emitted)
+            for seg in self._last_speech
+            if int(seg["end"]) > self._emitted
+        ]
+        if not starts:
+            return np.zeros(0, dtype="float32")
+        start = max(min(starts), end - int(max_seconds * _SAMPLE_RATE))
+        if end - start < int(LIVE_PARTIAL_MIN_S * _SAMPLE_RATE):
+            return np.zeros(0, dtype="float32")
+        lo = max(start - self._base, 0)
+        hi = end - self._base
+        return self._buffer[lo:hi]
+
+    def note_confirmed_language(self, language: str) -> None:
+        """Gate the English-only preview on what Whisper heard: a confirmed
+        utterance in another language switches partials off for this source;
+        an English one switches them back on. Empty/unknown leaves it as is."""
+        lang = (language or "").strip().lower()
+        if not lang:
+            return
+        self.partials_enabled = lang.startswith("en")
 
     def write_utterance_wav(self, start: int, end: int) -> Path:
         """Write one utterance to a temp 16-bit mono WAV; caller unlinks."""
@@ -204,3 +288,40 @@ class LiveCaptionSession:
         if cut > 0:
             self._buffer = self._buffer[cut:]
             self._base += cut
+
+
+class MoonshinePartialEngine:
+    """English streaming preview: re-decodes the unconfirmed audio tail with
+    sherpa-onnx Moonshine v2 (offline model, ~12–50 ms per call on CPU).
+    Best-effort — any failure yields an empty string, never an exception."""
+
+    FILES = ("encoder_model.ort", "decoder_model_merged.ort", "tokens.txt")
+
+    def __init__(self, snapshot: Path, num_threads: int = 2) -> None:
+        import sherpa_onnx  # lazy: keeps the service importable without it
+
+        self.name = "moonshine-v2-tiny-en"
+        self._lock = threading.Lock()
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_moonshine_v2(
+            encoder=str(snapshot / "encoder_model.ort"),
+            decoder=str(snapshot / "decoder_model_merged.ort"),
+            tokens=str(snapshot / "tokens.txt"),
+            num_threads=num_threads,
+            provider="cpu",
+        )
+
+    def decode(self, samples) -> str:
+        """Text for one float32 mono 16 kHz clip; only the last
+        LIVE_PARTIAL_MAX_S seconds are decoded (see the ORT limit above)."""
+        if not len(samples):
+            return ""
+        clip = samples[-int(LIVE_PARTIAL_MAX_S * _SAMPLE_RATE) :]
+        with self._lock:
+            try:
+                stream = self._recognizer.create_stream()
+                stream.accept_waveform(_SAMPLE_RATE, clip)
+                self._recognizer.decode_stream(stream)
+                return stream.result.text.strip()
+            except Exception:
+                logger.warning("Live preview decode failed (non-fatal)", exc_info=True)
+                return ""

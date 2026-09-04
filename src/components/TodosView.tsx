@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ActionItem,
   Meeting,
@@ -15,6 +15,7 @@ import {
   listMeetingWorkspaceBindings,
   listWorkspaces,
   setActionItemDone,
+  suggestTaskCapability,
   updateActionItem,
 } from "../lib/tauri";
 import { ListChecks, MoreHorizontal } from "lucide-react";
@@ -64,6 +65,26 @@ const FILTER_TABS: { id: FilterTab; label: string }[] = [
   { id: "overdue", label: "Overdue" },
 ];
 
+type TaskCapability = "research" | "write" | "visualize" | "present";
+
+const CAPABILITY_OPTIONS: ReadonlyArray<{
+  value: TaskCapability;
+  label: string;
+}> = [
+  { value: "research", label: "Research" },
+  { value: "write", label: "Write" },
+  { value: "visualize", label: "Visualize" },
+  { value: "present", label: "Present" },
+];
+
+function taskCapabilityFromSuggestion(
+  suggestion: string | null,
+): TaskCapability | null {
+  return (
+    CAPABILITY_OPTIONS.find((option) => option.value === suggestion)?.value ?? null
+  );
+}
+
 type ViewMode = "triage" | "focus";
 
 interface TodosViewProps {
@@ -82,6 +103,17 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   const [menuError, setMenuError] = useState<string | null>(null);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [menuCapability, setMenuCapability] = useState<TaskCapability | null>(null);
+  const [menuSuggestedCapability, setMenuSuggestedCapability] =
+    useState<TaskCapability | null>(null);
+  const [capabilitySuggestions, setCapabilitySuggestions] = useState<
+    Record<number, TaskCapability | null>
+  >({});
+  const activeMenuItemRef = useRef<number | null>(null);
+  const menuCapabilityPinnedRef = useRef(false);
+  const suggestionRequestsRef = useRef(
+    new Map<number, Promise<TaskCapability | null>>(),
+  );
 
   // View mode persisted in localStorage, default "triage".
   const [view, setView] = useState<ViewMode>(() => {
@@ -168,30 +200,89 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   };
 
   const closeWorkspaceMenu = () => {
+    activeMenuItemRef.current = null;
+    menuCapabilityPinnedRef.current = false;
     setMenuOpenId(null);
     setMenuError(null);
     setCreatingWorkspace(false);
     setNewWorkspaceName("");
+    setMenuCapability(null);
+    setMenuSuggestedCapability(null);
+    setPendingSendWorkspaceId(null);
+    setMenuNudge(false);
   };
 
-  const openWorkspaceMenu = (itemId: number) => {
-    if (menuOpenId === itemId) {
+  const openWorkspaceMenu = (item: ActionItem) => {
+    if (menuOpenId === item.id) {
       closeWorkspaceMenu();
       return;
     }
-    setMenuOpenId(itemId);
+    activeMenuItemRef.current = item.id;
+    menuCapabilityPinnedRef.current = false;
+    setMenuOpenId(item.id);
     setMenuWorkspaces([]);
     setMenuLoading(true);
     setMenuError(null);
     setCreatingWorkspace(false);
     setNewWorkspaceName("");
+    setMenuCapability(null);
+    setMenuSuggestedCapability(null);
+
+    const suggestionCached = Object.prototype.hasOwnProperty.call(
+      capabilitySuggestions,
+      item.id,
+    );
+    if (suggestionCached) {
+      const suggestion = capabilitySuggestions[item.id] ?? null;
+      setMenuCapability(suggestion);
+      setMenuSuggestedCapability(suggestion);
+    } else {
+      let request = suggestionRequestsRef.current.get(item.id);
+      if (!request) {
+        request = suggestTaskCapability(item.text, "")
+          .then(taskCapabilityFromSuggestion)
+          .catch((error: unknown) => {
+            console.warn("Could not suggest a workspace task capability", error);
+            return null;
+          });
+        suggestionRequestsRef.current.set(item.id, request);
+      }
+      void request.then((suggestion) => {
+        setCapabilitySuggestions((current) => ({
+          ...current,
+          [item.id]: suggestion,
+        }));
+        if (
+          activeMenuItemRef.current === item.id &&
+          !menuCapabilityPinnedRef.current
+        ) {
+          setMenuCapability(suggestion);
+          setMenuSuggestedCapability(suggestion);
+        }
+      });
+    }
+
     listWorkspaces()
       .then(setMenuWorkspaces)
       .catch((error: unknown) => setMenuError(String(error)))
       .finally(() => setMenuLoading(false));
   };
 
-  const sendToWorkspace = async (item: ActionItem, workspaceId: number) => {
+  // A workspace clicked before a capability is picked; sends as soon as one is.
+  const [pendingSendWorkspaceId, setPendingSendWorkspaceId] = useState<number | null>(null);
+  const [menuNudge, setMenuNudge] = useState(false);
+
+  const sendToWorkspace = async (
+    item: ActionItem,
+    workspaceId: number,
+    capabilityOverride?: string,
+  ) => {
+    const capability = capabilityOverride ?? menuCapability;
+    if (!capability) {
+      setPendingSendWorkspaceId(workspaceId);
+      setMenuNudge(true);
+      return;
+    }
     setMenuError(null);
     try {
       await createWorkspaceTask(
@@ -200,6 +291,7 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
         "",
         item.meeting_id,
         item.id,
+        capability,
       );
       closeWorkspaceMenu();
     } catch (error) {
@@ -210,6 +302,10 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
   const createAndSendToWorkspace = async (item: ActionItem) => {
     const name = newWorkspaceName.trim();
     if (!name) return;
+    if (!menuCapability) {
+      setMenuNudge(true);
+      return;
+    }
     setMenuError(null);
     try {
       const workspace = await createWorkspace(name);
@@ -384,11 +480,18 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
       )
       .filter((it) =>
         scopeMeetingId != null ? it.meeting_id === scopeMeetingId : true,
+      )
+      .sort(
+        (a, b) =>
+          (b.completed_at || "").localeCompare(a.completed_at || "") ||
+          b.id - a.id,
       );
   }, [items, q, scopeMeetingId, meetingById]);
 
   const triageDoneCount = triageDoneItems.length;
   const [doneOpen, setDoneOpen] = useState(false);
+  // Done-only view: one click to see what was finished, no scrolling to the tray.
+  const [doneOnly, setDoneOnly] = useState(false);
 
   // ---- Render helpers ----
 
@@ -507,7 +610,7 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
               onMouseDown={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation();
-                openWorkspaceMenu(it.id);
+                openWorkspaceMenu(it);
               }}
             >
               <MoreHorizontal size={16} aria-hidden="true" />
@@ -531,6 +634,90 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
                   <div className="triage-workspace-menu-title">
                     Push to workspace…
                   </div>
+                  <div
+                    style={{
+                      color: "var(--text-muted)",
+                      fontSize: "10px",
+                      padding: "2px var(--btn-padding-x) 3px",
+                    }}
+                  >
+                    How should AI help
+                  </div>
+                  <div
+                    role="group"
+                    aria-label="How should AI help"
+                    style={{
+                      alignItems: "center",
+                      display: "flex",
+                      flexWrap: "wrap",
+                      gap: "5px",
+                      padding: "2px var(--btn-padding-x) 6px",
+                    }}
+                  >
+                    {CAPABILITY_OPTIONS.map((option) => {
+                      const selected = menuCapability === option.value;
+                      const suggested = menuSuggestedCapability === option.value;
+                      return (
+                        <span
+                          key={option.value}
+                          style={{
+                            alignItems: "center",
+                            display: "inline-flex",
+                            gap: "4px",
+                          }}
+                        >
+                          <button
+                            className={`tag-pill${selected ? " active" : ""}`}
+                            type="button"
+                            aria-pressed={selected}
+                            style={{
+                              borderRadius: "12px",
+                              fontSize: "10px",
+                              fontWeight: 500,
+                              padding: "3px 8px",
+                            }}
+                            onClick={() => {
+                              menuCapabilityPinnedRef.current = true;
+                              setMenuCapability(option.value);
+                              setMenuSuggestedCapability(null);
+                              setMenuNudge(false);
+                              if (pendingSendWorkspaceId !== null) {
+                                const target = pendingSendWorkspaceId;
+                                setPendingSendWorkspaceId(null);
+                                void sendToWorkspace(it, target, option.value);
+                              }
+                            }}
+                          >
+                            + {option.label}
+                          </button>
+                          {suggested && (
+                            <span style={{ color: "#8ec5ff", fontSize: "10px" }}>
+                              suggested
+                            </span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </div>
+                  {!menuCapability && (
+                    <p
+                      style={{
+                        color: menuNudge ? "#8ec5ff" : "var(--text-muted)",
+                        fontSize: "10px",
+                        fontWeight: menuNudge ? 600 : 400,
+                        margin: 0,
+                        padding: "0 var(--btn-padding-x) 4px",
+                      }}
+                    >
+                      {pendingSendWorkspaceId !== null
+                        ? `Pick how AI should help, then this sends to ${
+                            menuWorkspaces.find(
+                              (w) => w.workspace.id === pendingSendWorkspaceId,
+                            )?.workspace.name ?? "the workspace"
+                          }`
+                        : "Pick how AI should help first"}
+                    </p>
+                  )}
                   {menuLoading ? (
                     <button className="settings-menu-item" type="button" disabled>
                       Loading…
@@ -683,6 +870,14 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
             aria-label="Search to-dos"
             className="search-input"
           />
+          <button
+            className={`todos-tab ${doneOnly ? "active" : ""}`}
+            onClick={() => setDoneOnly((v) => !v)}
+            aria-pressed={doneOnly}
+            style={{ whiteSpace: "nowrap" }}
+          >
+            Done ({triageDoneCount})
+          </button>
           {view === "focus" && (
             <label className="todos-tab" style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", whiteSpace: "nowrap" }}>
               <input
@@ -713,6 +908,35 @@ export function TodosView({ meetings, onOpenMeeting, scopeMeetingId, onScopeChan
           <p style={{ marginTop: "4px" }}>
             Record a meeting — its action items show up here automatically.
           </p>
+        </div>
+      ) : doneOnly ? (
+        /* ---- Done-only view: what was finished, newest first ---- */
+        <div className="triage-done-list" style={{ padding: "4px 0" }}>
+          {triageDoneItems.length === 0 ? (
+            <div style={{ textAlign: "center", color: "var(--text-muted)", fontSize: "13px", padding: "40px" }}>
+              Nothing finished yet{q ? ` matching "${query}"` : ""}.
+            </div>
+          ) : (
+            triageDoneItems.map((it) => (
+              <div key={it.id} className="triage-done-row">
+                <input
+                  type="checkbox"
+                  checked={it.done}
+                  onChange={() => toggle(it)}
+                  aria-label={`Reopen ${it.text}`}
+                />
+                <span style={{ flex: 1 }}>{it.text}</span>
+                <span style={{ color: "var(--text-muted)", fontSize: 11, flexShrink: 0 }}>
+                  {meetingById.get(it.meeting_id)?.title ?? ""}
+                </span>
+                {it.completed_at ? (
+                  <span style={{ color: "var(--text-muted)", fontSize: 11, flexShrink: 0 }}>
+                    {it.completed_at.slice(0, 10)}
+                  </span>
+                ) : null}
+              </div>
+            ))
+          )}
         </div>
       ) : (view === "focus" ? filtered.length === 0 : scoped.length === 0) ? (
         <div style={{ textAlign: "center", color: "var(--text-muted)", fontSize: "13px", padding: "40px" }}>

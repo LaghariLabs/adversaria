@@ -78,6 +78,10 @@ pub struct HealthResponse {
     /// Human detail for the semantic-search engine state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedder_detail: Option<String>,
+    /// English live-caption preview engine: `missing` | `loading` | `ready` |
+    /// `error`. Absent on older services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_captions_state: Option<String>,
 }
 
 // ---- Meeting ----
@@ -811,6 +815,45 @@ pub struct ContextIndexStatus {
     pub last_synced_at: String,
 }
 
+// ---- Meeting folders ----
+
+/// A user-defined collection used only to organize meetings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub instructions: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A folder plus its number of explicitly filed meetings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderSummary {
+    pub folder: Folder,
+    pub meeting_count: i64,
+}
+
+/// Which folder contains a meeting. `folder_id == None` means explicitly unfiled;
+/// no row at all means no filing decision has been made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingFolder {
+    pub meeting_id: i64,
+    pub folder_id: Option<i64>,
+    /// Resolved at read time; empty when explicitly unfiled.
+    pub folder_name: String,
+}
+
+/// The folder the graph proposes for a meeting, with the evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderSuggestion {
+    pub folder_id: i64,
+    pub folder_name: String,
+    pub related_meeting_count: i64,
+    pub shared_attendee_count: i64,
+}
+
 /// A long-lived project container for meeting work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -858,6 +901,16 @@ pub struct WorkspaceSuggestion {
     pub shared_attendee_count: i64,
 }
 
+/// What would ground a drafted task, shown before it runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskGroundingPreview {
+    pub related_meeting_count: i64,
+    pub latest_related_title: String,
+    pub vault_hit_count: i64,
+    pub top_vault_label: String,
+    pub project_hit_count: i64,
+}
+
 /// One meeting, folder, or file made available to a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceContextItem {
@@ -891,6 +944,7 @@ pub struct WorkspaceTask {
     pub workspace_id: i64,
     pub title: String,
     pub details: String,
+    pub capability: String,
     pub status: String,
     pub source_meeting_id: Option<i64>,
     /// Resolved at read time; empty when the task has no source meeting.
@@ -929,6 +983,7 @@ pub struct WorkspaceRun {
     pub engine: String,
     pub status: String,
     pub log: String,
+    pub report: String,
     pub error: String,
     pub started_at: String,
     pub finished_at: String,
@@ -975,4 +1030,23 @@ pub struct ProjectOverview {
     pub generated_at: String,
     pub source_meeting_count: i64,
     pub stale: bool,
+}
+
+/// Cached, AI-generated understanding of a folder built from its filed meetings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderOverview {
+    pub folder_id: i64,
+    pub summary: String,
+    pub generated_at: String,
+    pub source_meeting_count: i64,
+    pub stale: bool,
+}
+
+/// A related meeting surfaced under a note, with the reason it matched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelatedMeetingRef {
+    pub meeting_id: i64,
+    pub title: String,
+    pub recorded_at: String,
+    pub reason: String,
 }

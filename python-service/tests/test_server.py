@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -140,6 +141,16 @@ _server_mod._summarizer = _fake_summarizer_instance
 client = TestClient(app)
 
 
+class _FakeEngine:
+    name = "fake"
+
+    def __init__(self, text="hello wor") -> None:
+        self.text = text
+
+    def decode(self, samples) -> str:
+        return self.text
+
+
 class TestHealthEndpoint:
     """Tests for GET /health."""
 
@@ -164,6 +175,14 @@ class TestHealthEndpoint:
         response = client.get("/health")
         data = response.json()
         assert data["status"] in ("ok", "degraded")
+
+    def test_health_reports_live_captions_state(self, monkeypatch) -> None:
+        monkeypatch.setattr(_server_mod, "_partial_engine", None)
+        monkeypatch.setattr(_server_mod, "_PARTIAL_STATE", "missing")
+        assert client.get("/health").json()["live_captions_state"] == "missing"
+
+        monkeypatch.setattr(_server_mod, "_partial_engine", _FakeEngine())
+        assert client.get("/health").json()["live_captions_state"] == "ready"
 
     @pytest.mark.parametrize(
         ("payload", "error", "expected"),
@@ -885,6 +904,8 @@ class TestLiveFeedSources:
     class _FakeSession:
         """Deterministic stand-in for LiveCaptionSession (no VAD / decode)."""
 
+        partials_enabled = True
+
         def __init__(self) -> None:
             self.ingested: list[tuple[int, str]] = []
 
@@ -899,6 +920,19 @@ class TestLiveFeedSources:
 
         def advance(self, watermark: int) -> None:
             pass
+
+        def unconfirmed_tail(self, max_seconds=8.0):
+            return np.zeros(0, dtype="float32")
+
+        def note_confirmed_language(self, language):
+            pass
+
+    class _TalkingSession(_FakeSession):
+        def unconfirmed_tail(self, max_seconds=8.0):
+            return np.ones(8000, dtype="float32")
+
+    class _NonEnglishTalkingSession(_TalkingSession):
+        partials_enabled = False
 
     def test_me_and_them_are_independent_sessions(self, monkeypatch) -> None:
         monkeypatch.setattr(_server_mod, "LiveCaptionSession", self._FakeSession)
@@ -922,6 +956,97 @@ class TestLiveFeedSources:
         assert set(_server_mod._live_sessions) == {"them", "me"}
         assert _server_mod._live_sessions["them"].ingested == [(1, "/tmp/sys.wav")]
         assert _server_mod._live_sessions["me"].ingested == [(1, "/tmp/mic.wav")]
+
+    def test_live_feed_response_carries_empty_partial_by_default(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(_server_mod, "LiveCaptionSession", self._FakeSession)
+        _server_mod._live_sessions.clear()
+
+        resp = client.post(
+            "/live_feed",
+            json={"audio_path": "/tmp/sys.wav", "session": 1, "source": "them"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["captions"] == ["Hello world transcript."]
+        assert resp.json()["partial"] == ""
+
+    def test_live_feed_returns_preview_partial(self, monkeypatch) -> None:
+        monkeypatch.setattr(_server_mod, "LiveCaptionSession", self._TalkingSession)
+        monkeypatch.setattr(_server_mod, "_partial_engine", _FakeEngine())
+        _server_mod._live_sessions.clear()
+
+        resp = client.post(
+            "/live_feed",
+            json={"audio_path": "/tmp/sys.wav", "session": 1, "source": "them"},
+        )
+
+        assert resp.json()["captions"] == ["Hello world transcript."]
+        assert resp.json()["partial"] == "hello wor"
+
+    def test_live_feed_preview_survives_busy_whisper_lock(self, monkeypatch) -> None:
+        monkeypatch.setattr(_server_mod, "LiveCaptionSession", self._TalkingSession)
+        monkeypatch.setattr(_server_mod, "_partial_engine", _FakeEngine())
+        _server_mod._live_sessions.clear()
+
+        _server_mod._WHISPER_LOCK.acquire()
+        try:
+            resp = client.post(
+                "/live_feed",
+                json={
+                    "audio_path": "/tmp/sys.wav",
+                    "session": 1,
+                    "source": "them",
+                },
+            )
+        finally:
+            _server_mod._WHISPER_LOCK.release()
+
+        assert resp.json()["captions"] == []
+        assert resp.json()["partial"] == "hello wor"
+
+    def test_live_feed_preview_off_for_non_english_source(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            _server_mod, "LiveCaptionSession", self._NonEnglishTalkingSession
+        )
+        monkeypatch.setattr(_server_mod, "_partial_engine", _FakeEngine())
+        _server_mod._live_sessions.clear()
+
+        resp = client.post(
+            "/live_feed",
+            json={"audio_path": "/tmp/sys.wav", "session": 1, "source": "them"},
+        )
+
+        assert resp.json()["partial"] == ""
+
+    def test_live_feed_preview_drops_filler_hallucination(self, monkeypatch) -> None:
+        monkeypatch.setattr(_server_mod, "LiveCaptionSession", self._TalkingSession)
+        monkeypatch.setattr(_server_mod, "_partial_engine", _FakeEngine("Thank you."))
+        _server_mod._live_sessions.clear()
+
+        resp = client.post(
+            "/live_feed",
+            json={"audio_path": "/tmp/sys.wav", "session": 1, "source": "them"},
+        )
+
+        assert resp.json()["partial"] == ""
+
+    def test_live_feed_preview_trims_repetition_loop(self, monkeypatch) -> None:
+        monkeypatch.setattr(_server_mod, "LiveCaptionSession", self._TalkingSession)
+        monkeypatch.setattr(
+            _server_mod,
+            "_partial_engine",
+            _FakeEngine("The first milestone is moving the data data data data"),
+        )
+        _server_mod._live_sessions.clear()
+
+        resp = client.post(
+            "/live_feed",
+            json={"audio_path": "/tmp/sys.wav", "session": 1, "source": "them"},
+        )
+
+        assert resp.json()["partial"] == "The first milestone is moving the data"
 
     def test_source_defaults_to_them_when_absent(self, monkeypatch) -> None:
         """An old client that omits `source` still works (defaults to system)."""

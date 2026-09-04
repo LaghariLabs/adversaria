@@ -9,7 +9,7 @@ import {
   setLocalModelProfile,
   updateConfig,
 } from "../lib/tauri";
-import { WHISPER_MODEL_PREFIX, whisperModelId } from "../lib/modelDownloads";
+import { LIVE_CAPTIONS_ID, WHISPER_MODEL_PREFIX, whisperModelId } from "../lib/modelDownloads";
 import { useModelDownloads } from "./useModelDownloads";
 
 export interface SettingsModels {
@@ -127,6 +127,10 @@ export function useSettingsModels(
 
   const handleDownloadFinished = useCallback(
     async (profileId: string) => {
+      if (profileId === LIVE_CAPTIONS_ID) {
+        await onHealthChanged();
+        return;
+      }
       if (profileId.startsWith(WHISPER_MODEL_PREFIX)) {
         const key = profileId.slice(WHISPER_MODEL_PREFIX.length);
         const models = await loadWhisperModels();
@@ -150,11 +154,12 @@ export function useSettingsModels(
     ],
   );
 
-  // Every profile whose download Settings can show: one per curated
-  // transcription model, plus the pinned notes tiers (Ollama models are on disk
-  // already and are never fetched through this pipeline).
+  // Every profile whose download Settings can show: the live-caption preview,
+  // one per curated transcription model, plus the pinned notes tiers (Ollama
+  // models are on disk already and are never fetched through this pipeline).
   const watchedIds = useMemo(
     () => [
+      LIVE_CAPTIONS_ID,
       ...whisperModels.map((model) => whisperModelId(model.key)),
       ...(setup?.profiles ?? [])
         .map((profile) => profile.id)

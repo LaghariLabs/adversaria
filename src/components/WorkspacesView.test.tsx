@@ -84,6 +84,7 @@ function workspaceTask(overrides: Partial<WorkspaceTask> = {}): WorkspaceTask {
     workspace_id: 4,
     title: "Draft launch memo",
     details: "",
+    capability: "",
     status: "queued",
     source_meeting_id: null,
     source_meeting_title: "",
@@ -104,6 +105,7 @@ const finishedRun: WorkspaceRun = {
   engine: "local",
   status: "done",
   log: "# Launch memo",
+  report: "",
   error: "",
   started_at: "2026-08-18T10:59:00Z",
   finished_at: "2026-08-18T11:00:00Z",
@@ -169,8 +171,14 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
-    expect(await screen.findByText("needs you")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Let an agent try" }));
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Draft launch memo details",
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Let an agent try" }),
+    );
 
     await waitFor(() =>
       expect(eligibilityPayload).toEqual({ taskId: 11, eligible: true }),
@@ -247,6 +255,7 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
+    await user.click(screen.getByRole("button", { name: "Project settings" }));
 
     expect(await screen.findByText("Vault notes via search")).toBeVisible();
     expect(screen.getByText("Projects via search")).toBeVisible();
@@ -274,6 +283,7 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
+    await user.click(screen.getByRole("button", { name: "Project settings" }));
     expect(await screen.findByText("Local model")).toBeVisible();
     expect(document.querySelectorAll(".ws-engine-chip")).toHaveLength(3);
     const unavailable = screen.getByText("Codex");
@@ -315,9 +325,14 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Draft launch memo details",
+      }),
+    );
 
     expect(
-      await screen.findByText("Run setup: Manual · Architecture doc"),
+      await screen.findByText("Runs as Architecture doc · Local model"),
     ).toBeVisible();
     expect(
       screen.queryByRole("button", { name: "Architecture doc" }),
@@ -377,10 +392,15 @@ describe("WorkspacesView", () => {
     await waitFor(() =>
       expect(runPayload).toMatchObject({ taskId: 11, engine: "local" }),
     );
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Draft launch memo details",
+      }),
+    );
     expect(await screen.findByText("Run log")).toBeVisible();
     expect(await screen.findByText("draft.md")).toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: "Open in default app" }));
+    await user.click(screen.getByRole("button", { name: "Open" }));
     await waitFor(() =>
       expect(openPayload).toMatchObject({
         path: "/tmp/workspaces/4/run-21/draft.md",
@@ -388,7 +408,7 @@ describe("WorkspacesView", () => {
     );
   });
 
-  it("expands the first review artifact by default and hides its preview", async () => {
+  it("keeps review details collapsed and previews an artifact on demand", async () => {
     const reviewDetail: WorkspaceDetail = {
       ...detail,
       tasks: [workspaceTask({ status: "awaiting_review" })],
@@ -418,8 +438,21 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
-    const heading = await screen.findByRole("heading", { name: "Plan", level: 1 });
-    expect(heading.closest(".ws-review-card")).not.toBeNull();
+    const taskRow = await screen.findByRole("button", {
+      name: "Draft launch memo details",
+    });
+    expect(taskRow).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByRole("heading", { name: "Plan", level: 1 }),
+    ).not.toBeInTheDocument();
+
+    await user.click(taskRow);
+    await user.click(screen.getByRole("button", { name: "Preview" }));
+    const heading = await screen.findByRole("heading", {
+      name: "Plan",
+      level: 1,
+    });
+    expect(heading.closest(".ws-task-details")).not.toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Hide" }));
     expect(screen.queryByRole("heading", { name: "Plan", level: 1 })).toBeNull();
@@ -540,7 +573,7 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
-    expect(await screen.findByText("Awaiting your review · 1")).toBeVisible();
+    expect(await screen.findByText("Needs you · 1")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Approve" }));
 
     await waitFor(() => expect(approvePayload).toEqual({ taskId: 11 }));
@@ -553,6 +586,7 @@ describe("WorkspacesView", () => {
       tasks: [workspaceTask({ status: "awaiting_review" })],
     };
     let rejectPayload: unknown;
+    let runPayload: unknown;
     mockIPC((command, payload) => {
       if (command === "list_workspaces") return [summary];
       if (command === "get_workspace") return reviewDetail;
@@ -564,6 +598,10 @@ describe("WorkspacesView", () => {
         rejectPayload = payload;
         return null;
       }
+      if (command === "run_workspace_task") {
+        runPayload = payload;
+        return finishedRun;
+      }
       if (command === "plugin:event|listen") return null;
       return null;
     });
@@ -571,8 +609,8 @@ describe("WorkspacesView", () => {
     render(<WorkspacesView onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByText("Launch planning"));
-    await user.click(await screen.findByRole("button", { name: "Reject…" }));
-    const submit = screen.getByRole("button", { name: "Re-run with this note" });
+    await user.click(await screen.findByRole("button", { name: "Reject" }));
+    const submit = screen.getByRole("button", { name: "Rerun" });
     expect(submit).toBeDisabled();
 
     await user.type(screen.getByRole("textbox", { name: "Rejection reason" }), "Too long");
@@ -581,6 +619,9 @@ describe("WorkspacesView", () => {
 
     await waitFor(() =>
       expect(rejectPayload).toEqual({ taskId: 11, reason: "Too long" }),
+    );
+    await waitFor(() =>
+      expect(runPayload).toMatchObject({ taskId: 11, engine: "local" }),
     );
   });
 });

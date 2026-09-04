@@ -19,6 +19,8 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 
 - **Record → transcribe → summarize**, fully on-device; the audio is deleted right after.
 - **A recording companion view** — while recording, the app collapses into a slim panel made for docking beside a call: record bar (timer · live audio level · Stop & summarize), an auto-scrolling live transcript, and your notes split 50/50 (or pick **Transcript-first** in Settings → Recording view to give the transcript the whole window, notes in a one-tap footer). Toggle recording from anywhere with **⌘⇧M** (macOS) / **Ctrl+Shift+M** (Windows); **⌘⇧N** jots a quick note.
+- **Live captions preview** — while you speak, grey English words appear within about half a second and revise as you go; at each pause the confirmed Whisper caption replaces them. Fully on-device: a 44 MB Moonshine model (sherpa-onnx) downloads once on first launch, with a status row in Settings → Transcription. English-only for now; other languages keep the confirmed captions.
+- **Meeting Room** — at wide window sizes the live transcript docks beside your notes instead of stacking above them, and **+ add context** lets you attach reference documents or prior meeting summaries mid-recording. Attachments fold into the summary as reference material.
 - **A floating recording pill** — switch away from the app mid-recording and a compact pill tucks in just below the notch (dot · timer · live waveform). Choose **Notch pill → Expressive** in Settings → Notch & alerts for a richer island — timer, the running live caption, both channels, and a one-tap Stop — or **Hidden** to turn it off.
 - **Speaker-labeled** transcript (`Me:` / `Them:`, with on-device **Speaker 1/2/… diarization** of the remote side); notes in **10 languages** (English, العربية, 中文, हिन्दी, Español, Français, বাংলা, Português, Русский, اردو — or *Match spoken*), RTL rendered properly.
 - **Fix this word** — select a misheard term in the transcript, type the correction, and every mention in the transcript *and* notes updates; the term joins your dictionary so future meetings hear it right. **Rename an attendee** on their chip and every reference follows.
@@ -26,7 +28,8 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 - **Smart note templates** — the app detects what a recording is (watched video, brainstorm, 1:1, **job interview — either side of the table**) and picks the matching notes template automatically; your manual template choice always wins.
 - **Meeting Insights** — on-device speaking stats per meeting (talk-time share, pace vs the 130–175 wpm target, filler-word rate, interruptions, longest monologue) computed with zero AI calls; transcripts carry **[MM:SS] timestamps** per turn.
 - **To-dos** — action items from every meeting on a **triage board** (Overdue / This week / Later lanes with **drag-and-drop** — drops edit the due date) or a **focus queue** (one next-up card at a time), with meeting-scope chips, editable due dates, and **twice-daily due/overdue notification digests**.
-- **Meeting projects** — file related meetings into colored project folders from the Meetings sidebar (menu or drag-and-drop), then open a project view with a source-grounded AI overview, attendee frequency, filed meetings, and open action items. Standing instructions guide both the overview and future workspace-task briefs; deleting a project leaves its meetings intact and unfiled.
+- **Folders** — file related meetings into coloured folders from the Meetings sidebar (menu or drag-and-drop), then open a folder view with a source-grounded AI overview, attendee frequency, filed meetings, and open action items. Standing instructions guide the overview. Folders are pure organisation (a project, a meeting type, anything) and are fully on-device; meetings filed as projects in earlier versions are migrated into folders automatically. Deleting a folder leaves its meetings intact and unfiled.
+- **Related meetings** — the Summary tab of a note lists up to three related past meetings with the reason they match; click one to open it.
 - **Weekly Briefing** — your week written by the local LLM ("your week in sixty seconds"), plus stats, decisions made, and open loops carried forward.
 - **Ask across meetings** — cross-meeting Q&A (SQLite FTS5 retrieval) answered by the local LLM.
 - **Knowledge Graph** — an interactive, physics-animated map of your meetings, people, tags, and action owners (built from local data, zero LLM). Click any node for a **side dossier**: meeting-notes previews, and **editable person profiles** (role, company, notes, aliases) that sync to your Obsidian vault alongside meeting notes.
@@ -250,8 +253,9 @@ docs/superpowers/     Design spec and phase plan
 
 ## Known limitations
 
-- The live caption while recording is a best-effort rolling preview; the
-  authoritative transcript is produced when you stop.
+- The live caption while recording is a best-effort rolling preview, and the
+  grey words-as-you-speak layer can flicker or mis-hear on very short
+  fragments; the authoritative transcript is produced when you stop.
 - Speaker labels are channel-based (`Me:` = your mic, `Them:` = system audio),
   and the remote side is diarized into **Speaker 1/2/…** — but diarized
   speakers aren't matched to real names automatically yet (rename them on
@@ -282,4 +286,5 @@ remain available under those terms.
 
 ## Documentation changelog
 
-- 2026-08-30 — Added the Meeting projects surface and its non-destructive deletion behavior to the user-facing feature list. The implementation is currently in the working tree and has not been committed or released.
+- 2026-08-30 — Accuracy pass for v0.3.82: added Meeting Room (docked live transcript at wide widths and + add context mid-recording attachments), clarified meeting projects with the per-project Web research switch and standing instructions, and confirmed native capture uses a Core Audio process tap on macOS with no screen-recording session.
+- 2026-09-02 — v0.3.83 cut and notarized: added the live captions preview (grey words as you speak, replaced per utterance by the confirmed caption), related meetings under the note, the To-dos Done view; meeting projects are now Folders (migrated automatically) and the folder screen no longer shows the web-research switch; a hung transcription can no longer wedge the queue.

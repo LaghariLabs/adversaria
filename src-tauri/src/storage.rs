@@ -9,9 +9,10 @@ use std::sync::OnceLock;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::types::{
-    ActionItem, ContextChunkRow, ContextDoc, Meeting, MeetingAttachment, MeetingWorkspaceBinding,
-    OnboardingState, RegistrationState, TaskStaffing, Workspace, WorkspaceAddon, WorkspaceArtifact,
-    WorkspaceContextItem, WorkspaceDetail, WorkspaceRun, WorkspaceSummary, WorkspaceTask,
+    ActionItem, ContextChunkRow, ContextDoc, Folder, FolderSummary, Meeting, MeetingAttachment,
+    MeetingFolder, MeetingWorkspaceBinding, OnboardingState, RegistrationState, TaskStaffing,
+    Workspace, WorkspaceAddon, WorkspaceArtifact, WorkspaceContextItem, WorkspaceDetail,
+    WorkspaceRun, WorkspaceSummary, WorkspaceTask,
 };
 
 /// Path to the SQLite database file.
@@ -550,6 +551,7 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
             workspace_id      INTEGER NOT NULL,
             title             TEXT    NOT NULL,
             details           TEXT    NOT NULL DEFAULT '',
+            capability        TEXT    NOT NULL DEFAULT '',
             status            TEXT    NOT NULL DEFAULT 'queued'
                               CHECK(status IN ('queued','running','awaiting_review','done','failed')),
             source_meeting_id INTEGER,
@@ -577,6 +579,7 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
             status       TEXT    NOT NULL DEFAULT 'running'
                          CHECK(status IN ('running','done','failed','stopped')),
             log          TEXT    NOT NULL DEFAULT '',
+            report       TEXT    NOT NULL DEFAULT '',
             error        TEXT    NOT NULL DEFAULT '',
             started_at   TEXT    NOT NULL,
             finished_at  TEXT    NOT NULL DEFAULT ''
@@ -596,13 +599,40 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
             workspace_id INTEGER,
             created_at   TEXT    NOT NULL,
             updated_at   TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS folders (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT    NOT NULL,
+            color        TEXT    NOT NULL DEFAULT 'blue',
+            instructions TEXT    NOT NULL DEFAULT '',
+            created_at   TEXT    NOT NULL,
+            updated_at   TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS meeting_folders (
+            meeting_id INTEGER PRIMARY KEY,
+            folder_id  INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS folder_overviews (
+            folder_id    INTEGER PRIMARY KEY,
+            summary      TEXT NOT NULL,
+            source_hash  TEXT NOT NULL,
+            generated_at TEXT NOT NULL
         );",
     )?;
 
     seed_builtin_addons_on(&conn)?;
     migrate_workspace_tasks_v2(&conn)?;
     migrate_workspace_task_agent_eligibility(&conn)?;
+    migrate_workspace_task_capability(&conn)?;
     migrate_workspace_model(&conn)?;
+    if !column_exists(&conn, "workspace_runs", "report")? {
+        conn.execute(
+            "ALTER TABLE workspace_runs ADD COLUMN report TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     if !column_exists(&conn, "workspaces", "instructions")? {
         conn.execute(
             "ALTER TABLE workspaces ADD COLUMN instructions TEXT NOT NULL DEFAULT ''",
@@ -633,6 +663,7 @@ pub fn init_db(encrypt: bool) -> anyhow::Result<()> {
             [],
         )?;
     }
+    migrate_workspace_bindings_to_folders(&conn)?;
     migrate_context_docs_name(&conn)?;
 
     // Migration: add `intent` (provenance badge) to ask_messages tables created
@@ -946,6 +977,103 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result
     Ok(false)
 }
 
+/// Copy the former Meetings-side workspace filing state into independent folders once.
+/// The transaction matters: a partial copy must never leave `folders` non-empty and
+/// suppress the remaining migration on the next launch.
+fn migrate_workspace_bindings_to_folders(conn: &Connection) -> anyhow::Result<()> {
+    let folder_count: i64 = conn.query_row("SELECT COUNT(*) FROM folders", [], |row| row.get(0))?;
+    let bound_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM meeting_workspace_bindings WHERE workspace_id IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if folder_count != 0 || bound_count == 0 {
+        return Ok(());
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    let workspaces = {
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT w.id, w.name, w.color, w.instructions, w.created_at, w.updated_at,
+                    w.overview, w.overview_source_hash, w.overview_generated_at
+               FROM workspaces w
+               JOIN meeting_workspace_bindings b ON b.workspace_id = w.id
+              WHERE b.workspace_id IS NOT NULL
+              ORDER BY w.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut folder_by_workspace = std::collections::HashMap::new();
+    for (
+        workspace_id,
+        name,
+        color,
+        instructions,
+        created_at,
+        updated_at,
+        overview,
+        source_hash,
+        generated_at,
+    ) in workspaces
+    {
+        transaction.execute(
+            "INSERT INTO folders (name, color, instructions, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, color, instructions, created_at, updated_at],
+        )?;
+        let folder_id = transaction.last_insert_rowid();
+        folder_by_workspace.insert(workspace_id, folder_id);
+        if !overview.is_empty() || !source_hash.is_empty() || !generated_at.is_empty() {
+            transaction.execute(
+                "INSERT INTO folder_overviews (folder_id, summary, source_hash, generated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![folder_id, overview, source_hash, generated_at],
+            )?;
+        }
+    }
+
+    let bindings = {
+        let mut statement = transaction.prepare(
+            "SELECT meeting_id, workspace_id, created_at, updated_at
+               FROM meeting_workspace_bindings
+              ORDER BY meeting_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (meeting_id, workspace_id, created_at, updated_at) in bindings {
+        let folder_id = workspace_id.and_then(|id| folder_by_workspace.get(&id).copied());
+        transaction.execute(
+            "INSERT INTO meeting_folders (meeting_id, folder_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![meeting_id, folder_id, created_at, updated_at],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 /// Rebuild the workspace task table so its status CHECK and review columns are current.
 fn migrate_workspace_tasks_v2(conn: &Connection) -> anyhow::Result<()> {
     if column_exists(conn, "workspace_tasks", "action_item_id")? {
@@ -957,6 +1085,7 @@ fn migrate_workspace_tasks_v2(conn: &Connection) -> anyhow::Result<()> {
             workspace_id      INTEGER NOT NULL,
             title             TEXT    NOT NULL,
             details           TEXT    NOT NULL DEFAULT '',
+            capability        TEXT    NOT NULL DEFAULT '',
             status            TEXT    NOT NULL DEFAULT 'queued'
                               CHECK(status IN ('queued','running','awaiting_review','done','failed')),
             source_meeting_id INTEGER,
@@ -983,6 +1112,18 @@ fn migrate_workspace_task_agent_eligibility(conn: &Connection) -> anyhow::Result
         conn.execute(
             "ALTER TABLE workspace_tasks
              ADD COLUMN agent_eligible INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add the user-selected AI capability without rebuilding the current task table.
+fn migrate_workspace_task_capability(conn: &Connection) -> anyhow::Result<()> {
+    if !column_exists(conn, "workspace_tasks", "capability")? {
+        conn.execute(
+            "ALTER TABLE workspace_tasks
+             ADD COLUMN capability TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }
@@ -1883,6 +2024,40 @@ pub fn get_meeting(id: i64) -> anyhow::Result<Option<Meeting>> {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),
     }
+}
+
+/// Meetings explicitly filed to a folder, newest first.
+pub fn get_meetings_for_folder(folder_id: i64) -> anyhow::Result<Vec<Meeting>> {
+    let conn = connect()?;
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.title, m.recorded_at, m.duration_seconds, m.transcript, m.summary, m.template_used, m.audio_file_path, m.attendees, m.user_notes, m.tags, m.pinned, m.locked, m.archived, m.transcript_turns, m.link
+         FROM meetings m
+         INNER JOIN meeting_folders mf ON mf.meeting_id = m.id
+         WHERE mf.folder_id = ?1
+         ORDER BY m.recorded_at DESC",
+    )?;
+    let rows = stmt.query_map(params![folder_id], |row| {
+        Ok(Meeting {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            recorded_at: row.get(2)?,
+            duration_seconds: row.get(3)?,
+            transcript: row.get(4)?,
+            summary: row.get(5)?,
+            template_used: row.get(6)?,
+            audio_file_path: row.get(7)?,
+            attendees: decode_attendees(&row.get::<_, String>(8)?),
+            user_notes: row.get(9)?,
+            tags: decode_tags(&row.get::<_, String>(10)?),
+            pinned: row.get(11)?,
+            locked: row.get(12)?,
+            archived: row.get(13)?,
+            transcript_turns: decode_transcript_turns(&row.get::<_, String>(14)?),
+            link: row.get(15)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// Meetings explicitly filed to a workspace via `meeting_workspace_bindings`, newest first.
@@ -3155,6 +3330,297 @@ pub fn get_people() -> anyhow::Result<Vec<crate::types::PersonProfile>> {
 }
 
 // ---------------------------------------------------------------------------
+// Meeting folders
+// ---------------------------------------------------------------------------
+
+/// Create a folder used only to organize meetings.
+pub fn create_folder(name: &str, color: &str) -> anyhow::Result<Folder> {
+    let conn = connect()?;
+    create_folder_on(&conn, name, color)
+}
+
+fn create_folder_on(conn: &Connection, name: &str, color: &str) -> anyhow::Result<Folder> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO folders (name, color, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![name, color, now],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.query_row(
+        "SELECT id, name, color, instructions, created_at, updated_at
+           FROM folders WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Folder {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                instructions: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
+/// Return all meeting folders with their filed-meeting counts.
+pub fn list_folders() -> anyhow::Result<Vec<FolderSummary>> {
+    let conn = connect()?;
+    list_folders_on(&conn)
+}
+
+fn list_folders_on(conn: &Connection) -> anyhow::Result<Vec<FolderSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT f.id, f.name, f.color, f.instructions, f.created_at, f.updated_at,
+                (SELECT COUNT(*) FROM meeting_folders mf WHERE mf.folder_id = f.id)
+           FROM folders f
+          ORDER BY f.updated_at DESC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(FolderSummary {
+            folder: Folder {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                instructions: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            },
+            meeting_count: row.get(6)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Load one folder.
+pub fn get_folder(id: i64) -> anyhow::Result<Option<Folder>> {
+    let conn = connect()?;
+    get_folder_on(&conn, id)
+}
+
+fn get_folder_on(conn: &Connection, id: i64) -> anyhow::Result<Option<Folder>> {
+    conn.query_row(
+        "SELECT id, name, color, instructions, created_at, updated_at
+           FROM folders WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Folder {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                instructions: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Rename a folder and update its modified timestamp.
+pub fn rename_folder(id: i64, name: &str) -> anyhow::Result<()> {
+    let conn = connect()?;
+    rename_folder_on(&conn, id, name)
+}
+
+fn rename_folder_on(conn: &Connection, id: i64, name: &str) -> anyhow::Result<()> {
+    let updated = conn.execute(
+        "UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![name, chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    anyhow::ensure!(updated == 1, "Folder not found: {id}");
+    Ok(())
+}
+
+/// Update the standing overview instructions for a folder.
+pub fn set_folder_instructions(id: i64, instructions: &str) -> anyhow::Result<()> {
+    let conn = connect()?;
+    set_folder_instructions_on(&conn, id, instructions)
+}
+
+fn set_folder_instructions_on(
+    conn: &Connection,
+    id: i64,
+    instructions: &str,
+) -> anyhow::Result<()> {
+    let updated = conn.execute(
+        "UPDATE folders SET instructions = ?1, updated_at = ?2 WHERE id = ?3",
+        params![instructions, chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    anyhow::ensure!(updated == 1, "Folder not found: {id}");
+    Ok(())
+}
+
+/// Update the sidebar color for a folder.
+pub fn set_folder_color(id: i64, color: &str) -> anyhow::Result<()> {
+    let conn = connect()?;
+    set_folder_color_on(&conn, id, color)
+}
+
+fn set_folder_color_on(conn: &Connection, id: i64, color: &str) -> anyhow::Result<()> {
+    let updated = conn.execute(
+        "UPDATE folders SET color = ?1, updated_at = ?2 WHERE id = ?3",
+        params![color, chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    anyhow::ensure!(updated == 1, "Folder not found: {id}");
+    Ok(())
+}
+
+/// Delete a folder and its filing decisions, leaving meetings untouched.
+pub fn delete_folder(id: i64) -> anyhow::Result<()> {
+    let conn = connect()?;
+    delete_folder_on(&conn, id)
+}
+
+fn delete_folder_on(conn: &Connection, id: i64) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM meeting_folders WHERE folder_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM folder_overviews WHERE folder_id = ?1",
+        params![id],
+    )?;
+    let updated = conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    anyhow::ensure!(updated == 1, "Folder not found: {id}");
+    Ok(())
+}
+
+/// File a meeting into a folder, or explicitly mark it as not filed.
+pub fn set_meeting_folder(meeting_id: i64, folder_id: Option<i64>) -> anyhow::Result<()> {
+    let conn = connect()?;
+    set_meeting_folder_on(&conn, meeting_id, folder_id)
+}
+
+fn set_meeting_folder_on(
+    conn: &Connection,
+    meeting_id: i64,
+    folder_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let meeting_exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+        params![meeting_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    anyhow::ensure!(meeting_exists, "Meeting not found: {meeting_id}");
+    if let Some(folder_id) = folder_id {
+        let folder_exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1)",
+            params![folder_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        anyhow::ensure!(folder_exists, "Folder not found: {folder_id}");
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO meeting_folders (meeting_id, folder_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(meeting_id) DO UPDATE SET
+             folder_id = excluded.folder_id,
+             updated_at = excluded.updated_at",
+        params![meeting_id, folder_id, now],
+    )?;
+    Ok(())
+}
+
+/// Remove a meeting's folder decision so it becomes undecided again.
+pub fn clear_meeting_folder(meeting_id: i64) -> anyhow::Result<()> {
+    let conn = connect()?;
+    clear_meeting_folder_on(&conn, meeting_id)
+}
+
+fn clear_meeting_folder_on(conn: &Connection, meeting_id: i64) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM meeting_folders WHERE meeting_id = ?1",
+        params![meeting_id],
+    )?;
+    Ok(())
+}
+
+/// List every stored meeting-folder decision.
+pub fn list_meeting_folders() -> anyhow::Result<Vec<MeetingFolder>> {
+    let conn = connect()?;
+    list_meeting_folders_on(&conn)
+}
+
+fn list_meeting_folders_on(conn: &Connection) -> anyhow::Result<Vec<MeetingFolder>> {
+    let mut statement = conn.prepare(
+        "SELECT mf.meeting_id, mf.folder_id, COALESCE(f.name, '')
+           FROM meeting_folders mf
+           LEFT JOIN folders f ON f.id = mf.folder_id
+          ORDER BY mf.meeting_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(MeetingFolder {
+            meeting_id: row.get(0)?,
+            folder_id: row.get(1)?,
+            folder_name: row.get(2)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Return every explicitly filed folder/meeting pair.
+pub fn folder_meeting_ids() -> anyhow::Result<Vec<(i64, i64)>> {
+    let conn = connect()?;
+    let mut statement = conn.prepare(
+        "SELECT folder_id, meeting_id
+           FROM meeting_folders
+          WHERE folder_id IS NOT NULL",
+    )?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Load the cached overview for one folder.
+pub fn get_folder_overview_cache(
+    folder_id: i64,
+) -> anyhow::Result<Option<(String, String, String)>> {
+    let conn = connect()?;
+    get_folder_overview_cache_on(&conn, folder_id)
+}
+
+fn get_folder_overview_cache_on(
+    conn: &Connection,
+    folder_id: i64,
+) -> anyhow::Result<Option<(String, String, String)>> {
+    conn.query_row(
+        "SELECT summary, source_hash, generated_at
+           FROM folder_overviews WHERE folder_id = ?1",
+        params![folder_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Insert or replace the cached overview for one folder.
+pub fn upsert_folder_overview(
+    folder_id: i64,
+    summary: &str,
+    source_hash: &str,
+    generated_at: &str,
+) -> anyhow::Result<()> {
+    let conn = connect()?;
+    conn.execute(
+        "INSERT INTO folder_overviews (folder_id, summary, source_hash, generated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(folder_id) DO UPDATE SET
+             summary = excluded.summary,
+             source_hash = excluded.source_hash,
+             generated_at = excluded.generated_at",
+        params![folder_id, summary, source_hash, generated_at],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Workspaces
 // ---------------------------------------------------------------------------
 
@@ -3524,21 +3990,22 @@ fn list_workspace_addons_on(
 }
 
 fn workspace_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTask> {
-    let rejection_notes: String = row.get(11)?;
+    let rejection_notes: String = row.get(12)?;
     Ok(WorkspaceTask {
         id: row.get(0)?,
         workspace_id: row.get(1)?,
         title: row.get(2)?,
         details: row.get(3)?,
-        status: row.get(4)?,
-        source_meeting_id: row.get(5)?,
-        source_meeting_title: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-        action_item_id: row.get(9)?,
-        attempt: row.get(10)?,
+        capability: row.get(4)?,
+        status: row.get(5)?,
+        source_meeting_id: row.get(6)?,
+        source_meeting_title: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        action_item_id: row.get(10)?,
+        attempt: row.get(11)?,
         rejection_notes: serde_json::from_str::<Vec<String>>(&rejection_notes).unwrap_or_default(),
-        agent_eligible: row.get::<_, i32>(12)? != 0,
+        agent_eligible: row.get::<_, i32>(13)? != 0,
     })
 }
 
@@ -3595,7 +4062,7 @@ fn get_workspace_on(conn: &Connection, id: i64) -> anyhow::Result<Option<Workspa
     }
 
     let mut task_stmt = conn.prepare(
-        "SELECT t.id, t.workspace_id, t.title, t.details, t.status,
+        "SELECT t.id, t.workspace_id, t.title, t.details, t.capability, t.status,
                 t.source_meeting_id, COALESCE(m.title, ''), t.created_at, t.updated_at,
                 t.action_item_id, t.attempt, t.rejection_notes, t.agent_eligible
            FROM workspace_tasks t
@@ -4059,6 +4526,7 @@ fn push_meeting_action_items_on(conn: &Connection, meeting_id: i64) -> anyhow::R
             workspace_id,
             text,
             "",
+            "",
             Some(meeting_id),
             Some(*action_item_id),
             !crate::task_triage::needs_you(text),
@@ -4072,6 +4540,7 @@ pub fn create_workspace_task(
     workspace_id: i64,
     title: &str,
     details: &str,
+    capability: &str,
     source_meeting_id: Option<i64>,
     action_item_id: Option<i64>,
 ) -> anyhow::Result<WorkspaceTask> {
@@ -4081,6 +4550,7 @@ pub fn create_workspace_task(
         workspace_id,
         title,
         details,
+        capability,
         source_meeting_id,
         action_item_id,
     )
@@ -4091,6 +4561,7 @@ fn create_workspace_task_on(
     workspace_id: i64,
     title: &str,
     details: &str,
+    capability: &str,
     source_meeting_id: Option<i64>,
     action_item_id: Option<i64>,
 ) -> anyhow::Result<WorkspaceTask> {
@@ -4099,17 +4570,20 @@ fn create_workspace_task_on(
         workspace_id,
         title,
         details,
+        capability,
         source_meeting_id,
         action_item_id,
         true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_workspace_task_with_eligibility_on(
     conn: &Connection,
     workspace_id: i64,
     title: &str,
     details: &str,
+    capability: &str,
     source_meeting_id: Option<i64>,
     action_item_id: Option<i64>,
     agent_eligible: bool,
@@ -4155,13 +4629,14 @@ fn create_workspace_task_with_eligibility_on(
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO workspace_tasks
-             (workspace_id, title, details, source_meeting_id, action_item_id,
+             (workspace_id, title, details, capability, source_meeting_id, action_item_id,
               agent_eligible, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         params![
             workspace_id,
             title,
             details,
+            capability,
             source_meeting_id,
             action_item_id,
             agent_eligible,
@@ -4185,7 +4660,7 @@ fn create_workspace_task_with_eligibility_on(
     }
 
     let task = conn.query_row(
-        "SELECT t.id, t.workspace_id, t.title, t.details, t.status,
+        "SELECT t.id, t.workspace_id, t.title, t.details, t.capability, t.status,
                 t.source_meeting_id, COALESCE(m.title, ''), t.created_at, t.updated_at,
                 t.action_item_id, t.attempt, t.rejection_notes, t.agent_eligible
            FROM workspace_tasks t
@@ -4330,7 +4805,7 @@ pub fn get_workspace_task(task_id: i64) -> anyhow::Result<Option<WorkspaceTask>>
 
 fn get_workspace_task_on(conn: &Connection, task_id: i64) -> anyhow::Result<Option<WorkspaceTask>> {
     conn.query_row(
-        "SELECT t.id, t.workspace_id, t.title, t.details, t.status,
+        "SELECT t.id, t.workspace_id, t.title, t.details, t.capability, t.status,
                 t.source_meeting_id, COALESCE(m.title, ''), t.created_at, t.updated_at,
                 t.action_item_id, t.attempt, t.rejection_notes, t.agent_eligible
            FROM workspace_tasks t
@@ -4372,7 +4847,7 @@ fn next_queued_task_on(
     workspace_id: i64,
 ) -> anyhow::Result<Option<WorkspaceTask>> {
     conn.query_row(
-        "SELECT t.id, t.workspace_id, t.title, t.details, t.status,
+        "SELECT t.id, t.workspace_id, t.title, t.details, t.capability, t.status,
                 t.source_meeting_id, COALESCE(m.title, ''), t.created_at, t.updated_at,
                 t.action_item_id, t.attempt, t.rejection_notes, t.agent_eligible
            FROM workspace_tasks t
@@ -4536,9 +5011,10 @@ fn workspace_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace
         engine: row.get(3)?,
         status: row.get(4)?,
         log: row.get(5)?,
-        error: row.get(6)?,
-        started_at: row.get(7)?,
-        finished_at: row.get(8)?,
+        report: row.get(6)?,
+        error: row.get(7)?,
+        started_at: row.get(8)?,
+        finished_at: row.get(9)?,
     })
 }
 
@@ -4653,6 +5129,21 @@ pub(crate) fn update_workspace_run_log(run_id: i64, log: &str) -> anyhow::Result
     Ok(())
 }
 
+/// Store the plain-language summary of a completed workspace run.
+pub fn set_workspace_run_report(run_id: i64, report: &str) -> anyhow::Result<()> {
+    let conn = connect()?;
+    set_workspace_run_report_on(&conn, run_id, report)
+}
+
+fn set_workspace_run_report_on(conn: &Connection, run_id: i64, report: &str) -> anyhow::Result<()> {
+    let updated = conn.execute(
+        "UPDATE workspace_runs SET report = ?1 WHERE id = ?2",
+        params![report, run_id],
+    )?;
+    anyhow::ensure!(updated == 1, "Workspace run not found: {run_id}");
+    Ok(())
+}
+
 /// Recover tasks and runs left in flight when the previous process exited.
 pub fn requeue_orphaned_running_tasks() -> anyhow::Result<usize> {
     let conn = connect()?;
@@ -4686,7 +5177,7 @@ pub fn get_workspace_run(run_id: i64) -> anyhow::Result<Option<WorkspaceRun>> {
 
 fn get_workspace_run_on(conn: &Connection, run_id: i64) -> anyhow::Result<Option<WorkspaceRun>> {
     conn.query_row(
-        "SELECT id, workspace_id, task_id, engine, status, log, error,
+        "SELECT id, workspace_id, task_id, engine, status, log, report, error,
                 started_at, finished_at
            FROM workspace_runs
           WHERE id = ?1",
@@ -4708,7 +5199,7 @@ fn get_latest_workspace_run_on(
     task_id: i64,
 ) -> anyhow::Result<Option<WorkspaceRun>> {
     conn.query_row(
-        "SELECT id, workspace_id, task_id, engine, status, log, error,
+        "SELECT id, workspace_id, task_id, engine, status, log, report, error,
                 started_at, finished_at
            FROM workspace_runs
           WHERE task_id = ?1
@@ -4878,6 +5369,7 @@ pub(crate) fn create_workspace_tables(conn: &Connection) -> anyhow::Result<()> {
              workspace_id INTEGER NOT NULL,
              title TEXT NOT NULL,
              details TEXT NOT NULL DEFAULT '',
+             capability TEXT NOT NULL DEFAULT '',
              status TEXT NOT NULL DEFAULT 'queued'
                  CHECK(status IN ('queued','running','awaiting_review','done','failed')),
              source_meeting_id INTEGER,
@@ -4901,6 +5393,26 @@ pub(crate) fn create_workspace_tables(conn: &Connection) -> anyhow::Result<()> {
              workspace_id INTEGER,
              created_at TEXT NOT NULL,
              updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS folders (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL,
+             color TEXT NOT NULL DEFAULT 'blue',
+             instructions TEXT NOT NULL DEFAULT '',
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS meeting_folders (
+             meeting_id INTEGER PRIMARY KEY,
+             folder_id INTEGER,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS folder_overviews (
+             folder_id INTEGER PRIMARY KEY,
+             summary TEXT NOT NULL,
+             source_hash TEXT NOT NULL,
+             generated_at TEXT NOT NULL
          );",
     )?;
     if !column_exists(conn, "workspaces", "instructions")? {
@@ -5244,6 +5756,7 @@ mod tests {
                  status TEXT NOT NULL DEFAULT 'running'
                      CHECK(status IN ('running','done','failed','stopped')),
                  log TEXT NOT NULL DEFAULT '',
+                 report TEXT NOT NULL DEFAULT '',
                  error TEXT NOT NULL DEFAULT '',
                  started_at TEXT NOT NULL,
                  finished_at TEXT NOT NULL DEFAULT ''
@@ -5298,10 +5811,12 @@ mod tests {
 
         migrate_workspace_tasks_v2(&conn).unwrap();
         migrate_workspace_task_agent_eligibility(&conn).unwrap();
+        migrate_workspace_task_capability(&conn).unwrap();
         assert!(column_exists(&conn, "workspace_tasks", "action_item_id").unwrap());
         assert!(column_exists(&conn, "workspace_tasks", "attempt").unwrap());
         assert!(column_exists(&conn, "workspace_tasks", "rejection_notes").unwrap());
         assert!(column_exists(&conn, "workspace_tasks", "agent_eligible").unwrap());
+        assert!(column_exists(&conn, "workspace_tasks", "capability").unwrap());
         let old: (String, i64, String) = conn
             .query_row(
                 "SELECT title, attempt, rejection_notes FROM workspace_tasks WHERE id = 1",
@@ -5319,6 +5834,7 @@ mod tests {
         .unwrap();
         migrate_workspace_tasks_v2(&conn).unwrap();
         migrate_workspace_task_agent_eligibility(&conn).unwrap();
+        migrate_workspace_task_capability(&conn).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM workspace_tasks", [], |row| row.get(0))
             .unwrap();
@@ -5554,6 +6070,7 @@ mod tests {
             first_workspace.id,
             "Original title",
             "",
+            "",
             None,
             Some(5),
         )
@@ -5563,13 +6080,21 @@ mod tests {
             first_workspace.id,
             "Changed title",
             "Changed details",
+            "",
             None,
             Some(5),
         )
         .unwrap();
-        let other_workspace =
-            create_workspace_task_on(&conn, second_workspace.id, "Other task", "", None, Some(5))
-                .unwrap();
+        let other_workspace = create_workspace_task_on(
+            &conn,
+            second_workspace.id,
+            "Other task",
+            "",
+            "",
+            None,
+            Some(5),
+        )
+        .unwrap();
 
         assert_eq!(duplicate.id, first.id);
         assert_eq!(duplicate.title, "Original title");
@@ -5584,8 +6109,8 @@ mod tests {
     fn task_staffing_set_get_round_trips() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
         let staffing = TaskStaffing {
             mode: "automatic".to_string(),
             agent_id: Some(17),
@@ -5605,11 +6130,75 @@ mod tests {
     }
 
     #[test]
+    fn capability_tasks_persist_adapter_and_baseline_staffing() {
+        let conn = workspace_conn();
+        let workspace = create_workspace_on(&conn, "Research", "blue").unwrap();
+        seed_builtin_addons_on(&conn).unwrap();
+        let catalog = list_addons_on(&conn).unwrap();
+        let research_skill = catalog
+            .iter()
+            .find(|addon| addon.slug == "deep-research")
+            .unwrap();
+
+        let research = create_workspace_task_on(
+            &conn,
+            workspace.id,
+            "Research competitors",
+            "Compare the market",
+            "research",
+            None,
+            None,
+        )
+        .unwrap();
+        let research_staffing = crate::commands::capability_task_staffing(
+            &research.title,
+            &research.details,
+            &research.capability,
+            &catalog,
+        );
+        set_task_staffing_on(&conn, research.id, &research_staffing).unwrap();
+
+        let stored_research = get_workspace_task_on(&conn, research.id).unwrap().unwrap();
+        let stored_staffing = get_task_staffing_on(&conn, research.id).unwrap().unwrap();
+        assert_eq!(stored_research.capability, "research");
+        assert_eq!(stored_staffing.mode, "manual");
+        assert_eq!(stored_staffing.skill_ids, vec![research_skill.id]);
+        assert_eq!(stored_staffing.reason, "Adapter: deep-research");
+
+        let present = create_workspace_task_on(
+            &conn,
+            workspace.id,
+            "Present the findings",
+            "",
+            "present",
+            None,
+            None,
+        )
+        .unwrap();
+        let catalog_without_slides = catalog
+            .iter()
+            .filter(|addon| addon.slug != "slides-deck")
+            .cloned()
+            .collect::<Vec<_>>();
+        let staffing = crate::commands::capability_task_staffing(
+            &present.title,
+            &present.details,
+            &present.capability,
+            &catalog_without_slides,
+        );
+        set_task_staffing_on(&conn, present.id, &staffing).unwrap();
+
+        let stored = get_task_staffing_on(&conn, present.id).unwrap().unwrap();
+        assert!(stored.skill_ids.is_empty());
+        assert_eq!(stored.reason, "baseline:present");
+    }
+
+    #[test]
     fn task_staffing_set_twice_upserts_same_task() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
         let first = TaskStaffing {
             mode: "automatic".to_string(),
             agent_id: Some(17),
@@ -5648,8 +6237,8 @@ mod tests {
     fn deleting_workspace_task_removes_its_staffing() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
         set_task_staffing_on(
             &conn,
             task.id,
@@ -5674,11 +6263,12 @@ mod tests {
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
         assert!(next_queued_task_on(&conn, workspace.id).unwrap().is_none());
 
-        let newer = create_workspace_task_on(&conn, workspace.id, "Newer", "", None, None).unwrap();
+        let newer =
+            create_workspace_task_on(&conn, workspace.id, "Newer", "", "", None, None).unwrap();
         let oldest =
-            create_workspace_task_on(&conn, workspace.id, "Oldest", "", None, None).unwrap();
+            create_workspace_task_on(&conn, workspace.id, "Oldest", "", "", None, None).unwrap();
         let running =
-            create_workspace_task_on(&conn, workspace.id, "Running", "", None, None).unwrap();
+            create_workspace_task_on(&conn, workspace.id, "Running", "", "", None, None).unwrap();
         conn.execute(
             "UPDATE workspace_tasks SET created_at = ?1 WHERE id = ?2",
             params!["2026-01-02T00:00:00Z", newer.id],
@@ -5711,7 +6301,8 @@ mod tests {
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
         assert!(!workspace_has_running_task_on(&conn, workspace.id).unwrap());
 
-        let task = create_workspace_task_on(&conn, workspace.id, "Draft", "", None, None).unwrap();
+        let task =
+            create_workspace_task_on(&conn, workspace.id, "Draft", "", "", None, None).unwrap();
         let run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
         assert!(workspace_has_running_task_on(&conn, workspace.id).unwrap());
 
@@ -5723,7 +6314,8 @@ mod tests {
     fn queued_task_that_cannot_start_is_marked_failed() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task = create_workspace_task_on(&conn, workspace.id, "Draft", "", None, None).unwrap();
+        let task =
+            create_workspace_task_on(&conn, workspace.id, "Draft", "", "", None, None).unwrap();
 
         assert!(fail_task_that_could_not_start_on(
             &conn,
@@ -5753,7 +6345,8 @@ mod tests {
     fn running_task_is_not_changed_when_start_failure_is_reported() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task = create_workspace_task_on(&conn, workspace.id, "Draft", "", None, None).unwrap();
+        let task =
+            create_workspace_task_on(&conn, workspace.id, "Draft", "", "", None, None).unwrap();
         let existing_run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
 
         assert!(
@@ -5780,9 +6373,9 @@ mod tests {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
         let queued =
-            create_workspace_task_on(&conn, workspace.id, "Queued", "", None, None).unwrap();
+            create_workspace_task_on(&conn, workspace.id, "Queued", "", "", None, None).unwrap();
         let running =
-            create_workspace_task_on(&conn, workspace.id, "Running", "", None, None).unwrap();
+            create_workspace_task_on(&conn, workspace.id, "Running", "", "", None, None).unwrap();
         let running_run =
             create_workspace_run_on(&conn, workspace.id, running.id, "local").unwrap();
 
@@ -5818,11 +6411,14 @@ mod tests {
         let first_workspace = create_workspace_on(&conn, "First", "blue").unwrap();
         let second_workspace = create_workspace_on(&conn, "Second", "blue").unwrap();
         let first_task =
-            create_workspace_task_on(&conn, first_workspace.id, "First", "", None, None).unwrap();
+            create_workspace_task_on(&conn, first_workspace.id, "First", "", "", None, None)
+                .unwrap();
         let second_task =
-            create_workspace_task_on(&conn, second_workspace.id, "Second", "", None, None).unwrap();
+            create_workspace_task_on(&conn, second_workspace.id, "Second", "", "", None, None)
+                .unwrap();
         let untouched =
-            create_workspace_task_on(&conn, first_workspace.id, "Queued", "", None, None).unwrap();
+            create_workspace_task_on(&conn, first_workspace.id, "Queued", "", "", None, None)
+                .unwrap();
         let first_run =
             create_workspace_run_on(&conn, first_workspace.id, first_task.id, "local").unwrap();
         let second_run =
@@ -5850,8 +6446,8 @@ mod tests {
     fn finished_run_awaits_review_and_counts_show_it() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
         let run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
 
         finish_workspace_run_on(&conn, run.id, "done", "draft", "").unwrap();
@@ -5887,7 +6483,7 @@ mod tests {
         .unwrap();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
         let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", Some(7), Some(3))
+            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", Some(7), Some(3))
                 .unwrap();
         let run = create_workspace_run_on(&conn, workspace.id, task.id, "claude").unwrap();
         insert_workspace_artifact_on(&conn, workspace.id, run.id, "memo.md", "/tmp/memo.md")
@@ -5918,8 +6514,8 @@ mod tests {
     fn reject_requeues_with_note_and_attempt() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
         let first_run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
         finish_workspace_run_on(&conn, first_run.id, "done", "draft", "").unwrap();
 
@@ -6018,7 +6614,7 @@ mod tests {
         let workspace = create_workspace_on(&conn, "Project", "blue").unwrap();
         set_meeting_binding_on(&conn, 7, Some(workspace.id)).unwrap();
         let manual =
-            create_workspace_task_on(&conn, workspace.id, "Draft the memo", "", None, None)
+            create_workspace_task_on(&conn, workspace.id, "Draft the memo", "", "", None, None)
                 .unwrap();
         conn.execute(
             "INSERT INTO action_items (id, meeting_id, ord, text)
@@ -6091,7 +6687,7 @@ mod tests {
         assert_eq!(list_workspaces_on(&conn).unwrap()[0].needs_you_count, 0);
 
         let manual =
-            create_workspace_task_on(&conn, workspace.id, "Call the supplier", "", None, None)
+            create_workspace_task_on(&conn, workspace.id, "Call the supplier", "", "", None, None)
                 .unwrap();
         assert!(manual.agent_eligible);
     }
@@ -6188,7 +6784,7 @@ mod tests {
         assert_eq!(before[0].meeting_count, 0);
         assert_eq!(before[0].folder_count, 0);
 
-        create_workspace_task_on(&conn, workspace.id, "Draft plan", "", None, None).unwrap();
+        create_workspace_task_on(&conn, workspace.id, "Draft plan", "", "", None, None).unwrap();
         let after = list_workspaces_on(&conn).unwrap();
         assert_eq!(after[0].queued_task_count, 1);
     }
@@ -6317,12 +6913,26 @@ mod tests {
         .unwrap();
         let workspace = create_workspace_on(&conn, "Product", "blue").unwrap();
 
-        let first =
-            create_workspace_task_on(&conn, workspace.id, "Write follow-up", "", Some(7), None)
-                .unwrap();
-        let second =
-            create_workspace_task_on(&conn, workspace.id, "Share decisions", "", Some(7), None)
-                .unwrap();
+        let first = create_workspace_task_on(
+            &conn,
+            workspace.id,
+            "Write follow-up",
+            "",
+            "",
+            Some(7),
+            None,
+        )
+        .unwrap();
+        let second = create_workspace_task_on(
+            &conn,
+            workspace.id,
+            "Share decisions",
+            "",
+            "",
+            Some(7),
+            None,
+        )
+        .unwrap();
         assert_eq!(first.source_meeting_title, "Product review");
         assert_eq!(second.source_meeting_title, "Product review");
 
@@ -6342,7 +6952,7 @@ mod tests {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Research", "blue").unwrap();
         let error =
-            create_workspace_task_on(&conn, workspace.id, "Investigate", "", Some(404), None)
+            create_workspace_task_on(&conn, workspace.id, "Investigate", "", "", Some(404), None)
                 .unwrap_err();
         assert!(error.to_string().contains("Meeting not found: 404"));
     }
@@ -6361,8 +6971,8 @@ mod tests {
         set_meeting_binding_on(&conn, 8, Some(second.id)).unwrap();
         add_workspace_context_on(&conn, first.id, "folder", "/first", "first").unwrap();
         add_workspace_context_on(&conn, second.id, "folder", "/second", "second").unwrap();
-        create_workspace_task_on(&conn, first.id, "First task", "", None, None).unwrap();
-        create_workspace_task_on(&conn, second.id, "Second task", "", None, None).unwrap();
+        create_workspace_task_on(&conn, first.id, "First task", "", "", None, None).unwrap();
+        create_workspace_task_on(&conn, second.id, "Second task", "", "", None, None).unwrap();
 
         delete_workspace_on(&conn, first.id).unwrap();
 
@@ -6426,8 +7036,8 @@ mod tests {
     fn workspace_run_lifecycle_updates_task_status() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
 
         let run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
         assert_eq!(
@@ -6461,11 +7071,38 @@ mod tests {
     }
 
     #[test]
+    fn workspace_run_report_round_trips_through_run_getters() {
+        let conn = workspace_conn();
+        let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
+        let run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
+
+        set_workspace_run_report_on(
+            &conn,
+            run.id,
+            "Produced the launch memo and left pricing undecided.",
+        )
+        .unwrap();
+
+        let loaded = get_workspace_run_on(&conn, run.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.report,
+            "Produced the launch memo and left pricing undecided."
+        );
+        let latest = get_latest_workspace_run_on(&conn, task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.report, loaded.report);
+    }
+
+    #[test]
     fn workspace_artifacts_are_newest_first_and_in_workspace_detail() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Research", "blue").unwrap();
         let task =
-            create_workspace_task_on(&conn, workspace.id, "Compare notes", "", None, None).unwrap();
+            create_workspace_task_on(&conn, workspace.id, "Compare notes", "", "", None, None)
+                .unwrap();
         let run = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
 
         let first =
@@ -6493,8 +7130,8 @@ mod tests {
     fn latest_workspace_run_uses_highest_run_id() {
         let conn = workspace_conn();
         let workspace = create_workspace_on(&conn, "Launch", "blue").unwrap();
-        let task =
-            create_workspace_task_on(&conn, workspace.id, "Draft memo", "", None, None).unwrap();
+        let task = create_workspace_task_on(&conn, workspace.id, "Draft memo", "", "", None, None)
+            .unwrap();
         let first = create_workspace_run_on(&conn, workspace.id, task.id, "local").unwrap();
         finish_workspace_run_on(&conn, first.id, "failed", "", "failed").unwrap();
         let second = create_workspace_run_on(&conn, workspace.id, task.id, "codex").unwrap();
