@@ -608,3 +608,51 @@ def test_manifest_accepts_onnx_weights():
     with patch.object(model_setup.HfApi, "model_info", return_value=info):
         files = model_setup._load_manifest(pin)
     assert [file.name for file in files] == ["tokens.txt", "encoder.int8.onnx"]
+
+
+def test_live_captions_pin_is_platform_neutral():
+    pin = model_setup.MODEL_PINS["live-captions-en"]
+    assert (
+        pin.repo_id
+        == "csukuangfj2/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"
+    )
+    assert pin.revision == "d1e6c30921780b8508d04b492dfb3ce8a51605d4"
+    assert pin.allow_patterns is not None
+    assert {
+        "encoder_model.ort",
+        "decoder_model_merged.ort",
+        "tokens.txt",
+    }.issubset(pin.allow_patterns)
+
+
+def test_load_manifest_accepts_ort_weights():
+    pin = model_setup.MODEL_PINS["live-captions-en"]
+    info = SimpleNamespace(
+        sha=pin.revision,
+        siblings=[
+            SimpleNamespace(
+                rfilename="encoder_model.ort",
+                size=100,
+                lfs=SimpleNamespace(sha256="b" * 64),
+            ),
+            SimpleNamespace(rfilename="tokens.txt", size=10, lfs=None),
+        ],
+    )
+    with patch.object(model_setup.HfApi, "model_info", return_value=info):
+        files = model_setup._load_manifest(pin)
+    assert [file.name for file in files] == ["encoder_model.ort", "tokens.txt"]
+
+
+def test_ready_snapshot_dir_requires_every_pinned_file(tmp_path, monkeypatch):
+    snapshot = tmp_path / "snap"
+    monkeypatch.setattr(model_setup, "_snapshot_path", lambda pin: snapshot)
+
+    assert model_setup.ready_snapshot_dir("live-captions-en") is None
+    snapshot.mkdir()
+    (snapshot / "encoder_model.ort").touch()
+    assert model_setup.ready_snapshot_dir("live-captions-en") is None
+
+    pin = model_setup.MODEL_PINS["live-captions-en"]
+    for name in pin.allow_patterns or ():
+        (snapshot / name).touch()
+    assert model_setup.ready_snapshot_dir("live-captions-en") == snapshot

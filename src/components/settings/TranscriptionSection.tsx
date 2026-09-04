@@ -6,7 +6,7 @@ import type { AppConfig, TranscriptionProvider } from "../../types";
 import { classifyTranscriptionProvider } from "../../types";
 import type { ServiceHealth } from "../../hooks/useServiceHealth";
 import type { SettingsModels } from "../../hooks/useSettingsModels";
-import { aggregatePercent, formatGb, isInFlight, whisperModelId } from "../../lib/modelDownloads";
+import { LIVE_CAPTIONS_ID, aggregatePercent, formatGb, isInFlight, whisperModelId } from "../../lib/modelDownloads";
 import { resetModelDownload } from "../../lib/tauri";
 
 interface TranscriptionSectionProps {
@@ -360,6 +360,69 @@ export function TranscriptionSection({
               })}
             </div>
           )}
+          {(() => {
+            const liveState = health.health?.live_captions_state;
+            const status = downloads[LIVE_CAPTIONS_ID];
+            const running = status ? isInFlight(status) : false;
+            const percent = status ? aggregatePercent([status]) : null;
+            const ready = liveState === "ready";
+            const detail = running
+              ? null
+              : ready
+                ? "On this computer · grey words appear while someone is speaking"
+                : liveState === "loading"
+                  ? "Starting up…"
+                  : liveState === "error"
+                    ? "Couldn't load — download it again"
+                    : status?.state === "error"
+                      ? status.detail
+                      : "44 MB download · English only; confirmed lines still come from your transcription model";
+            return (
+              <div className="settings-model-list" data-testid="live-captions-row">
+                <div className={`settings-model-row${ready ? " active" : ""}`}>
+                  <div className="settings-model-info">
+                    <span className="settings-model-name">
+                      Live captions preview <em>{" — "}words as they are spoken</em>
+                    </span>
+                    {detail && <small>{detail}</small>}
+                    {running && status && (
+                      <>
+                        <small>
+                          {status.total_bytes > 0
+                            ? `${formatGb(status.downloaded_bytes)} of ${formatGb(status.total_bytes)}`
+                            : "Preparing…"}
+                        </small>
+                        {status.total_bytes > 0 ? (
+                          <progress value={status.downloaded_bytes} max={status.total_bytes} />
+                        ) : (
+                          <progress />
+                        )}
+                      </>
+                    )}
+                  </div>
+                  <div className="settings-model-action">
+                    {running && status ? (
+                      <span className="settings-model-dl">
+                        {percent === null ? "Downloading…" : `Downloading ${percent}%`}
+                      </span>
+                    ) : ready ? (
+                      <span className="settings-model-inuse">Active</span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        onClick={() => void beginDownload(LIVE_CAPTIONS_ID, setWhisperMsg)}
+                        disabled={health.healthStatus === "unreachable"}
+                        title={health.healthStatus === "unreachable" ? "Local AI offline — restart it first" : undefined}
+                      >
+                        {status?.state === "error" || liveState === "error" ? "Retry" : "Download"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
           {health.healthStatus === "unreachable" && (
             <p className="settings-help">
               The local AI service isn&apos;t running — downloads need it. Start Adversaria&apos;s

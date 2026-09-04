@@ -91,8 +91,12 @@ all communication with the Python service.
   stored transcript with a different template.
 - **`audio/`** — **dual capture (system audio "Them" + mic "Me"), platform-split.**
   `mod.rs` holds the platform-agnostic surface: `AudioCapture`, `RecordingPaths`,
-  the shared `StreamState` accumulator, the float/PCM `write_wav_file`, and the
-  rolling-window `snapshot_tail` (live caption). Only the capture mechanism is
+  the shared `StreamState` accumulator, the float/PCM `write_wav_file`, and
+  `snapshot_since` (the append-only live buffer's delta since the last byte
+  offset — the live-caption feed; `commands.rs::spawn_live_caption` polls it
+  every `LIVE_CHUNK_MS` = 500 ms per source and emits `live-transcript` for
+  confirmed utterances and `live-partial` for the grey preview, replace
+  semantics, cleared on stop). Only the capture mechanism is
   `#[cfg]`-gated:
   - **`wasapi.rs`** (Windows) — two OS threads: the default *render* device in
     loopback mode + the default *capture* device. Shared-mode WASAPI delivers
@@ -152,15 +156,27 @@ Endpoints:
 
 | Method/Path | Purpose | Request → Response |
 |-------------|---------|--------------------|
-| `GET /health` | readiness | → `{status, whisper_model, ollama_available, transcriber_state, transcriber_detail}` |
+| `GET /health` | readiness | → `{status, whisper_model, ollama_available, transcriber_state, transcriber_detail, embedder_state, embedder_detail, live_captions_state}` |
 | `GET /templates` | list templates | → `[{name, description}]` |
 | `GET /templates/{name}` | raw template | → `{name, content}` |
+| `POST /live_feed` | live captions, two tiers | `{audio_path (delta WAV of NEW audio), session (recording epoch), source: "them"\|"me"}` → `{captions: [confirmed utterances], partial: "grey preview of the unconfirmed tail"}` (2026-09-01, ADR-019) |
 | `POST /transcribe` | speech→text (+ diarization) | `{audio_path, mic_audio_path?, me_label?, vocabulary?, diarize}` → `{text, language, duration_seconds}` |
 | `POST /summarize` | text→notes | `{transcript, template_name, model?, llm_base_url?, llm_api_key?}` → `{summary, template_used, title, attendees, category}` |
 | `POST /chat` | grounded Q&A | `{transcript, question, model?, llm_base_url?, llm_api_key?}` → `{answer}` |
 | `POST /chat_stream` | streaming Q&A | same as `/chat` → SSE: `data:{"t":"…"}` frames, ended by `[DONE]` |
 | `POST /embed` | batch text embeddings (hybrid Ask) | `{texts, model?}` → `{embeddings, model, dim}`; 503 + `ollama pull bge-m3` hint when the model is missing |
 
+- **`live.py`** — live captions, two tiers per audio source (ADR-019). `LiveCaptionSession`
+  buffers the delta feed, Silero-VAD segments it, and yields FINISHED utterances
+  once each for the resident Whisper (confirmed `captions`, any language). The
+  PREVIEW tier: `unconfirmed_tail()` (audio after the watermark, from the first
+  VAD speech region, capped to the LAST 8 s) is re-decoded on every poll by
+  `MoonshinePartialEngine` (sherpa-onnx Moonshine v2 tiny, English, pinned profile
+  `live-captions-en`, ~44 MB, built at startup / when its download lands) and
+  returned as `partial`; loops are trimmed to the sane prefix, fillers dropped,
+  and the preview self-gates off when Whisper reports a non-English utterance
+  (`note_confirmed_language`). The preview never takes the Whisper lock, so a
+  running `/transcribe` delays confirmations only.
 - **`embedder.py`** — `OllamaEmbedder`: batch text embeddings via a local Ollama
   model (default `bge-m3`, override with `EMBED_MODEL`). Independent of the
   summarizer's LLM backend (on this Mac the LLM is Rapid-MLX/openai while

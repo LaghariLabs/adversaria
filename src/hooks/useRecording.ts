@@ -12,6 +12,23 @@ import {
 import type { AttachmentDraft, CalendarEvent } from "../types";
 import { isUnrecoverable } from "../lib/recordingErrors";
 
+/** Rejects with the given message if the promise does not settle in time. */
+export function raceWithWatchdog<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const watchedPromise = promise.finally(() => clearTimeout(timer));
+  const watchdog = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      void watchedPromise.catch(() => undefined);
+      reject(new Error(message));
+    }, ms);
+  });
+  return Promise.race([watchedPromise, watchdog]);
+}
+
 /** Capture status only. Transcription no longer blocks this — once a recording
  *  is stopped it's enqueued for background transcription and the status returns
  *  to "idle" immediately, so the next meeting can be recorded right away. */
@@ -174,8 +191,12 @@ export function useRecording(): UseRecordingReturn {
     setTranscribingId(job.id);
     setQueue((q) => q.slice(1));
 
-    transcribeMeeting(job.id)
+    const watchdogMessage = `Background transcription for meeting ${job.id} was abandoned after 45 minutes because it did not finish. The audio is kept for retry.`;
+    let abandoned = false;
+
+    raceWithWatchdog(transcribeMeeting(job.id), 45 * 60_000, watchdogMessage)
       .then(async (updated) => {
+        if (abandoned) return;
         if (updated === null) {
           setLastDiscardedId(job.id);
           return;
@@ -205,6 +226,9 @@ export function useRecording(): UseRecordingReturn {
         }
       })
       .catch((e) => {
+        if (e instanceof Error && e.message === watchdogMessage) {
+          abandoned = true;
+        }
         // Transcription failed (e.g. the transcription model isn't on this
         // machine yet). The meeting stays a pending row with its audio kept, so
         // it can be retried — but silence here meant a recording that quietly

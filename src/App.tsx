@@ -20,7 +20,7 @@ import { useMeetings } from "./hooks/useMeetings";
 import { RecordingControls } from "./components/RecordingControls";
 import { MeetingsList } from "./components/MeetingsList";
 import { NoteViewer, NoteViewerEmpty } from "./components/NoteViewer";
-import { ProjectView } from "./components/ProjectView";
+import { FolderView } from "./components/FolderView";
 import { RecordingCompanion } from "./components/RecordingCompanion";
 import { ErrorBanner } from "./components/ErrorBanner";
 import { UpdatePrompt } from "./components/UpdatePrompt";
@@ -44,23 +44,23 @@ import {
   importMeetingBundle,
   pickAudioFile,
   biometricAuthenticate,
-  clearMeetingWorkspaceBinding,
-  createWorkspace,
-  deleteWorkspace,
-  listMeetingWorkspaceBindings,
-  listWorkspaces,
-  setMeetingWorkspaceBinding,
-  suggestWorkspaceForMeeting,
+  clearMeetingFolder,
+  createFolder,
+  deleteFolder,
+  listMeetingFolders,
+  listFolders,
+  setMeetingFolder,
+  suggestFolderForMeeting,
 } from "./lib/tauri";
 import { verifyPin } from "./lib/pin";
 import { setDateFormat } from "./lib/dateFormat";
 import type {
   AttachmentDraft,
   Meeting,
-  MeetingWorkspaceBinding,
+  MeetingFolder,
   PromptTemplate,
-  WorkspaceSuggestion,
-  WorkspaceSummary,
+  FolderSuggestion,
+  FolderSummary,
 } from "./types";
 
 // Secondary views are intentionally split from the startup/recording path.
@@ -125,6 +125,10 @@ function App() {
   const [userNotes, setUserNotes] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentDraft[]>([]);
   const [liveLines, setLiveLines] = useState<{ text: string; source: string }[]>([]);
+  const [livePartials, setLivePartials] = useState<{ me: string; them: string }>({
+    me: "",
+    them: "",
+  });
   const [sidebarWidth, setSidebarWidth] = useState(288);
   const [meetingOverPrompt, setMeetingOverPrompt] = useState(false);
   const [showSplash, setShowSplash] = useState(true);
@@ -145,9 +149,9 @@ function App() {
   // Meeting pending delete-confirmation (in-app modal — window.confirm is a
   // no-op in the Tauri webview, so it can't gate the delete).
   const [deletePrompt, setDeletePrompt] = useState<Meeting | null>(null);
-  const [deleteProjectPrompt, setDeleteProjectPrompt] =
-    useState<WorkspaceSummary | null>(null);
-  const [deletingProject, setDeletingProject] = useState(false);
+  const [deleteFolderPrompt, setDeleteProjectPrompt] =
+    useState<FolderSummary | null>(null);
+  const [deletingFolder, setDeletingProject] = useState(false);
   const [recordingView, setRecordingView] = useState("balanced");
   const [peekBrowse, setPeekBrowse] = useState(false);
   // Auto-stop thresholds, loaded from config (defaults match the old constants).
@@ -176,84 +180,84 @@ function App() {
   const lastActivityRef = useRef(Date.now());
   const { meetings, selectedMeeting, selectMeeting, clearSelection, refresh } =
     useMeetings();
-  const [projects, setProjects] = useState<WorkspaceSummary[]>([]);
-  const [bindings, setBindings] = useState<MeetingWorkspaceBinding[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
-  const [projectsLoaded, setProjectsLoaded] = useState(false);
-  const [workspaceSuggestions, setWorkspaceSuggestions] = useState<
-    Map<number, WorkspaceSuggestion | null>
+  const [folders, setFolders] = useState<FolderSummary[]>([]);
+  const [meetingFolders, setMeetingFolders] = useState<MeetingFolder[]>([]);
+  const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
+  const [foldersLoaded, setProjectsLoaded] = useState(false);
+  const [folderSuggestions, setFolderSuggestions] = useState<
+    Map<number, FolderSuggestion | null>
   >(new Map());
   const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<number>>(
     new Set(),
   );
 
-  const refreshProjects = useCallback(async () => {
+  const refreshFolders = useCallback(async () => {
     try {
       const [nextProjects, nextBindings] = await Promise.all([
-        listWorkspaces(),
-        listMeetingWorkspaceBindings(),
+        listFolders(),
+        listMeetingFolders(),
       ]);
-      setProjects(nextProjects);
-      setBindings(nextBindings);
+      setFolders(nextProjects);
+      setMeetingFolders(nextBindings);
       setProjectsLoaded(true);
     } catch (loadError) {
-      setNotice("Couldn't load projects: " + String(loadError).slice(0, 160));
+      setNotice("Couldn't load folders: " + String(loadError).slice(0, 160));
     }
   }, []);
 
   useEffect(() => {
-    void refreshProjects();
-  }, [meetings, refreshProjects]);
+    void refreshFolders();
+  }, [meetings, refreshFolders]);
 
-  const handleAssignToProject = useCallback(
+  const handleAssignToFolder = useCallback(
     async (meeting: Meeting, workspaceId: number | null) => {
       try {
         if (workspaceId === null) {
-          await clearMeetingWorkspaceBinding(meeting.id);
+          await clearMeetingFolder(meeting.id);
         } else {
-          await setMeetingWorkspaceBinding(meeting.id, workspaceId);
+          await setMeetingFolder(meeting.id, workspaceId);
         }
-        await refreshProjects();
+        await refreshFolders();
       } catch (assignError) {
-        setNotice("Couldn't update project: " + String(assignError).slice(0, 160));
+        setNotice("Couldn't update folder: " + String(assignError).slice(0, 160));
       }
     },
-    [refreshProjects],
+    [refreshFolders],
   );
 
-  const handleCreateProject = useCallback(
+  const handleCreateFolder = useCallback(
     async (name: string, color: string): Promise<number | null> => {
       try {
-        const workspace = await createWorkspace(name, color);
-        await refreshProjects();
+        const workspace = await createFolder(name, color);
+        await refreshFolders();
         return workspace.id;
       } catch (createError) {
-        setNotice("Couldn't create project: " + String(createError).slice(0, 160));
+        setNotice("Couldn't create folder: " + String(createError).slice(0, 160));
         return null;
       }
     },
-    [refreshProjects],
+    [refreshFolders],
   );
 
-  const selectedBinding = selectedMeeting
-    ? bindings.find((binding) => binding.meeting_id === selectedMeeting.id)
+  const selectedMeetingFolder = selectedMeeting
+    ? meetingFolders.find((binding) => binding.meeting_id === selectedMeeting.id)
     : undefined;
-  const selectedProject = selectedBinding?.workspace_id == null
+  const selectedFolder = selectedMeetingFolder?.folder_id == null
     ? undefined
-    : projects.find(
-        (project) => project.workspace.id === selectedBinding.workspace_id,
+    : folders.find(
+        (project) => project.folder.id === selectedMeetingFolder.folder_id,
       );
-  const selectedProjectForView = selectedProjectId === null
+  const selectedFolderForView = selectedFolderId === null
     ? undefined
-    : projects.find((project) => project.workspace.id === selectedProjectId);
-  const projectMeetings = useMemo(() => {
-    if (selectedProjectId === null) return [];
+    : folders.find((project) => project.folder.id === selectedFolderId);
+  const folderMeetings = useMemo(() => {
+    if (selectedFolderId === null) return [];
     const projectMeetingIds = new Set(
-      bindings
+      meetingFolders
         .filter(
           (binding) =>
-            binding.workspace_id !== null &&
-            binding.workspace_id === selectedProjectId,
+            binding.folder_id !== null &&
+            binding.folder_id === selectedFolderId,
         )
         .map((binding) => binding.meeting_id),
     );
@@ -263,54 +267,54 @@ function App() {
         (a, b) =>
           new Date(b.recorded_at).getTime() - new Date(a.recorded_at).getTime(),
       );
-  }, [bindings, meetings, selectedProjectId]);
+  }, [meetingFolders, meetings, selectedFolderId]);
 
   useEffect(() => {
     if (
-      selectedProjectId !== null &&
-      !projects.some((project) => project.workspace.id === selectedProjectId)
+      selectedFolderId !== null &&
+      !folders.some((project) => project.folder.id === selectedFolderId)
     ) {
-      setSelectedProjectId(null);
+      setSelectedFolderId(null);
     }
-  }, [projects, selectedProjectId]);
+  }, [folders, selectedFolderId]);
 
   useEffect(() => {
     if (
       !selectedMeeting ||
-      !projectsLoaded ||
-      selectedBinding !== undefined ||
+      !foldersLoaded ||
+      selectedMeetingFolder !== undefined ||
       selectedMeeting.summary.trim() === "" ||
       dismissedSuggestions.has(selectedMeeting.id) ||
-      workspaceSuggestions.has(selectedMeeting.id)
+      folderSuggestions.has(selectedMeeting.id)
     ) {
       return;
     }
     let cancelled = false;
-    suggestWorkspaceForMeeting(selectedMeeting.id)
+    suggestFolderForMeeting(selectedMeeting.id)
       .then((suggestion) => {
         if (cancelled) return;
-        setWorkspaceSuggestions((current) => {
+        setFolderSuggestions((current) => {
           const next = new Map(current);
           next.set(selectedMeeting.id, suggestion);
           return next;
         });
       })
       .catch((suggestionError) => {
-        console.warn("Failed to suggest project:", suggestionError);
+        console.warn("Failed to suggest folder:", suggestionError);
       });
     return () => {
       cancelled = true;
     };
   }, [
     dismissedSuggestions,
-    projectsLoaded,
-    selectedBinding,
+    foldersLoaded,
+    selectedMeetingFolder,
     selectedMeeting,
-    workspaceSuggestions,
+    folderSuggestions,
   ]);
 
   const selectedSuggestion = selectedMeeting && !dismissedSuggestions.has(selectedMeeting.id)
-    ? workspaceSuggestions.get(selectedMeeting.id) ?? null
+    ? folderSuggestions.get(selectedMeeting.id) ?? null
     : null;
 
   // Refs for Tauri event listeners to avoid stale closures
@@ -399,10 +403,11 @@ function App() {
     if (lastMeetingId !== null && lastMeetingId !== prevLastMeetingId.current) {
       prevLastMeetingId.current = lastMeetingId;
       refresh();
-      setSelectedProjectId(null);
+      setSelectedFolderId(null);
       selectMeeting(lastMeetingId);
       setUserNotes("");
       setLiveLines([]);
+      setLivePartials({ me: "", them: "" });
     }
   }, [lastMeetingId, refresh, selectMeeting]);
 
@@ -420,7 +425,7 @@ function App() {
       return;
     }
     if (lastSettledId !== null && selectedMeetingRef.current?.id === lastSettledId) {
-      setSelectedProjectId(null);
+      setSelectedFolderId(null);
       selectMeeting(lastSettledId);
     }
   }, [settledTick, lastSettledId, lastDiscardedId, refresh, selectMeeting, clearSelection]);
@@ -429,6 +434,7 @@ function App() {
   useEffect(() => {
     if (status === "idle") {
       setLiveLines([]);
+      setLivePartials({ me: "", them: "" });
       setPeekBrowse(false);
     }
   }, [status]);
@@ -465,6 +471,16 @@ function App() {
         lastActivityRef.current = Date.now();
         setMeetingOverPrompt(false);
       }),
+      // Streaming preview of the utterance in progress (replace semantics per
+      // source; empty text clears). Counts as activity for the silence auto-stop.
+      listen<{ text: string; source: string }>("live-partial", (event) => {
+        const source = event.payload.source === "me" ? "me" : "them";
+        setLivePartials((prev) => ({ ...prev, [source]: event.payload.text }));
+        if (event.payload.text.trim() !== "") {
+          lastActivityRef.current = Date.now();
+          setMeetingOverPrompt(false);
+        }
+      }),
     ];
 
     return () => {
@@ -496,9 +512,10 @@ function App() {
   useEffect(() => {
     if (status === "recording") {
       clearSelection();
-      setSelectedProjectId(null);
+      setSelectedFolderId(null);
       setView("meetings");
       setLiveLines([]);
+      setLivePartials({ me: "", them: "" });
       setPeekBrowse(false);
       getConfig()
         .then((c) => setRecordingView(c.recording_view ?? "balanced"))
@@ -549,7 +566,7 @@ function App() {
   const performUnlock = (meeting: Meeting, purpose: "view" | "unlock") => {
     if (purpose === "view") {
       setUnlockedIds((prev) => new Set(prev).add(meeting.id));
-      setSelectedProjectId(null);
+      setSelectedFolderId(null);
       selectMeeting(meeting.id);
       setView("meetings");
     } else {
@@ -557,7 +574,7 @@ function App() {
         .then(() => {
           refresh();
           if (selectedMeeting?.id === meeting.id) {
-            setSelectedProjectId(null);
+            setSelectedFolderId(null);
             selectMeeting(meeting.id);
           }
         })
@@ -597,11 +614,18 @@ function App() {
       requestUnlock(meeting, "view");
       return;
     }
-    setSelectedProjectId(null);
+    setSelectedFolderId(null);
     selectMeeting(meeting.id);
     // Clicking a meeting in the sidebar jumps to its note from any other
     // tab (Weekly / Ask / Graph / Settings).
     setView("meetings");
+  };
+
+  const handleOpenMeetingId = (meetingId: number) => {
+    const target = meetings.find((m) => m.id === meetingId);
+    if (target) {
+      handleMeetingSelected(target);
+    }
   };
 
   const handleToggleLock = async (meeting: Meeting) => {
@@ -630,7 +654,7 @@ function App() {
         await setMeetingLocked(meeting.id, false);
         refresh();
         if (selectedMeeting?.id === meeting.id) {
-          setSelectedProjectId(null);
+          setSelectedFolderId(null);
           selectMeeting(meeting.id);
         }
       } catch (e) {
@@ -666,7 +690,7 @@ function App() {
   };
 
   const handleOpenFromTodos = (id: number) => {
-    setSelectedProjectId(null);
+    setSelectedFolderId(null);
     selectMeeting(id);
     setView("meetings");
   };
@@ -675,9 +699,9 @@ function App() {
     setDeletePrompt(meeting);
   };
 
-  const handleDeleteProject = (workspaceId: number) => {
-    const project = projects.find(
-      (candidate) => candidate.workspace.id === workspaceId,
+  const handleDeleteFolder = (workspaceId: number) => {
+    const project = folders.find(
+      (candidate) => candidate.folder.id === workspaceId,
     );
     if (project) setDeleteProjectPrompt(project);
   };
@@ -695,18 +719,18 @@ function App() {
     }
   };
 
-  const confirmDeleteProject = async () => {
-    if (!deleteProjectPrompt || deletingProject) return;
-    const projectId = deleteProjectPrompt.workspace.id;
+  const confirmDeleteFolder = async () => {
+    if (!deleteFolderPrompt || deletingFolder) return;
+    const projectId = deleteFolderPrompt.folder.id;
     setDeletingProject(true);
     try {
-      await deleteWorkspace(projectId);
-      if (selectedProjectId === projectId) setSelectedProjectId(null);
+      await deleteFolder(projectId);
+      if (selectedFolderId === projectId) setSelectedFolderId(null);
       setDeleteProjectPrompt(null);
-      await refreshProjects();
+      await refreshFolders();
     } catch (deleteError) {
       setNotice(
-        "Couldn't delete project: " + String(deleteError).slice(0, 160),
+        "Couldn't delete folder: " + String(deleteError).slice(0, 160),
       );
     } finally {
       setDeletingProject(false);
@@ -718,7 +742,7 @@ function App() {
       await setMeetingPinned(meeting.id, !meeting.pinned);
       refresh();
       if (selectedMeeting?.id === meeting.id) {
-        setSelectedProjectId(null);
+        setSelectedFolderId(null);
         selectMeeting(meeting.id);
       }
     } catch (e) {
@@ -732,7 +756,7 @@ function App() {
       await setMeetingArchived(meeting.id, !meeting.archived);
       refresh();
       if (selectedMeeting?.id === meeting.id) {
-        setSelectedProjectId(null);
+        setSelectedFolderId(null);
         selectMeeting(meeting.id);
       }
     } catch (e) {
@@ -742,7 +766,7 @@ function App() {
   };
 
   const handleMeetingUpdated = (updated: { id: number }) => {
-    setSelectedProjectId(null);
+    setSelectedFolderId(null);
     selectMeeting(updated.id);
     refresh();
   };
@@ -751,7 +775,7 @@ function App() {
   const companionActive =
     isRecordingActive &&
     !selectedMeeting &&
-    selectedProjectId === null &&
+    selectedFolderId === null &&
     view === "meetings" &&
     !peekBrowse;
   const recentMeetings = meetings
@@ -821,7 +845,7 @@ function App() {
                     try {
                       const meeting = await importAudio(path);
                       refresh();
-                      setSelectedProjectId(null);
+                      setSelectedFolderId(null);
                       selectMeeting(meeting.id);
                       setView("meetings");
                     } catch (e) {
@@ -844,7 +868,7 @@ function App() {
                       const meeting = await importMeetingBundle();
                       if (meeting) {
                         refresh();
-                        setSelectedProjectId(null);
+                        setSelectedFolderId(null);
                         selectMeeting(meeting.id);
                         setView("meetings");
                       }
@@ -866,17 +890,17 @@ function App() {
       <div className="flex-1 overflow-hidden">
         <MeetingsList
           meetings={meetings}
-          projects={projects}
-          bindings={bindings}
-          selectedProjectId={selectedProjectId}
-          onSelectProject={(id) => {
-            setSelectedProjectId(id);
+          folders={folders}
+          meetingFolders={meetingFolders}
+          selectedFolderId={selectedFolderId}
+          onSelectFolder={(id) => {
+            setSelectedFolderId(id);
             clearSelection();
           }}
           onSelect={handleMeetingSelected}
-          onAssignToProject={handleAssignToProject}
-          onCreateProject={handleCreateProject}
-          onDeleteProject={handleDeleteProject}
+          onAssignToFolder={handleAssignToFolder}
+          onCreateFolder={handleCreateFolder}
+          onDeleteFolder={handleDeleteFolder}
           onTagsUpdated={refresh}
           onDelete={handleDeleteMeeting}
           onTogglePin={handleTogglePin}
@@ -1210,11 +1234,11 @@ function App() {
       )}
 
       {/* Project delete confirmation — meetings survive and become unfiled. */}
-      {deleteProjectPrompt && (
+      {deleteFolderPrompt && (
         <div
           className="modal-overlay open"
           onClick={() => {
-            if (!deletingProject) setDeleteProjectPrompt(null);
+            if (!deletingFolder) setDeleteProjectPrompt(null);
           }}
         >
           <div className="modal-box" onClick={(event) => event.stopPropagation()}>
@@ -1222,7 +1246,7 @@ function App() {
               Delete project?
             </h3>
             <p className="modal-desc">
-              &quot;{deleteProjectPrompt.workspace.name}&quot; and its workspace
+              &quot;{deleteFolderPrompt.folder.name}&quot; and its workspace
               tasks, context, and overview will be permanently deleted. Meetings
               stay in your library and become unfiled.
             </p>
@@ -1231,17 +1255,17 @@ function App() {
                 type="button"
                 onClick={() => setDeleteProjectPrompt(null)}
                 className="btn-modal cancel"
-                disabled={deletingProject}
+                disabled={deletingFolder}
               >
                 Cancel
               </button>
               <button
                 type="button"
-                onClick={() => void confirmDeleteProject()}
+                onClick={() => void confirmDeleteFolder()}
                 className="btn-modal delete"
-                disabled={deletingProject}
+                disabled={deletingFolder}
               >
-                {deletingProject ? "Deleting…" : "Delete project"}
+                {deletingFolder ? "Deleting…" : "Delete project"}
               </button>
             </div>
           </div>
@@ -1339,7 +1363,7 @@ function App() {
               <GraphView meetings={meetings} onSelectMeeting={handleOpenFromTodos} />
             ) : view === "workspaces" ? (
               <WorkspacesView onOpenMeeting={handleOpenFromTodos} />
-            ) : isRecordingActive && !selectedMeeting && !selectedProjectForView ? (
+            ) : isRecordingActive && !selectedMeeting && !selectedFolderForView ? (
               companionActive ? (
                 <RecordingCompanion
                   variant={recordingView}
@@ -1347,6 +1371,7 @@ function App() {
                   onChange={setUserNotes}
                   status={status}
                   liveLines={liveLines}
+                  livePartials={livePartials}
                   attachments={pendingAttachments}
                   onAddAttachment={(attachment) =>
                     setPendingAttachments((current) => [...current, attachment])
@@ -1375,19 +1400,16 @@ function App() {
                   <NoteViewerEmpty />
                 </>
               )
-            ) : selectedProjectForView ? (
-              <ProjectView
-                key={selectedProjectForView.workspace.id}
-                project={selectedProjectForView}
-                meetings={projectMeetings}
+            ) : selectedFolderForView ? (
+              <FolderView
+                key={selectedFolderForView.folder.id}
+                folder={selectedFolderForView}
+                meetings={folderMeetings}
                 onOpenMeeting={(meeting) => {
-                  setSelectedProjectId(null);
+                  setSelectedFolderId(null);
                   handleMeetingSelected(meeting);
                 }}
-                onProjectUpdated={refreshProjects}
-                onOpenWorkspaces={
-                  import.meta.env.DEV ? () => setView("workspaces") : undefined
-                }
+                onFolderUpdated={refreshFolders}
               />
             ) : selectedMeeting ? (
               <>
@@ -1409,13 +1431,18 @@ function App() {
                 <NoteViewer
                   key={selectedMeeting.id}
                   meeting={selectedMeeting}
-                  projectChip={selectedProject ? {
-                    name: selectedProject.workspace.name,
-                    color: selectedProject.workspace.color,
+                  projectChip={selectedFolder ? {
+                    name: selectedFolder.folder.name,
+                    color: selectedFolder.folder.color,
                   } : null}
-                  suggestion={selectedSuggestion}
+                  suggestion={selectedSuggestion ? {
+                    workspace_id: selectedSuggestion.folder_id,
+                    workspace_name: selectedSuggestion.folder_name,
+                    related_meeting_count: selectedSuggestion.related_meeting_count,
+                    shared_attendee_count: selectedSuggestion.shared_attendee_count,
+                  } : null}
                   onAcceptSuggestion={(workspaceId) => {
-                    void handleAssignToProject(selectedMeeting, workspaceId);
+                    void handleAssignToFolder(selectedMeeting, workspaceId);
                   }}
                   onDismissSuggestion={() => {
                     setDismissedSuggestions((current) => {
@@ -1433,6 +1460,7 @@ function App() {
                   transcriptionSetup={transcription}
                   onOpenModelSettings={openModelSettings}
                   onOpenNotesSettings={openNotesSettings}
+                  onOpenMeetingId={handleOpenMeetingId}
                   onDiscarded={() => {
                     setNotice("Recording discarded — no speech was detected.");
                     clearSelection();

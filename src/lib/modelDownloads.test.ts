@@ -1,7 +1,12 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { describe, expect, it } from "vitest";
 
-import { beginModelDownload, onModelDownloadStarted } from "./modelDownloads";
+import {
+  beginModelDownload,
+  downloadLabel,
+  isTranscriptionProfile,
+  onModelDownloadStarted,
+} from "./modelDownloads";
 
 const status = (id: string, state: string) => ({
   profile_id: id,
@@ -96,5 +101,15 @@ describe("model download start bus", () => {
     unsubscribe();
     await beginModelDownload("whisper-live");
     expect(seen).toEqual(["whisper-main"]);
+  });
+});
+
+describe("live-caption download vocabulary", () => {
+  it("uses the live-captions label", () => {
+    expect(downloadLabel("live-captions-en")).toBe("Live captions model");
+  });
+
+  it("classifies live captions as a transcription profile", () => {
+    expect(isTranscriptionProfile("live-captions-en")).toBe(true);
   });
 });

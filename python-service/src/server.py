@@ -14,7 +14,13 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
-from .live import LiveCaptionSession, is_filler_hallucination, is_repetition_loop
+from .live import (
+    LiveCaptionSession,
+    MoonshinePartialEngine,
+    is_filler_hallucination,
+    is_repetition_loop,
+    trim_repetition_loop,
+)
 from .models import (
     DraftRequest,
     GenerateTemplateRequest,
@@ -41,8 +47,10 @@ from .models import (
     WhisperModelInfo,
 )
 from .model_setup import (
+    LIVE_CAPTIONS_PROFILE_ID,
     model_download_status,
     on_download_ready,
+    ready_snapshot_dir,
     start_model_download,
 )
 from .summarizer import (
@@ -87,6 +95,12 @@ logger = logging.getLogger(__name__)
 _transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
 # Dedicated fast model for the live-caption preview (see _build_live_transcriber).
 _live_transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
+# English live-caption PREVIEW engine (Moonshine v2 via sherpa-onnx). Independent
+# of the Whisper resident + lock; `_PARTIAL_STATE` is what /health reports
+# while it is None: missing | loading | error.
+_partial_engine: MoonshinePartialEngine | None = None
+_PARTIAL_STATE = "missing"
+_PARTIAL_INIT_LOCK = threading.Lock()
 _summarizer: OllamaSummarizer | None = None
 _embedder: OllamaEmbedder | None = None
 _OLLAMA_HOST = "http://localhost:11434"
@@ -265,10 +279,39 @@ def _init_transcriber(wait: bool = False) -> None:
         _INIT_LOCK.release()
 
 
+def _init_partial_engine() -> None:
+    """Build the preview engine if its pinned model is on disk. Runs on a
+    background thread at startup and again when its download lands; never
+    raises, never downloads."""
+    global _partial_engine, _PARTIAL_STATE
+    if not _PARTIAL_INIT_LOCK.acquire(blocking=False):
+        return
+    try:
+        if _partial_engine is not None:
+            return
+        snapshot = ready_snapshot_dir(LIVE_CAPTIONS_PROFILE_ID)
+        if snapshot is None:
+            _PARTIAL_STATE = "missing"
+            return
+        _PARTIAL_STATE = "loading"
+        try:
+            _partial_engine = MoonshinePartialEngine(snapshot)
+        except Exception:
+            logger.exception("Live-caption preview engine failed to load")
+            _PARTIAL_STATE = "error"
+            return
+        _PARTIAL_STATE = "ready"
+        logger.info("Live-caption preview engine ready (%s).", _partial_engine.name)
+    finally:
+        _PARTIAL_INIT_LOCK.release()
+
+
 def _on_model_download_ready(profile_id: str) -> None:
     """model_setup callback: a verified download landed — try to come alive."""
     if profile_id.startswith("whisper") and _transcriber is None:
         _init_transcriber(wait=True)
+    if profile_id == LIVE_CAPTIONS_PROFILE_ID and _partial_engine is None:
+        _init_partial_engine()
 
 
 class _ModelDownloadPollFilter(logging.Filter):
@@ -353,7 +396,7 @@ async def lifespan(app: FastAPI):
     within seconds no matter what — a missing model is a reportable state
     (`transcriber_state`), never a hang or a dead process.
     """
-    global _transcriber, _live_transcriber, _summarizer, _embedder
+    global _transcriber, _live_transcriber, _partial_engine, _summarizer, _embedder
     logger.info("Starting ML service lifespan...")
     logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_POLL_FILTER)
     # Identify this process in the log the app ships with a diagnostics bundle.
@@ -374,6 +417,9 @@ async def lifespan(app: FastAPI):
     threading.Thread(
         target=_init_transcriber, name="transcriber-init", daemon=True
     ).start()
+    threading.Thread(
+        target=_init_partial_engine, name="partial-engine-init", daemon=True
+    ).start()
     # Backend is platform-resolved: Rapid-MLX (openai) on Apple Silicon, Ollama
     # elsewhere — unless LLM_BACKEND is set explicitly.
     _summarizer = OllamaSummarizer(
@@ -385,6 +431,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down ML service lifespan.")
     _transcriber = None
     _live_transcriber = None
+    _partial_engine = None
     _summarizer = None
     _embedder = None
 
@@ -434,6 +481,7 @@ def health() -> HealthResponse:
         transcriber_detail=None if _transcriber is not None else _TRANSCRIBER_DETAIL,
         embedder_state=embedder_state,
         embedder_detail=embedder_detail,
+        live_captions_state="ready" if _partial_engine is not None else _PARTIAL_STATE,
     )
 
 
@@ -1013,46 +1061,53 @@ _live_sessions: dict[str, LiveCaptionSession] = {}
 
 @app.post("/live_feed", response_model=LiveFeedResponse)
 def live_feed(request: LiveFeedRequest) -> LiveFeedResponse:
-    """Ingest a delta of new recording audio; return captions for utterances
-    that just FINISHED (Silero-VAD segmented, transcribed once each).
-
-    Best-effort like /transcribe_chunk: failures return empty captions. When a
-    full /transcribe holds the Whisper lock, nothing is transcribed and the
-    watermark does NOT advance — finished utterances are captioned on a later
-    feed instead of being dropped.
-    """
-    if _live_transcriber is None or not request.audio_path.strip():
+    """Ingest live audio and return confirmed Whisper captions plus an English
+    Moonshine preview of the current utterance. The preview is independent of
+    the Whisper lock, so long transcription jobs delay confirmations only."""
+    if not request.audio_path.strip():
         return LiveFeedResponse()
     try:
         session = _live_sessions.setdefault(request.source, LiveCaptionSession())
         session.ingest(request.session, request.audio_path)
         utterances, watermark = session.pending_utterances()
-        if not utterances:
-            return LiveFeedResponse()
-        if not _WHISPER_LOCK.acquire(blocking=False):
-            return LiveFeedResponse()  # busy — retry next feed, nothing lost
-        try:
-            captions: list[str] = []
-            for start, end in utterances:
-                wav = session.write_utterance_wav(start, end)
-                try:
-                    text = _live_transcriber.transcribe(str(wav)).text.strip()
-                    # Preview-only cosmetic gates: Whisper emits "Thank you." /
-                    # "Thanks for watching" for breath/noise that VAD let
-                    # through, and loops one token ("pre pre pre ...") on
-                    # noise. The final transcript is unaffected.
-                    if (
-                        text
-                        and not is_filler_hallucination(text)
-                        and not is_repetition_loop(text)
-                    ):
-                        captions.append(text)
-                finally:
-                    wav.unlink(missing_ok=True)
-            session.advance(watermark)
-            return LiveFeedResponse(captions=captions)
-        finally:
-            _WHISPER_LOCK.release()
+        captions: list[str] = []
+        if (
+            utterances
+            and _live_transcriber is not None
+            and _WHISPER_LOCK.acquire(blocking=False)
+        ):
+            try:
+                for start, end in utterances:
+                    wav = session.write_utterance_wav(start, end)
+                    try:
+                        result = _live_transcriber.transcribe(str(wav))
+                        text = result.text.strip()
+                        session.note_confirmed_language(
+                            getattr(result, "language", "") or ""
+                        )
+                        # Preview-only cosmetic gates (unchanged): Whisper's
+                        # noise fillers and repetition loops never caption.
+                        if (
+                            text
+                            and not is_filler_hallucination(text)
+                            and not is_repetition_loop(text)
+                        ):
+                            captions.append(text)
+                    finally:
+                        wav.unlink(missing_ok=True)
+                session.advance(watermark)
+            finally:
+                _WHISPER_LOCK.release()
+        # Preview of what is being said right now — outside the Whisper lock,
+        # so a running /transcribe delays confirmations, never the preview.
+        partial = ""
+        if _partial_engine is not None and session.partials_enabled:
+            tail = session.unconfirmed_tail()
+            if len(tail):
+                partial = trim_repetition_loop(_partial_engine.decode(tail))
+                if is_filler_hallucination(partial) or is_repetition_loop(partial):
+                    partial = ""
+        return LiveFeedResponse(captions=captions, partial=partial)
     except Exception:
         logger.exception("Live feed failed (non-fatal)")
         return LiveFeedResponse()

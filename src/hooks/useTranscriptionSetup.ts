@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { HealthResponse, ModelDownloadStatus } from "../types";
 import {
@@ -10,6 +10,7 @@ import {
 } from "../lib/tauri";
 import {
   ENGINE_WHISPER_IDS,
+  LIVE_CAPTIONS_ID,
   aggregatePercent,
   beginModelDownload,
   isInFlight,
@@ -38,6 +39,8 @@ export interface TranscriptionSetup {
   detail: string;
   /** Whether the last health poll reached the on-device service. */
   serviceOnline: boolean | null;
+  /** English live-caption preview engine state; undefined until health answers. */
+  liveCaptionsState: HealthResponse["live_captions_state"];
   /** Re-check health (and, when relevant, download progress) immediately. */
   refresh: () => void;
   /** Restart every transcription download that failed. */
@@ -59,7 +62,11 @@ const DOWNLOAD_MS_IDLE = 5_000;
  *
  * Reads `/health`'s `transcriber_state` and — only while that is anything but
  * `ready` — the byte progress of the transcription download profiles. Nothing
- * here ever STARTS a download: the app guides, the user clicks.
+ * here ever STARTS a transcription-model download: the app guides, the user
+ * clicks. The one exception is the 44 MB live-caption preview model, which has
+ * no picker and no consent moment of its own, so it follows the onboarding rule
+ * (auto download, one progress strip) — started at most once per session, and
+ * never re-started after a failure (the strip's Retry does that).
  */
 export function useTranscriptionSetup(): TranscriptionSetup {
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -72,6 +79,7 @@ export function useTranscriptionSetup(): TranscriptionSetup {
   // null = catalogue not fetched yet (the sidecar may still be booting).
   const [modelKeys, setModelKeys] = useState<string[] | null>(null);
   const [tick, setTick] = useState(0);
+  const autoStarted = useRef(false);
 
   const refresh = useCallback(() => setTick((n) => n + 1), []);
 
@@ -150,6 +158,20 @@ export function useTranscriptionSetup(): TranscriptionSetup {
       window.clearInterval(timer);
     };
   }, [transcriberState === "ready", tick]);
+
+  // Auto-fetch the preview model once the service says it is missing. Only from
+  // a clean state: an errored or in-flight download is left to the strip.
+  useEffect(() => {
+    if (autoStarted.current) return;
+    if (serviceOnline !== true || health?.live_captions_state !== "missing") return;
+    autoStarted.current = true;
+    getModelDownloadStatus(LIVE_CAPTIONS_ID)
+      .then((status) => {
+        if (status.state === "idle") return beginModelDownload(LIVE_CAPTIONS_ID);
+        return undefined;
+      })
+      .catch(() => {});
+  }, [serviceOnline, health?.live_captions_state]);
 
   // Byte progress is only worth asking for while transcription is NOT ready —
   // a settled machine polls nothing at all.
@@ -230,6 +252,7 @@ export function useTranscriptionSetup(): TranscriptionSetup {
     percent: running.length > 0 ? aggregatePercent(running) : null,
     detail: state === "ready" ? "" : failed?.detail || health?.transcriber_detail || "",
     serviceOnline,
+    liveCaptionsState: health?.live_captions_state,
     refresh,
     retry,
   };

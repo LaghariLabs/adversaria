@@ -10,9 +10,15 @@ import type {
   Meeting,
   MeetingAttachment,
   MeetingStats,
+  MeetingFolder,
   MeetingWorkspaceBinding,
   PersonProfile,
+  Folder,
+  FolderOverview,
+  FolderSummary,
+  FolderSuggestion,
   ProjectOverview,
+  RelatedMeetingRef,
   ManagedLlmStatus,
   ModelDownloadStatus,
   OllamaInstallPlan,
@@ -45,6 +51,7 @@ import type {
   WorkspaceSummary,
   WorkspaceSuggestion,
   WorkspaceTask,
+  TaskGroundingPreview,
 } from "../types";
 
 // ---- Recording ----
@@ -746,6 +753,74 @@ export function openPrivacySettings(which: "microphone" | "system_audio"): Promi
   return invoke("open_privacy_settings", { which });
 }
 
+// ---- Meeting folders ----
+
+/** Load the cached folder overview, generating it when missing or explicitly refreshed. */
+export function getFolderOverview(
+  folderId: number,
+  refresh = false,
+): Promise<FolderOverview> {
+  return invoke("get_folder_overview", { folderId, refresh });
+}
+
+/** Create a folder used only to organize meetings. */
+export function createFolder(name: string, color?: string): Promise<Folder> {
+  return invoke("create_folder", { name, color: color ?? null });
+}
+
+/** List meeting folders and their filed-meeting counts. */
+export function listFolders(): Promise<FolderSummary[]> {
+  return invoke("list_folders");
+}
+
+/** Rename a meeting folder. */
+export function renameFolder(id: number, name: string): Promise<void> {
+  return invoke("rename_folder", { id, name });
+}
+
+/** Update a folder's standing overview instructions. */
+export function setFolderInstructions(
+  id: number,
+  instructions: string,
+): Promise<void> {
+  return invoke("set_folder_instructions", { id, instructions });
+}
+
+/** Update a folder's sidebar color. */
+export function setFolderColor(id: number, color: string): Promise<void> {
+  return invoke("set_folder_color", { id, color });
+}
+
+/** Delete a folder and its filing decisions, leaving meetings untouched. */
+export function deleteFolder(id: number): Promise<void> {
+  return invoke("delete_folder", { id });
+}
+
+/** File a meeting into a folder, or explicitly mark it as not filed. */
+export function setMeetingFolder(
+  meetingId: number,
+  folderId: number | null,
+): Promise<void> {
+  return invoke("set_meeting_folder", { meetingId, folderId });
+}
+
+/** Clear a meeting's folder decision so it becomes undecided again. */
+export function clearMeetingFolder(meetingId: number): Promise<void> {
+  return invoke("clear_meeting_folder", { meetingId });
+}
+
+/** List every meeting that has a folder decision. */
+export function listMeetingFolders(): Promise<MeetingFolder[]> {
+  return invoke("list_meeting_folders");
+}
+
+/** Suggest the strongest existing folder for a meeting. */
+export function suggestFolderForMeeting(
+  meetingId: number,
+): Promise<FolderSuggestion | null> {
+  return invoke("suggest_folder_for_meeting", { meetingId });
+}
+
 // ---- Workspaces ----
 
 /** Load the cached project overview, generating it when missing or explicitly refreshed. */
@@ -774,6 +849,23 @@ export function getWorkspace(id: number): Promise<WorkspaceDetail> {
 /** List the reusable skill and agent catalog. */
 export function listWorkspaceAddons(): Promise<WorkspaceAddon[]> {
   return invoke("list_workspace_addons");
+}
+
+/** Suggest what the AI should do when the task text matches one capability confidently. */
+export function suggestTaskCapability(
+  title: string,
+  details: string,
+): Promise<string | null> {
+  return invoke("suggest_task_capability", { title, details });
+}
+
+/** Preview the sources that would ground a drafted workspace task. */
+export function previewTaskGrounding(
+  workspaceId: number,
+  title: string,
+  details: string,
+): Promise<TaskGroundingPreview> {
+  return invoke("preview_task_grounding", { workspaceId, title, details });
 }
 
 /** Create a custom skill or agent role. */
@@ -886,6 +978,7 @@ export function createWorkspaceTask(
   details: string,
   sourceMeetingId: number | null,
   actionItemId: number | null = null,
+  capability?: string,
 ): Promise<WorkspaceTask> {
   return invoke("create_workspace_task", {
     workspaceId,
@@ -893,6 +986,7 @@ export function createWorkspaceTask(
     details,
     sourceMeetingId,
     actionItemId,
+    capability: capability ?? null,
   });
 }
 
@@ -1037,4 +1131,9 @@ export function readWorkspaceArtifact(path: string): Promise<string> {
 /** Reveal a workspace artifact in the platform file browser. */
 export function revealWorkspaceArtifact(path: string): Promise<void> {
   return invoke("reveal_workspace_artifact", { path });
+}
+
+/** Up to 3 related meetings surfaced under a note, with human-readable match reasons. */
+export function relatedMeetings(meetingId: number): Promise<RelatedMeetingRef[]> {
+  return invoke("related_meetings", { meetingId });
 }

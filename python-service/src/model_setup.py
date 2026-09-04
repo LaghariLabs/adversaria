@@ -105,6 +105,28 @@ _WHISPER_KEY_REVISIONS_CT2 = {
 
 WHISPER_MODEL_PROFILE_PREFIX = "whisper-model:"
 
+#: Profile id of the English live-caption PREVIEW model (Moonshine v2 tiny,
+#: sherpa-onnx ORT export). Platform-neutral — the same pin on MLX and CT2.
+LIVE_CAPTIONS_PROFILE_ID = "live-captions-en"
+
+
+def _live_caption_pins() -> dict[str, ModelPin]:
+    """The ~44 MB English preview model. Pinned 2026-09-01 against live
+    Hugging Face state; `allow_patterns` skips the repo's sample WAV."""
+    return {
+        LIVE_CAPTIONS_PROFILE_ID: ModelPin(
+            profile_id=LIVE_CAPTIONS_PROFILE_ID,
+            repo_id="csukuangfj2/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
+            revision="d1e6c30921780b8508d04b492dfb3ce8a51605d4",
+            allow_patterns=(
+                "encoder_model.ort",
+                "decoder_model_merged.ort",
+                "tokens.txt",
+                "LICENSE",
+            ),
+        )
+    }
+
 
 def _whisper_model_pins() -> dict[str, ModelPin]:
     """One pin per curated Settings whisper model: `whisper-model:<key>`."""
@@ -177,6 +199,7 @@ MODEL_PINS = {
     **_qwen_pins(),
     **_whisper_pins(),
     **_whisper_model_pins(),
+    **_live_caption_pins(),
 }
 
 
@@ -207,7 +230,7 @@ _FORCE_DOWNLOADS: set[str] = set()
 # Keep this predicate aligned with transcriber.whisper_model_is_cached: those
 # root-level weight entries are what make a snapshot appear downloaded.
 _CACHED_WEIGHT_NAMES = {"model.bin", "weights.npz"}
-_CACHED_WEIGHT_SUFFIXES = (".safetensors", ".gguf")
+_CACHED_WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".ort")
 
 #: Called with the profile_id after a download reaches `ready` (verified).
 #: The server registers a transcriber re-init here so a finished whisper
@@ -231,6 +254,20 @@ def _pin(profile_id: str) -> ModelPin:
 def _snapshot_path(pin: ModelPin) -> Path:
     repo_dir = f"models--{pin.repo_id.replace('/', '--')}"
     return Path(constants.HF_HUB_CACHE) / repo_dir / "snapshots" / pin.revision
+
+
+def ready_snapshot_dir(profile_id: str) -> Path | None:
+    """The pinned snapshot directory when every allowed file is on disk, else
+    None. Never downloads; the server uses it to decide whether an engine can
+    be built right now."""
+    pin = _pin(profile_id)
+    snapshot = _snapshot_path(pin)
+    if not snapshot.is_dir():
+        return None
+    for name in pin.allow_patterns or ():
+        if not (snapshot / name).is_file():
+            return None
+    return snapshot
 
 
 def _value(obj: object, key: str, default: Any = None) -> Any:
@@ -258,8 +295,9 @@ def _load_manifest(pin: ModelPin) -> tuple[ExpectedFile, ...]:
     # `.onnx` covers sherpa exports (Cohere) — this predicate is INDEPENDENT of
     # transcriber._WEIGHT_SUFFIXES and silently vetoed the Cohere download at
     # the manifest stage (founder-hit 2026-08-14; reported as "network").
+    # .ort covers ONNX-Runtime-format sherpa exports (the Moonshine v2 live-caption preview).
     if not files or not any(
-        file.name.endswith((".safetensors", ".gguf", ".bin", ".onnx"))
+        file.name.endswith((".safetensors", ".gguf", ".bin", ".onnx", ".ort"))
         or file.name == "weights.npz"
         for file in files
     ):

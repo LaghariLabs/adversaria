@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -356,6 +356,35 @@ describe("Transcription engine", () => {
     expect(await screen.findByText("Large v3")).toBeTruthy();
     expect(screen.queryByLabelText("Transcription Base URL")).toBeNull();
   });
+
+  it("offers the live-captions preview download when the service reports it missing", async () => {
+    const user = userEvent.setup();
+    const beginDownload = vi.fn(async () => {});
+    renderTab(
+      {},
+      healthStub({
+        health: { ...healthStub().health!, live_captions_state: "missing" },
+      }),
+      modelsStub({ beginDownload }),
+    );
+
+    const row = within(screen.getByTestId("live-captions-row"));
+    await user.click(row.getByRole("button", { name: "Download" }));
+    expect(beginDownload).toHaveBeenCalledWith("live-captions-en", expect.any(Function));
+  });
+
+  it("shows the live-captions preview as active once loaded", () => {
+    renderTab(
+      {},
+      healthStub({
+        health: { ...healthStub().health!, live_captions_state: "ready" },
+      }),
+    );
+
+    const row = within(screen.getByTestId("live-captions-row"));
+    expect(row.getByText("Active")).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Download" })).toBeNull();
+  });
 });
 
 describe("Background downloads", () => {
@@ -593,7 +622,10 @@ describe("Offline recovery copy", () => {
       }),
     );
 
-    const download = await screen.findByRole("button", { name: "Download" });
+    const downloadRow = (await screen.findByText("Large v3 turbo")).closest(
+      ".settings-model-row",
+    ) as HTMLElement;
+    const download = within(downloadRow).getByRole("button", { name: "Download" });
     const redownload = screen.getByRole("button", { name: "Re-download" });
     expect(download).toBeDisabled();
     expect(redownload).toBeDisabled();
@@ -609,7 +641,10 @@ describe("Offline recovery copy", () => {
   it("leaves Download enabled once Local AI answers again", async () => {
     renderTab({}, healthStub({ healthStatus: "ok" }), modelsStub({ whisperModels: NOT_DOWNLOADED }));
 
-    const button = await screen.findByRole("button", { name: "Download" });
+    const downloadRow = (await screen.findByText("Large v3 turbo")).closest(
+      ".settings-model-row",
+    ) as HTMLElement;
+    const button = within(downloadRow).getByRole("button", { name: "Download" });
     expect(button).not.toBeDisabled();
     expect(button).not.toHaveAttribute("title");
   });

@@ -12,6 +12,7 @@ import {
   renameMeetingPerson,
   updateMeetingLink,
   engineConfigured,
+  relatedMeetings,
   resummarizeMeeting,
   retryRecordingCleanup,
   structureNote,
@@ -27,6 +28,7 @@ import type {
   ActionItem,
   Meeting,
   MeetingStats,
+  RelatedMeetingRef,
   SummaryLanguage,
   Tag,
   TranscriptTurn,
@@ -43,7 +45,7 @@ import {
   withoutSpeakerLabels,
 } from "../lib/summary";
 import { buildSlideHtml, exportFileBase } from "../lib/exportDocument";
-import { formatDateTime } from "../lib/dateFormat";
+import { formatDate, formatDateTime } from "../lib/dateFormat";
 import { templateDisplayName } from "../lib/templateNames";
 import {
   Download,
@@ -103,6 +105,7 @@ interface NoteViewerProps {
   suggestion?: WorkspaceSuggestion | null;
   onAcceptSuggestion?: (workspaceId: number) => void;
   onDismissSuggestion?: () => void;
+  onOpenMeetingId?: (meetingId: number) => void;
 }
 
 type Tab = "transcript" | "summary" | "chat" | "notes" | "insights";
@@ -230,6 +233,7 @@ export function NoteViewer({
   suggestion,
   onAcceptSuggestion,
   onDismissSuggestion,
+  onOpenMeetingId,
 }: NoteViewerProps) {
   const [templateNames, setTemplateNames] = useState<string[]>([
     "general",
@@ -238,6 +242,31 @@ export function NoteViewer({
     "brainstorm",
   ]);
   const [activeTab, setActiveTab] = useState<Tab>("summary");
+  const [relatedMeetingsList, setRelatedMeetingsList] = useState<RelatedMeetingRef[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRelatedMeetingsList([]);
+    if (!meeting.summary || meeting.summary.trim() === "") {
+      return;
+    }
+    relatedMeetings(meeting.id)
+      .then((items) => {
+        if (!cancelled) {
+          setRelatedMeetingsList(Array.isArray(items) ? items : []);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.warn("Failed to load related meetings:", error);
+          setRelatedMeetingsList([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [meeting.id, meeting.summary]);
+
   // The user's own transcript label (relabel maps mic turns to this name) —
   // used to pin their turns to the "Me" blue in the speaker colors.
   const [meName, setMeName] = useState("");
@@ -1599,11 +1628,98 @@ export function NoteViewer({
                 )}
               </div>
             ) : (
-              <SummaryView
-                summary={meeting.summary}
-                actionItems={actionItems}
-                onToggleActionItem={handleToggleActionItem}
-              />
+              <>
+                <SummaryView
+                  summary={meeting.summary}
+                  actionItems={actionItems}
+                  onToggleActionItem={handleToggleActionItem}
+                />
+                {relatedMeetingsList.length > 0 && (
+                  <div
+                    className="summary-section"
+                    style={{
+                      background: "var(--overlay-5)",
+                      border: "1px solid var(--border-color)",
+                      borderRadius: 10,
+                      padding: "14px 16px",
+                    }}
+                  >
+                    <h3
+                      style={{
+                        fontSize: 16,
+                        fontWeight: 600,
+                        color: "var(--text-primary)",
+                        marginTop: 0,
+                        marginBottom: 8,
+                      }}
+                    >
+                      Related meetings
+                    </h3>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      {relatedMeetingsList.map((item) => (
+                        <button
+                          key={item.meeting_id}
+                          type="button"
+                          onClick={() => onOpenMeetingId?.(item.meeting_id)}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            width: "100%",
+                            textAlign: "left",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                            padding: "6px 8px",
+                            borderRadius: 6,
+                            fontSize: 13,
+                            color: "var(--text-primary)",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <span
+                            style={{
+                              width: 7,
+                              height: 7,
+                              borderRadius: "50%",
+                              background: "var(--text-muted)",
+                              flexShrink: 0,
+                            }}
+                            aria-hidden="true"
+                          />
+                          <span
+                            style={{
+                              flex: 1,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {cleanMeetingTitle(item.title)}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              color: "var(--text-muted)",
+                              flexShrink: 0,
+                            }}
+                          >
+                            {item.reason}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              color: "var(--text-muted)",
+                              flexShrink: 0,
+                            }}
+                          >
+                            {formatDate(item.recorded_at)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}

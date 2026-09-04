@@ -18,23 +18,34 @@ use crate::http_client::{HttpClient, SummarizeParams, TranscribeParams};
 use crate::types::{
     ActionItem, AppConfig, AskMessage, AskResponse, AttachmentDraft, CalendarAccount,
     CalendarConfig, CalendarEvent, ChatMessage, ChatTurn, ContextIndexStatus, ContextSources,
-    HealthResponse, Meeting, MeetingAttachment, MeetingRef, MeetingWorkspaceBinding,
-    ProjectOverview, SummarizeResponse, Tag, TaskStaffing, TemplateInfo, WeeklyBriefing,
-    WeeklyOpenLoop, Workspace, WorkspaceAddon, WorkspaceContextItem, WorkspaceDetail,
-    WorkspaceEngine, WorkspaceRun, WorkspaceSuggestion, WorkspaceSummary, WorkspaceTask,
+    Folder, FolderOverview, FolderSuggestion, FolderSummary, HealthResponse, Meeting,
+    MeetingAttachment, MeetingFolder, MeetingRef, MeetingWorkspaceBinding, ProjectOverview,
+    RelatedMeetingRef, SummarizeResponse, Tag, TaskGroundingPreview, TaskStaffing, TemplateInfo,
+    WeeklyBriefing, WeeklyOpenLoop, Workspace, WorkspaceAddon, WorkspaceContextItem,
+    WorkspaceDetail, WorkspaceEngine, WorkspaceRun, WorkspaceSuggestion, WorkspaceSummary,
+    WorkspaceTask,
 };
 
-/// How often to feed new recording audio to the VAD-gated live-caption
-/// session. Small: each poll ships only the delta since the last one, and the
-/// service replies instantly unless an utterance just finished. 1 s keeps the
-/// preview responsive (the fast turbo-q4 live model transcribes in ~0.2 s).
-const LIVE_CHUNK_SECS: u64 = 1;
+/// Poll cadence for the live-caption feed, in milliseconds. 500 ms: the
+/// streaming preview (Moonshine v2 tail re-decode, 12–50 ms per call) makes a
+/// half-second cadence affordable; `snapshot_since` still skips a poll with
+/// under ~250 ms of new audio.
+const LIVE_CHUNK_MS: u64 = 500;
 
 /// Payload for the `live-transcript` event (one finished utterance per event).
 #[derive(Clone, serde::Serialize)]
 struct LiveTranscript {
     text: String,
     /// Which stream heard it: "me" (mic) or "them" (system audio).
+    source: String,
+}
+
+/// Streaming preview of the utterance in progress on one stream. Emitted as
+/// `live-partial` with REPLACE semantics: the UI shows exactly this text for
+/// `source` until the next event; an empty `text` clears it.
+#[derive(Clone, serde::Serialize)]
+struct LivePartial {
+    text: String,
     source: String,
 }
 
@@ -5705,13 +5716,14 @@ async fn feed_live_source(
     epoch: u64,
     source: &str,
     recent: &mut Vec<(std::time::Instant, String, Vec<String>)>,
+    last_partial: &mut String,
 ) -> usize {
     match snapshot {
         Ok((true, next)) => {
             let path_str = path.to_string_lossy().to_string();
             match client.live_feed(&path_str, epoch, source).await {
-                Ok(captions) => {
-                    for text in captions {
+                Ok(result) => {
+                    for text in result.captions {
                         if text.trim().is_empty() {
                             continue;
                         }
@@ -5727,6 +5739,16 @@ async fn feed_live_source(
                             "live-transcript",
                             LiveTranscript {
                                 text,
+                                source: source.to_string(),
+                            },
+                        );
+                    }
+                    if result.partial != *last_partial {
+                        *last_partial = result.partial.clone();
+                        let _ = app.emit(
+                            "live-partial",
+                            LivePartial {
+                                text: result.partial,
                                 source: source.to_string(),
                             },
                         );
@@ -5759,11 +5781,13 @@ fn spawn_live_caption(app: AppHandle) {
         let mic_path = std::env::temp_dir().join(format!("mnt_live_mic_{epoch}.wav"));
         let mut from_sys: usize = 0;
         let mut from_mic: usize = 0;
+        let mut partial_sys = String::new();
+        let mut partial_mic = String::new();
         // Shared recent-caption window for cross-source bleed dedup (speakers
         // audible in the mic would otherwise caption everything twice).
         let mut recent: Vec<(std::time::Instant, String, Vec<String>)> = Vec::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(LIVE_CHUNK_SECS)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(LIVE_CHUNK_MS)).await;
 
             if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
                 break; // a newer recording owns the captions now
@@ -5782,6 +5806,7 @@ fn spawn_live_caption(app: AppHandle) {
                 epoch,
                 "them",
                 &mut recent,
+                &mut partial_sys,
             )
             .await;
             let mic_snap = state.capture.snapshot_mic_since(&mic_path, from_mic);
@@ -5794,8 +5819,20 @@ fn spawn_live_caption(app: AppHandle) {
                 epoch,
                 "me",
                 &mut recent,
+                &mut partial_mic,
             )
             .await;
+        }
+        for (source, last) in [("them", &partial_sys), ("me", &partial_mic)] {
+            if !last.is_empty() {
+                let _ = app.emit(
+                    "live-partial",
+                    LivePartial {
+                        text: String::new(),
+                        source: source.to_string(),
+                    },
+                );
+            }
         }
         // Best-effort cleanup of this loop's delta temp files.
         let _ = std::fs::remove_file(&sys_path);
@@ -5812,6 +5849,26 @@ fn automatic_task_staffing(task: &WorkspaceTask, catalog: &[WorkspaceAddon]) -> 
         agent_id: staffing.agent.map(|agent| agent.id),
         skill_ids: staffing.skills.into_iter().map(|skill| skill.id).collect(),
         reason: staffing.reasons.join(" "),
+        resolved_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+pub(crate) fn capability_task_staffing(
+    title: &str,
+    details: &str,
+    capability: &str,
+    catalog: &[WorkspaceAddon],
+) -> TaskStaffing {
+    let selected_adapter =
+        crate::workspace_runs::best_adapter_for_capability(title, details, capability, catalog);
+    TaskStaffing {
+        mode: "manual".to_string(),
+        agent_id: None,
+        skill_ids: selected_adapter.map_or_else(Vec::new, |adapter| vec![adapter.id]),
+        reason: selected_adapter.map_or_else(
+            || format!("baseline:{capability}"),
+            |adapter| format!("Adapter: {}", adapter.slug),
+        ),
         resolved_at: chrono::Utc::now().to_rfc3339(),
     }
 }
@@ -5928,6 +5985,88 @@ pub async fn get_context_index_status() -> Result<ContextIndexStatus, String> {
     Ok(crate::context_index::get_status())
 }
 
+/// Create a folder used only to organize meetings.
+#[tauri::command]
+pub async fn create_folder(name: String, color: Option<String>) -> Result<Folder, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name can't be empty.".into());
+    }
+    let color = color.unwrap_or_default();
+    let color = if color.is_empty() {
+        "blue"
+    } else {
+        color.as_str()
+    };
+    if !matches!(color, "blue" | "purple" | "orange" | "green" | "red") {
+        return Err(format!("Unknown folder colour: {color}"));
+    }
+    crate::storage::create_folder(name, color).map_err(|e| format!("Failed to create folder: {e}"))
+}
+
+/// List meeting folders and their filed-meeting counts.
+#[tauri::command]
+pub async fn list_folders() -> Result<Vec<FolderSummary>, String> {
+    crate::storage::list_folders().map_err(|e| format!("Failed to list folders: {e}"))
+}
+
+/// Rename a meeting folder.
+#[tauri::command]
+pub async fn rename_folder(id: i64, name: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name can't be empty.".into());
+    }
+    crate::storage::rename_folder(id, name).map_err(|e| format!("Failed to rename folder: {e}"))
+}
+
+/// Update a folder's standing overview instructions.
+#[tauri::command]
+pub async fn set_folder_instructions(id: i64, instructions: String) -> Result<(), String> {
+    crate::storage::set_folder_instructions(id, &instructions)
+        .map_err(|e| format!("Failed to update folder instructions: {e}"))
+}
+
+/// Update a folder's sidebar color.
+#[tauri::command]
+pub async fn set_folder_color(id: i64, color: String) -> Result<(), String> {
+    if !matches!(
+        color.as_str(),
+        "blue" | "purple" | "orange" | "green" | "red"
+    ) {
+        return Err(format!("Unknown folder colour: {color}"));
+    }
+    crate::storage::set_folder_color(id, &color)
+        .map_err(|e| format!("Failed to update folder colour: {e}"))
+}
+
+/// Delete a folder and its filing decisions, leaving meetings untouched.
+#[tauri::command]
+pub async fn delete_folder(id: i64) -> Result<(), String> {
+    crate::storage::delete_folder(id).map_err(|e| format!("Failed to delete folder: {e}"))
+}
+
+/// File a meeting into a folder, or explicitly mark it as not filed.
+#[tauri::command]
+pub async fn set_meeting_folder(meeting_id: i64, folder_id: Option<i64>) -> Result<(), String> {
+    crate::storage::set_meeting_folder(meeting_id, folder_id)
+        .map_err(|e| format!("Failed to set meeting folder: {e}"))
+}
+
+/// Clear a meeting's folder decision so it becomes undecided again.
+#[tauri::command]
+pub async fn clear_meeting_folder(meeting_id: i64) -> Result<(), String> {
+    crate::storage::clear_meeting_folder(meeting_id)
+        .map_err(|e| format!("Failed to clear meeting folder: {e}"))
+}
+
+/// List every meeting that has a folder decision.
+#[tauri::command]
+pub async fn list_meeting_folders() -> Result<Vec<MeetingFolder>, String> {
+    crate::storage::list_meeting_folders()
+        .map_err(|e| format!("Failed to list meeting folders: {e}"))
+}
+
 /// Create a long-lived workspace using the local engine.
 #[tauri::command]
 pub async fn create_workspace(name: String, color: Option<String>) -> Result<Workspace, String> {
@@ -5978,6 +6117,68 @@ pub async fn suggest_workspace_staffing(
     let catalog = crate::storage::list_addons()
         .map_err(|error| format!("Failed to list workspace add-ons: {error}"))?;
     Ok(crate::workspace_runs::suggest_staffing(&title, &details, &catalog, 2).reasons)
+}
+
+/// Suggest what the AI should do only when one capability matches confidently.
+#[tauri::command]
+pub async fn suggest_task_capability(
+    title: String,
+    details: String,
+) -> Result<Option<String>, String> {
+    Ok(crate::workspace_runs::suggest_capability(&title, &details))
+}
+
+/// Preview the meeting, vault, and project context a drafted task would use.
+#[tauri::command]
+pub async fn preview_task_grounding(
+    app: AppHandle,
+    workspace_id: i64,
+    title: String,
+    details: String,
+) -> Result<TaskGroundingPreview, String> {
+    get_workspace(workspace_id).await?;
+
+    let query = format!("{}\n{}", title.trim(), details.trim())
+        .trim()
+        .to_string();
+    let all = crate::storage::get_meetings()
+        .map_err(|error| format!("Failed to load meetings: {error}"))?;
+    let hits = {
+        let state = app.state::<AppState>();
+        crate::embeddings::related_meetings_for_text(
+            &state.client,
+            &query,
+            &HashSet::new(),
+            0.55,
+            3,
+        )
+        .await
+    };
+    let related = crate::workspace_runs::select_related_meetings(&hits, &all, 3);
+    let latest_related_title = related
+        .iter()
+        .max_by(|(left, _), (right, _)| left.recorded_at.cmp(&right.recorded_at))
+        .map(|(meeting, _)| meeting.title.clone())
+        .unwrap_or_default();
+    let context_hits = {
+        let state = app.state::<AppState>();
+        crate::context_index::search(&state.client, &query, 5, 2, 0.55).await
+    };
+    let (vault_hits, project_hits): (Vec<_>, Vec<_>) = context_hits
+        .into_iter()
+        .partition(|hit| hit.source == "vault");
+    let top_vault_label = vault_hits
+        .first()
+        .map(|hit| hit.title.clone())
+        .unwrap_or_default();
+
+    Ok(TaskGroundingPreview {
+        related_meeting_count: related.len() as i64,
+        latest_related_title,
+        vault_hit_count: vault_hits.len() as i64,
+        top_vault_label,
+        project_hit_count: project_hits.len() as i64,
+    })
 }
 
 /// Create a custom skill or agent role.
@@ -6097,20 +6298,33 @@ pub async fn create_workspace_task(
     details: String,
     source_meeting_id: Option<i64>,
     action_item_id: Option<i64>,
+    capability: Option<String>,
 ) -> Result<WorkspaceTask, String> {
     let title = title.trim();
     if title.is_empty() {
         return Err("Task title can't be empty.".into());
     }
+    let capability = capability.unwrap_or_default();
+    if !matches!(
+        capability.as_str(),
+        "" | "research" | "write" | "visualize" | "present"
+    ) {
+        return Err(format!("Unknown task capability: {capability}"));
+    }
     let task = crate::storage::create_workspace_task(
         workspace_id,
         title,
         &details,
+        &capability,
         source_meeting_id,
         action_item_id,
     )
     .map_err(|e| format!("Failed to create workspace task: {e}"))?;
-    resolve_task_staffing(&task);
+    let catalog = crate::storage::list_addons()
+        .map_err(|error| format!("Failed to list workspace add-ons: {error}"))?;
+    let staffing = capability_task_staffing(&task.title, &task.details, &capability, &catalog);
+    crate::storage::set_task_staffing(task.id, &staffing)
+        .map_err(|error| format!("Failed to save capability staffing: {error}"))?;
     let _ = app.emit(
         "workspace-task-changed",
         serde_json::json!({ "workspace_id": task.workspace_id, "task_id": task.id }),
@@ -6227,6 +6441,68 @@ fn persist_workspace_artifacts(
         .map_err(|error| format!("Failed to record workspace artifact: {error}"))?;
     }
     Ok(files.len())
+}
+
+async fn generate_workspace_run_report(
+    app: &AppHandle,
+    workspace_id: i64,
+    run_id: i64,
+    log: &str,
+    artifact_names: Option<&[String]>,
+) {
+    let artifact_names = match artifact_names {
+        Some(names) => names.to_vec(),
+        None => match crate::storage::list_workspace_artifacts(workspace_id) {
+            Ok(artifacts) => artifacts
+                .into_iter()
+                .filter(|artifact| artifact.run_id == run_id)
+                .map(|artifact| artifact.name)
+                .collect(),
+            Err(error) => {
+                eprintln!(
+                    "[workspace-run] could not list artifacts for report on run {run_id}: {error}"
+                );
+                return;
+            }
+        },
+    };
+    let mut context = crate::workspace_runs::tail_chars(log, 6_000);
+    if !context.is_empty() && !context.ends_with('\n') {
+        context.push('\n');
+    }
+    context.push_str("Artifact files: ");
+    if artifact_names.is_empty() {
+        context.push_str("(none)");
+    } else {
+        context.push_str(&artifact_names.join(", "));
+    }
+
+    let model = configured_model();
+    let llm_base_url = configured_llm_base_url();
+    let llm_api_key = configured_llm_api_key();
+    let question = "In one or two plain sentences, say what this run actually produced and call out anything it left undecided or unfinished. No headings, no lists.";
+    let answer = app
+        .state::<AppState>()
+        .client
+        .chat(
+            &context,
+            question,
+            model.as_deref(),
+            llm_base_url.as_deref(),
+            llm_api_key.as_deref(),
+        )
+        .await;
+
+    match answer {
+        Ok(answer) => {
+            if let Err(error) = crate::storage::set_workspace_run_report(run_id, answer.trim()) {
+                eprintln!("[workspace-run] could not store report for run {run_id}: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("[workspace-run] could not generate report for run {run_id}: {error}");
+        }
+    }
 }
 
 /// Detect the bundled local model and both supported headless agent CLIs.
@@ -6374,6 +6650,16 @@ async fn execute_workspace_run_inner(
                 _ => {}
             }
         }
+        // The meeting a pushed to-do came from is the task's primary grounding.
+        // Without it a fresh workspace briefs the model with no meeting content
+        // at all, which is how invented premises happen.
+        if let Some(source_meeting_id) = task.source_meeting_id {
+            if !meetings.iter().any(|m| m.id == source_meeting_id) {
+                if let Ok(Some(source)) = crate::storage::get_meeting(source_meeting_id) {
+                    meetings.insert(0, source);
+                }
+            }
+        }
         let run = crate::storage::create_workspace_run(task.workspace_id, task.id, &engine)
             .map_err(|error| format!("Failed to create workspace run: {error}"))?;
         (task, detail.workspace, meetings, folders, run)
@@ -6463,6 +6749,23 @@ async fn execute_workspace_run_inner(
     } else {
         None
     };
+    let folder_excerpts = if engine == "local" && !folders.is_empty() {
+        let per_folder_cap = (24_000 / folders.len()).max(6_000);
+        folders
+            .iter()
+            .map(|folder| {
+                (
+                    folder.clone(),
+                    crate::workspace_runs::folder_excerpt(
+                        std::path::Path::new(folder),
+                        per_folder_cap,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut receipt_line = String::new();
     if staffing.mode == "manual" {
         receipt_line.push_str("Run setup: chosen manually.\n");
@@ -6479,6 +6782,7 @@ async fn execute_workspace_run_inner(
         &project_hits,
         agent,
         &skills,
+        !folder_excerpts.is_empty(),
     ));
     receipt_line.push('\n');
     if let Some((model, source)) = &local_model {
@@ -6556,6 +6860,8 @@ async fn execute_workspace_run_inner(
         &vault_hits,
         &project_hits,
         &workspace.instructions,
+        workspace.network_allowed,
+        &folder_excerpts,
     );
 
     if engine == "local" {
@@ -6639,6 +6945,8 @@ async fn execute_workspace_run_inner(
         sink(write_line);
         crate::storage::finish_workspace_run(run.id, "done", &log, "")
             .map_err(|error| format!("Failed to finish workspace run: {error}"))?;
+        generate_workspace_run_report(app, task.workspace_id, run.id, &log, Some(&written_names))
+            .await;
         return workspace_run_by_id(run.id);
     }
 
@@ -6745,6 +7053,7 @@ async fn execute_workspace_run_inner(
         }
         crate::storage::finish_workspace_run(run.id, "done", &log, "")
             .map_err(|error| format!("Failed to finish workspace run: {error}"))?;
+        generate_workspace_run_report(app, task.workspace_id, run.id, &log, None).await;
     } else {
         let error = crate::workspace_runs::tail_chars(&outcome.stderr, 500);
         crate::storage::finish_workspace_run(run.id, "failed", &outcome.log, &error)
@@ -6917,6 +7226,111 @@ pub async fn set_agents_paused(app: AppHandle, paused: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// Suggest the strongest existing folder for a meeting using graph and attendee overlap.
+#[tauri::command]
+pub async fn suggest_folder_for_meeting(
+    state: State<'_, AppState>,
+    meeting_id: i64,
+) -> Result<Option<FolderSuggestion>, String> {
+    let meetings =
+        crate::storage::get_meetings().map_err(|e| format!("Failed to load meetings: {e}"))?;
+    let meeting = meetings
+        .iter()
+        .find(|meeting| meeting.id == meeting_id)
+        .ok_or_else(|| format!("Meeting not found: {meeting_id}"))?;
+    let folders =
+        crate::storage::list_folders().map_err(|e| format!("Failed to list folders: {e}"))?;
+    if folders.is_empty() {
+        return Ok(None);
+    }
+
+    let mut folder_meetings: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for (folder_id, linked_meeting_id) in crate::storage::folder_meeting_ids()
+        .map_err(|e| format!("Failed to load folder meetings: {e}"))?
+    {
+        if linked_meeting_id != meeting_id {
+            folder_meetings
+                .entry(folder_id)
+                .or_default()
+                .insert(linked_meeting_id);
+        }
+    }
+
+    let query = format!(
+        "{} {}",
+        meeting.title,
+        meeting.summary.chars().take(600).collect::<String>()
+    );
+    let (mut ids, _) = crate::embeddings::hybrid_rank(&state.client, &meetings, &query, 12).await;
+    if ids.is_empty() {
+        ids = rank_meetings(&meetings, &query, 12)
+            .into_iter()
+            .map(|meeting| meeting.id)
+            .collect();
+    }
+    let related: HashSet<i64> = ids.into_iter().filter(|id| *id != meeting_id).collect();
+    let target_attendees: HashSet<String> = meeting
+        .attendees
+        .iter()
+        .map(|attendee| attendee.trim())
+        .filter(|attendee| !attendee.is_empty() && !is_generic_participant(attendee))
+        .map(str::to_lowercase)
+        .collect();
+    let meetings_by_id: HashMap<i64, &Meeting> = meetings
+        .iter()
+        .map(|meeting| (meeting.id, meeting))
+        .collect();
+
+    let mut best: Option<(i64, String, String, i64, i64, i64)> = None;
+    for summary in &folders {
+        let folder_id = summary.folder.id;
+        let linked = folder_meetings.get(&folder_id).cloned().unwrap_or_default();
+        let related_count = linked.intersection(&related).count() as i64;
+        let folder_attendees: HashSet<String> = linked
+            .iter()
+            .filter_map(|id| meetings_by_id.get(id).copied())
+            .flat_map(|meeting| meeting.attendees.iter())
+            .map(|attendee| attendee.trim())
+            .filter(|attendee| !attendee.is_empty() && !is_generic_participant(attendee))
+            .map(str::to_lowercase)
+            .collect();
+        let shared_attendee_count = target_attendees.intersection(&folder_attendees).count() as i64;
+        let score = 2 * related_count + shared_attendee_count;
+        let replace = match &best {
+            None => true,
+            Some((_, _, updated_at, best_score, _, _)) => {
+                score > *best_score
+                    || (score == *best_score && summary.folder.updated_at > *updated_at)
+            }
+        };
+        if replace {
+            best = Some((
+                folder_id,
+                summary.folder.name.clone(),
+                summary.folder.updated_at.clone(),
+                score,
+                related_count,
+                shared_attendee_count,
+            ));
+        }
+    }
+
+    let Some((folder_id, folder_name, _, score, related_meeting_count, shared_attendee_count)) =
+        best
+    else {
+        return Ok(None);
+    };
+    if score < 2 {
+        return Ok(None);
+    }
+    Ok(Some(FolderSuggestion {
+        folder_id,
+        folder_name,
+        related_meeting_count,
+        shared_attendee_count,
+    }))
+}
+
 /// Suggest the strongest existing workspace for a meeting using graph and attendee overlap.
 #[tauri::command]
 pub async fn suggest_workspace_for_meeting(
@@ -7030,6 +7444,146 @@ pub async fn suggest_workspace_for_meeting(
         related_meeting_count,
         shared_attendee_count,
     }))
+}
+
+/// Format a human-readable match reason from a RelatedSignal.
+pub fn related_reason(signal: &crate::embeddings::RelatedSignal) -> String {
+    match signal {
+        crate::embeddings::RelatedSignal::TextMatch => "Mentions the same things".to_string(),
+        crate::embeddings::RelatedSignal::Semantic(score) => {
+            let percent = (score * 100.0).round() as i64;
+            format!("Similar content ({percent}% match)")
+        }
+    }
+}
+
+/// Return up to 3 related meetings for a meeting note, with human-readable match reasons.
+#[tauri::command]
+pub async fn related_meetings(
+    state: State<'_, AppState>,
+    meeting_id: i64,
+) -> Result<Vec<RelatedMeetingRef>, String> {
+    let all =
+        crate::storage::get_meetings().map_err(|e| format!("Failed to load meetings: {e}"))?;
+    let meeting = all
+        .iter()
+        .find(|m| m.id == meeting_id)
+        .ok_or_else(|| format!("Meeting not found: {meeting_id}"))?;
+
+    if meeting.summary.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let summary_chars: String = meeting.summary.chars().take(600).collect();
+    let query = format!("{} {}", meeting.title, summary_chars);
+    let mut exclude = HashSet::new();
+    exclude.insert(meeting_id);
+
+    let hits =
+        crate::embeddings::related_meetings_for_text(&state.client, &query, &exclude, 0.55, 3)
+            .await;
+    let related = crate::workspace_runs::select_related_meetings(&hits, &all, 3);
+
+    let hits_by_id: HashMap<i64, &crate::embeddings::RelatedSignal> = hits
+        .iter()
+        .map(|hit| (hit.meeting_id, &hit.signal))
+        .collect();
+
+    let result = related
+        .into_iter()
+        .filter_map(|(m, _label)| {
+            let signal = hits_by_id.get(&m.id)?;
+            Some(RelatedMeetingRef {
+                meeting_id: m.id,
+                title: m.title,
+                recorded_at: m.recorded_at,
+                reason: related_reason(signal),
+            })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn get_folder_overview(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    refresh: bool,
+) -> Result<FolderOverview, String> {
+    const FOLDER_OVERVIEW_CHAR_CAP: usize = 12_000;
+
+    let instructions = crate::storage::get_folder(folder_id)
+        .map_err(|e| format!("Failed to load folder: {e}"))?
+        .ok_or_else(|| format!("Folder not found: {folder_id}"))?
+        .instructions;
+    let meetings = crate::storage::get_meetings_for_folder(folder_id)
+        .map_err(|e| format!("Failed to load folder meetings: {e}"))?;
+    let current_hash = crate::project_overview::compute_source_hash(&instructions, &meetings);
+
+    if meetings.is_empty() {
+        return Ok(FolderOverview {
+            folder_id,
+            summary: String::new(),
+            generated_at: String::new(),
+            source_meeting_count: 0,
+            stale: false,
+        });
+    }
+
+    let cached = crate::storage::get_folder_overview_cache(folder_id)
+        .map_err(|e| format!("Failed to load folder overview: {e}"))?;
+    if !refresh {
+        if let Some((summary, cached_hash, generated_at)) = cached {
+            if !summary.trim().is_empty() {
+                return Ok(FolderOverview {
+                    folder_id,
+                    summary,
+                    generated_at,
+                    source_meeting_count: meetings.len() as i64,
+                    stale: cached_hash != current_hash,
+                });
+            }
+        }
+    }
+
+    let model = configured_model();
+    let llm_base_url = configured_llm_base_url();
+    let llm_api_key = configured_llm_api_key();
+    let context =
+        crate::project_overview::build_project_context(&meetings, FOLDER_OVERVIEW_CHAR_CAP);
+    let chat_question =
+        crate::project_overview::build_folder_overview_question(&instructions, meetings.len());
+    let answer = state
+        .client
+        .chat(
+            &context,
+            &chat_question,
+            model.as_deref(),
+            llm_base_url.as_deref(),
+            llm_api_key.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("Could not generate the folder overview: {e}"))?;
+
+    let trimmed = answer.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(
+            "The notes model returned an empty overview. Try again in a moment.".to_string(),
+        );
+    }
+
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    crate::storage::upsert_folder_overview(folder_id, &trimmed, &current_hash, &generated_at)
+        .map_err(|e| format!("Failed to save folder overview: {e}"))?;
+
+    Ok(FolderOverview {
+        folder_id,
+        summary: trimmed,
+        generated_at,
+        source_meeting_count: meetings.len() as i64,
+        stale: false,
+    })
 }
 
 #[tauri::command]
@@ -7198,6 +7752,7 @@ mod tests {
             workspace_id: 3,
             title: "Draft the launch memo".to_string(),
             details: "Summarize the decisions.".to_string(),
+            capability: String::new(),
             status: "queued".to_string(),
             source_meeting_id: None,
             source_meeting_title: String::new(),
@@ -8144,5 +8699,21 @@ mod tests {
             assert!(keys.contains(&e.source), "dangling source: {}", e.source);
             assert!(keys.contains(&e.target), "dangling target: {}", e.target);
         }
+    }
+
+    #[test]
+    fn test_related_reason() {
+        assert_eq!(
+            related_reason(&crate::embeddings::RelatedSignal::TextMatch),
+            "Mentions the same things"
+        );
+        assert_eq!(
+            related_reason(&crate::embeddings::RelatedSignal::Semantic(0.82)),
+            "Similar content (82% match)"
+        );
+        assert_eq!(
+            related_reason(&crate::embeddings::RelatedSignal::Semantic(0.55)),
+            "Similar content (55% match)"
+        );
     }
 }
