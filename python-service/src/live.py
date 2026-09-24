@@ -95,8 +95,7 @@ def trim_repetition_loop(text: str, max_ngram: int = 4, min_repeats: int = 3) ->
             if not any(unit):
                 continue
             if all(
-                norm[i + k * n : i + (k + 1) * n] == unit
-                for k in range(1, min_repeats)
+                norm[i + k * n : i + (k + 1) * n] == unit for k in range(1, min_repeats)
             ):
                 return " ".join(tokens[: i + n]).rstrip(" ,;:")
     return text
@@ -158,6 +157,41 @@ def completed_utterances(
             continue  # still being spoken — wait for silence
         cut_end = min(end, max(start, emitted_upto) + max_len) if force_cut else end
         ready.append((max(start, emitted_upto), cut_end))
+        watermark = max(watermark, cut_end)
+    return ready, watermark
+
+
+def completed_utterance_events(
+    speech_ts: list[dict],
+    buffer_end: int,
+    emitted_upto: int,
+    sample_rate: int = _SAMPLE_RATE,
+    redemption_ms: int = _REDEMPTION_MS,
+    max_utterance_s: float = _MAX_UTTERANCE_S,
+) -> tuple[list[tuple[int, int, str]], int]:
+    """Return ready spans with their semantic boundary.
+
+    ``forced`` means the live latency cap split continuous speech and the next
+    caption still belongs to the same speech turn. ``silence`` means VAD heard
+    enough trailing silence to finish the turn. The original pair-returning
+    helper stays stable for callers that only need audio spans.
+    """
+    redemption = int(redemption_ms * sample_rate / 1000)
+    max_len = int(max_utterance_s * sample_rate)
+    ready: list[tuple[int, int, str]] = []
+    watermark = emitted_upto
+    for seg in speech_ts:
+        start, end = int(seg["start"]), int(seg["end"])
+        if end <= emitted_upto:
+            continue
+        finished = (buffer_end - end) >= redemption
+        force_cut = (end - max(start, emitted_upto)) >= max_len
+        if not (finished or force_cut):
+            continue
+        cut_end = min(end, max(start, emitted_upto) + max_len) if force_cut else end
+        ready.append(
+            (max(start, emitted_upto), cut_end, "forced" if force_cut else "silence")
+        )
         watermark = max(watermark, cut_end)
     return ready, watermark
 
@@ -227,6 +261,21 @@ class LiveCaptionSession:
         ]
         self._last_speech = absolute
         return completed_utterances(
+            absolute, self._base + len(self._buffer), self._emitted
+        )
+
+    def pending_utterance_events(self) -> tuple[list[tuple[int, int, str]], int]:
+        """Ready utterances plus ``forced``/``silence`` turn boundaries."""
+        if not len(self._buffer):
+            self._last_speech = []
+            return [], self._emitted
+        speech = _speech_timestamps(self._buffer)
+        absolute = [
+            {"start": s["start"] + self._base, "end": s["end"] + self._base}
+            for s in speech
+        ]
+        self._last_speech = absolute
+        return completed_utterance_events(
             absolute, self._base + len(self._buffer), self._emitted
         )
 

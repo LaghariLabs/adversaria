@@ -22,6 +22,107 @@ const NODE_COLORS: Record<string, string> = {
   owner: "#dd6b20",
 };
 
+export interface GraphThemeColors {
+  label: string;
+  meetingLabel: string;
+  outline: string;
+  node: string;
+  edge: string;
+  highlight: string;
+}
+
+export const DARK_GRAPH_COLORS: GraphThemeColors = {
+  label: "#cbd5e0",
+  meetingLabel: "#e2e8f0",
+  outline: "#1a1a1f",
+  node: "#4a5568",
+  edge: "#4a5568",
+  highlight: "#ffffff",
+};
+
+export function readGraphTheme(root: HTMLElement = document.documentElement): GraphThemeColors {
+  const read = (name: string): string => {
+    try {
+      return getComputedStyle(root).getPropertyValue(name).trim();
+    } catch {
+      return "";
+    }
+  };
+  const label = read("--text-secondary");
+  const meetingLabel = read("--text-primary");
+  const outline = read("--bg-primary");
+  const node = read("--text-muted");
+  const edge = read("--text-muted");
+  const highlight = read("--text-primary");
+  return {
+    label: label || DARK_GRAPH_COLORS.label,
+    meetingLabel: meetingLabel || DARK_GRAPH_COLORS.meetingLabel,
+    outline: outline || DARK_GRAPH_COLORS.outline,
+    node: node || DARK_GRAPH_COLORS.node,
+    edge: edge || DARK_GRAPH_COLORS.edge,
+    highlight: highlight || DARK_GRAPH_COLORS.highlight,
+  };
+}
+
+export function buildGraphStyle(colors: GraphThemeColors): cytoscape.StylesheetJson {
+  return [
+    {
+      selector: "node",
+      style: {
+        label: "data(label)",
+        width: "data(size)",
+        height: "data(size)",
+        "text-valign": "bottom",
+        "text-halign": "center",
+        "text-margin-y": 4,
+        "font-size": "9px",
+        // Obsidian-style text fade: labels disappear when zoomed out, so
+        // the wide view is shapes and structure, not letter soup.
+        "min-zoomed-font-size": 8,
+        "text-wrap": "wrap",
+        "text-max-width": "110px",
+        "background-color": colors.node,
+        color: colors.label,
+        "text-outline-width": 2,
+        "text-outline-color": colors.outline,
+      },
+    },
+    {
+      selector: "node.meeting",
+      style: {
+        "background-color": NODE_COLORS.meeting,
+        shape: "round-rectangle",
+        "font-size": "10px",
+        color: colors.meetingLabel,
+      },
+    },
+    { selector: "node.person", style: { "background-color": NODE_COLORS.person, shape: "ellipse" } },
+    { selector: "node.tag", style: { "background-color": NODE_COLORS.tag, shape: "diamond" } },
+    { selector: "node.owner", style: { "background-color": NODE_COLORS.owner, shape: "triangle" } },
+    {
+      selector: "edge",
+      style: {
+        width: 1,
+        "line-color": colors.edge,
+        "line-opacity": 0.55,
+        "target-arrow-shape": "none",
+        "curve-style": "haystack",
+      },
+    },
+    // Meeting↔meeting "shared attendee" links are inferred, not recorded —
+    // dashed so they read differently from real membership edges.
+    {
+      selector: "edge.shared-attendee",
+      style: { "line-style": "dashed", "line-opacity": 0.35 },
+    },
+    {
+      selector: "node.highlighted",
+      style: { "border-width": 3, "border-color": colors.highlight },
+    },
+    { selector: ".faded", style: { opacity: 0.12 } },
+  ];
+}
+
 /** Node types the legend can hide. Meetings are the graph's spine — always shown. */
 type ToggleType = "person" | "tag" | "owner";
 
@@ -560,62 +661,7 @@ export function GraphView({ meetings, onSelectMeeting }: GraphViewProps) {
             classes: e.label,
           })),
         ],
-        style: [
-          {
-            selector: "node",
-            style: {
-              label: "data(label)",
-              width: "data(size)",
-              height: "data(size)",
-              "text-valign": "bottom",
-              "text-halign": "center",
-              "text-margin-y": 4,
-              "font-size": "9px",
-              // Obsidian-style text fade: labels disappear when zoomed out, so
-              // the wide view is shapes and structure, not letter soup.
-              "min-zoomed-font-size": 8,
-              "text-wrap": "wrap",
-              "text-max-width": "110px",
-              "background-color": "#4a5568",
-              color: "#cbd5e0",
-              "text-outline-width": 2,
-              "text-outline-color": "#1a1a1f",
-            },
-          },
-          {
-            selector: "node.meeting",
-            style: {
-              "background-color": NODE_COLORS.meeting,
-              shape: "round-rectangle",
-              "font-size": "10px",
-              color: "#e2e8f0",
-            },
-          },
-          { selector: "node.person", style: { "background-color": NODE_COLORS.person, shape: "ellipse" } },
-          { selector: "node.tag", style: { "background-color": NODE_COLORS.tag, shape: "diamond" } },
-          { selector: "node.owner", style: { "background-color": NODE_COLORS.owner, shape: "triangle" } },
-          {
-            selector: "edge",
-            style: {
-              width: 1,
-              "line-color": "#4a5568",
-              "line-opacity": 0.55,
-              "target-arrow-shape": "none",
-              "curve-style": "haystack",
-            },
-          },
-          // Meeting↔meeting "shared attendee" links are inferred, not recorded —
-          // dashed so they read differently from real membership edges.
-          {
-            selector: "edge.shared-attendee",
-            style: { "line-style": "dashed", "line-opacity": 0.35 },
-          },
-          {
-            selector: "node.highlighted",
-            style: { "border-width": 3, "border-color": "#ffffff" },
-          },
-          { selector: ".faded", style: { opacity: 0.12 } },
-        ],
+        style: buildGraphStyle(readGraphTheme()),
         // Every node has an explicit position (saved spot or fresh scatter);
         // the force simulation pulls the structure together from there.
         layout: { name: "preset" },
@@ -688,8 +734,16 @@ export function GraphView({ meetings, onSelectMeeting }: GraphViewProps) {
 
       cyRef.current = cy;
       setSelected(null); // a rebuild may have removed the selected node
+      const themeObserver = new MutationObserver(() => {
+        cy.style().fromJson(buildGraphStyle(readGraphTheme())).update();
+      });
+      themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-theme"],
+      });
       return () => {
         window.clearTimeout(fitTimer);
+        themeObserver.disconnect();
         layout.stop(); // infinite layouts never stop on their own
         // Remember where everything settled for the next visit.
         cy.nodes().forEach((n) => {

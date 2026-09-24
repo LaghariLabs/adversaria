@@ -16,10 +16,17 @@ import "./prototype.css";
 //  ?card=meeting       → the "Meeting detected" prompt (detector)
 //  ?widget=recording   → the floating "Recording" bubble (shown while recording
 //                        when the main window is minimized/blurred)
+//  ?widget=copilot-hud → the floating copilot answer capsule (Contract H)
 // Everything else is the main app.
 const params = new URLSearchParams(window.location.search);
 const isCard = params.get("card") === "meeting";
 const isRecordingWidget = params.get("widget") === "recording";
+const isCopilotHud = params.get("widget") === "copilot-hud";
+
+// Lazy so the floating HUD never joins the main entry chunk (500 kB budget).
+const CopilotHud = React.lazy(() =>
+  import("./components/CopilotHud").then((m) => ({ default: m.CopilotHud })),
+);
 
 // Suppress the browser-style right-click menu in the packaged (release) app so
 // it feels like a native app, not a dev webview. In `tauri dev`
@@ -44,6 +51,10 @@ async function bootstrap() {
         <MeetingCard />
       ) : isRecordingWidget ? (
         <RecordingBubble />
+      ) : isCopilotHud ? (
+        <React.Suspense fallback={null}>
+          <CopilotHud />
+        </React.Suspense>
       ) : (
         <App />
       )}

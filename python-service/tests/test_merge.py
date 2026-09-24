@@ -16,9 +16,7 @@ class TestMergeLabeledSegments:
         mic = [(5.0, 7.0, "I'm good, thanks!")]
         result = merge_labeled_segments(system, mic)
         assert result == (
-            "Them: Hello, how are you?\n"
-            "Me: I'm good, thanks!\n"
-            "Them: Great, talk later."
+            "Them: Hello, how are you?\nMe: I'm good, thanks!\nThem: Great, talk later."
         )
 
     def test_joins_consecutive_same_speaker_segments(self):
@@ -126,8 +124,7 @@ class TestBuildLabeledTurns:
     def test_same_speaker_split_on_length(self):
         texts = [f"Segment {i}: " + "x" * 70 for i in range(10)]
         system = [
-            (float(i * 2), float(i * 2) + 1.5, text)
-            for i, text in enumerate(texts)
+            (float(i * 2), float(i * 2) + 1.5, text) for i, text in enumerate(texts)
         ]
         turns = build_labeled_turns(system, [])
         assert len(turns) > 1
@@ -242,8 +239,10 @@ class TestDiarizeSystemLabels:
             return [(0.0, 9.0, 0), (9.0, 20.0, 3)]
 
         monkeypatch.setattr(diarizer, "diarize", fake_diarize)
-        system = [(0.0, 4.0, "Quarterly numbers look strong overall."),
-                  (10.0, 14.0, "Marketing budget needs another review.")]
+        system = [
+            (0.0, 4.0, "Quarterly numbers look strong overall."),
+            (10.0, 14.0, "Marketing budget needs another review."),
+        ]
         mic = [(5.0, 8.0, "Thanks everyone for joining the planning call.")]
         labels = diarize_system_labels("sys.wav", system, True, mic)
         assert labels == ["Speaker 1", "Speaker 2"]
@@ -256,7 +255,9 @@ class TestDiarizeSystemLabels:
         from src.transcriber import diarize_system_labels
 
         monkeypatch.setattr(
-            diarizer, "diarize", lambda p, voiced_starts=None: [(0.0, 5.0, 0), (5.0, 9.0, 1)]
+            diarizer,
+            "diarize",
+            lambda p, voiced_starts=None: [(0.0, 5.0, 0), (5.0, 9.0, 1)],
         )
         system = [(0.0, 2.0, "hello there"), (6.0, 8.0, "general kenobi")]
         labels = diarize_system_labels("sys.wav", system, True)
@@ -279,7 +280,9 @@ class TestStripMicBleed:
 
     def test_near_verbatim_bleed_dropped(self):
         # Whisper transcribes the bleed slightly differently on each channel.
-        system = [(10.0, 13.0, "Users can copy the markdown file into a coding engine.")]
+        system = [
+            (10.0, 13.0, "Users can copy the markdown file into a coding engine.")
+        ]
         mic = [(11.5, 14.0, "Users can copy the markdown file into coding engine")]
         assert self._strip(system, mic) == []
 
@@ -299,13 +302,27 @@ class TestStripMicBleed:
         # Verbatim from that recording: the mic line's head is the tail of the
         # first system segment, its tail is the head of the second.
         system = [
-            (0.0, 4.0, "without it at the tap of a button You can use it for live meetings, "
-                       "upload recordings, or even record in-person conversations. So it's "
-                       "not just locked into one workflow."),
-            (4.0, 8.0, "Now here's where it really stood out for me. The transcription "
-                       "accuracy is really strong."),
+            (
+                0.0,
+                4.0,
+                "without it at the tap of a button You can use it for live meetings, "
+                "upload recordings, or even record in-person conversations. So it's "
+                "not just locked into one workflow.",
+            ),
+            (
+                4.0,
+                8.0,
+                "Now here's where it really stood out for me. The transcription "
+                "accuracy is really strong.",
+            ),
         ]
-        mic = [(2.1, 6.2, "just locked into one workflow. Now here's where it really stood out for me the")]
+        mic = [
+            (
+                2.1,
+                6.2,
+                "just locked into one workflow. Now here's where it really stood out for me the",
+            )
+        ]
         assert self._strip(system, mic) == []
 
     def test_same_topic_speech_survives_the_window_check(self):
@@ -313,10 +330,24 @@ class TestStripMicBleed:
         talking ABOUT what is playing. Shared vocabulary is expected; shared
         word ORDER is what marks an echo."""
         system = [
-            (0.0, 4.0, "the transcription accuracy is really strong so you can trust the output"),
-            (4.0, 8.0, "it also supports over 120 plus languages which is huge for teams"),
+            (
+                0.0,
+                4.0,
+                "the transcription accuracy is really strong so you can trust the output",
+            ),
+            (
+                4.0,
+                8.0,
+                "it also supports over 120 plus languages which is huge for teams",
+            ),
         ]
-        mic = [(3.0, 7.0, "yeah I think the transcription accuracy is the thing that matters most for us")]
+        mic = [
+            (
+                3.0,
+                7.0,
+                "yeah I think the transcription accuracy is the thing that matters most for us",
+            )
+        ]
         assert self._strip(system, mic) == mic
 
     def test_same_words_far_apart_in_time_kept(self):
@@ -359,7 +390,9 @@ class TestStripMicBleed:
 
     def test_garbled_duplicate_caught_by_containment(self):
         # Ordered ratio may fall under 0.85, but token containment >= 0.8 catches it.
-        system = [(0.0, 3.0, "for example here is the record button that I demonstrated here")]
+        system = [
+            (0.0, 3.0, "for example here is the record button that I demonstrated here")
+        ]
         mic = [(1.0, 4.0, "for example here is the record button that I showed")]
         assert self._strip(system, mic) == []
 
@@ -383,7 +416,13 @@ class TestStripGlossaryEcho:
         return strip_glossary_echo(segments, prompt)
 
     def test_shuffled_repeated_echo_dropped(self):
-        seg = [(0.0, 3.0, "Tatweer OS, Echelon, Tatweer, Echelon, Tatweer Tatweer OS, Echelon, Tatweer")]
+        seg = [
+            (
+                0.0,
+                3.0,
+                "Tatweer OS, Echelon, Tatweer, Echelon, Tatweer Tatweer OS, Echelon, Tatweer",
+            )
+        ]
         prompt = "Glossary: Tatweer OS, Claude, Hira, Laghari, Echelon, Tatweer"
         assert self._strip(seg, prompt) == []
 
@@ -393,13 +432,22 @@ class TestStripGlossaryEcho:
         assert self._strip(seg, prompt) == seg
 
     def test_mixed_segment_prefix_trimmed(self):
-        seg = [(1.0, 5.0, "Tatweer OS, Echelon, Tatweer it organizes everything for you so for example here is the record button")]
+        seg = [
+            (
+                1.0,
+                5.0,
+                "Tatweer OS, Echelon, Tatweer it organizes everything for you so for example here is the record button",
+            )
+        ]
         prompt = "Glossary: Tatweer OS, Claude, Hira, Laghari, Echelon, Tatweer"
         result = self._strip(seg, prompt)
         assert len(result) == 1
         assert result[0][0] == 1.0  # start preserved
         assert result[0][1] == 5.0  # end preserved
-        assert result[0][2] == "it organizes everything for you so for example here is the record button"
+        assert (
+            result[0][2]
+            == "it organizes everything for you so for example here is the record button"
+        )
 
     def test_no_vocabulary_passthrough(self):
         seg = [(0.0, 2.0, "Tatweer OS, Echelon, Tatweer")]
@@ -410,6 +458,7 @@ class TestStripGlossaryEcho:
         seg = [(0.0, 2.0, "Glossary: Tatweer OS, Claude")]
         prompt = "Glossary: Tatweer OS, Claude"
         assert self._strip(seg, prompt) == []
+
     """Mic segments with no real voice are Whisper hallucinations on a silent
     mic ("thanks for watching", repetition loops) — they must not become the
     user's talk-time. VAD marks the voiced spans; only overlapping segments stay."""
@@ -468,16 +517,23 @@ class TestApplyVocabularyCorrections:
 
     def test_live_near_miss_corrected(self):
         assert (
-            self._one("Welcome to Adverse Area, the most advanced note taker.", self.PROMPT)
+            self._one(
+                "Welcome to Adverse Area, the most advanced note taker.", self.PROMPT
+            )
             == "Welcome to Adversaria, the most advanced note taker."
         )
 
     def test_standalone_adverse_never_matches(self):
-        assert self._one("adverse conditions ahead", self.PROMPT) == "adverse conditions ahead"
+        assert (
+            self._one("adverse conditions ahead", self.PROMPT)
+            == "adverse conditions ahead"
+        )
         assert self._one("an adverse reaction", self.PROMPT) == "an adverse reaction"
 
     def test_exact_match_casing_rewritten(self):
-        assert self._one("welcome to adversaria", self.PROMPT) == "welcome to Adversaria"
+        assert (
+            self._one("welcome to adversaria", self.PROMPT) == "welcome to Adversaria"
+        )
 
     def test_no_vocabulary_passthrough(self):
         seg = [(0.0, 2.0, "Welcome to Adverse Area.")]
@@ -497,18 +553,29 @@ class TestApplyVocabularyCorrections:
     def test_short_term_skips_fuzzy_but_fixes_casing(self):
         # "Hira" normalizes to 4 chars (< 6): fuzzy is off ("Hera" stays), but
         # the case-insensitive exact match still gets the user's casing.
-        assert self._one("I met hira yesterday", "Glossary: Hira") == "I met Hira yesterday"
-        assert self._one("I met Hera yesterday", "Glossary: Hira") == "I met Hera yesterday"
+        assert (
+            self._one("I met hira yesterday", "Glossary: Hira")
+            == "I met Hira yesterday"
+        )
+        assert (
+            self._one("I met Hera yesterday", "Glossary: Hira")
+            == "I met Hera yesterday"
+        )
 
     def test_multi_word_term_window(self):
         assert (
-            self._one("so Tatveer OS organizes everything", "Glossary: Tatweer OS, Claude")
+            self._one(
+                "so Tatveer OS organizes everything", "Glossary: Tatweer OS, Claude"
+            )
             == "so Tatweer OS organizes everything"
         )
 
     def test_window_never_swallows_following_word(self):
         # The +1-word window must not absorb "area": the length bound rejects it.
-        assert self._one("Adversaria area of work", self.PROMPT) == "Adversaria area of work"
+        assert (
+            self._one("Adversaria area of work", self.PROMPT)
+            == "Adversaria area of work"
+        )
 
     def test_punctuation_adjacency_preserved(self):
         assert self._one("(adverse area)", self.PROMPT) == "(Adversaria)"
@@ -529,7 +596,8 @@ class TestApplyVocabularyCorrections:
         ):
             assert self._one(text, self.PROMPT) == text
         assert (
-            self._one("Tatweer OS is nice", "Glossary: Tatweer OS") == "Tatweer OS is nice"
+            self._one("Tatweer OS is nice", "Glossary: Tatweer OS")
+            == "Tatweer OS is nice"
         )
 
     def test_possessive_suffix_preserved(self):
@@ -555,7 +623,8 @@ class TestApplyVocabularyCorrections:
             == "Adversaria launched today."
         )
         assert (
-            self._one("Hira joined the call.", "Glossary: hira") == "Hira joined the call."
+            self._one("Hira joined the call.", "Glossary: hira")
+            == "Hira joined the call."
         )
 
     def test_lowercase_entry_still_corrects_near_misses(self):
@@ -588,11 +657,18 @@ class TestVocabularyCorrectionWiring:
             if path == sys_path:
                 seg = [(0.0, 2.0, "Welcome to Adverse Area, the note taker.")]
                 return seg, tr._TranscriptInfo("en", 7.0)
-            return [(3.0, 5.0, "I love adverse area already.")], tr._TranscriptInfo("en", 7.0)
+            return [(3.0, 5.0, "I love adverse area already.")], tr._TranscriptInfo(
+                "en", 7.0
+            )
 
-        monkeypatch.setattr(tr, "_voiced_regions", lambda path: None)  # VAD off — keep all
+        monkeypatch.setattr(
+            tr, "_voiced_regions", lambda path: None
+        )  # VAD off — keep all
         resp = tr._merge_dual(
-            collect, sys_path, mic_path, diarize=False,
+            collect,
+            sys_path,
+            mic_path,
+            diarize=False,
             initial_prompt="Glossary: Adversaria",
         )
         assert [t.text for t in resp.turns] == [
@@ -660,8 +736,13 @@ class TestPlaybackHint:
             "users can copy the markdown file into a coding engine",
             "the system incrementally builds a persistent wiki from sources",
         ]
-        system = [(float(i * 8), float(i * 8 + 5), text) for i, text in enumerate(video)]
-        mic = [(float(i * 8) + 0.7, float(i * 8 + 5) + 0.7, text) for i, text in enumerate(video)]  # bleed
+        system = [
+            (float(i * 8), float(i * 8 + 5), text) for i, text in enumerate(video)
+        ]
+        mic = [
+            (float(i * 8) + 0.7, float(i * 8 + 5) + 0.7, text)
+            for i, text in enumerate(video)
+        ]  # bleed
         assert playback_hint(system, mic) == "youtube"
 
     def test_real_conversation_hints_nothing(self):

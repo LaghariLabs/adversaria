@@ -21,6 +21,7 @@ sys.modules["ollama"] = _fake_ollama
 # Reload src.embedder to pick up the mock (addresses ordering issues when
 # other test files also mock ollama at the module level)
 import src.embedder  # noqa: E402
+
 importlib.reload(src.embedder)
 
 from src.embedder import OllamaEmbedder, DEFAULT_EMBED_MODEL  # noqa: E402
@@ -68,9 +69,7 @@ class TestOllamaEmbedderEmbed:
         _fake_ollama.Client.reset_mock()
         _fake_client_instance.embed.return_value = {"embeddings": [[0.7, 0.8]]}
 
-        vectors, model = embedder.embed(
-            ["managed"], host="http://127.0.0.1:27434/v1"
-        )
+        vectors, model = embedder.embed(["managed"], host="http://127.0.0.1:27434/v1")
 
         _fake_ollama.Client.assert_called_once_with(host="http://127.0.0.1:27434")
         assert vectors == [[0.7, 0.8]]
@@ -84,9 +83,7 @@ class TestOllamaEmbedderEmbed:
         with pytest.raises(RuntimeError, match="ollama pull"):
             embedder.embed(["test"])
 
-    def test_embed_count_mismatch_raises(
-        self, embedder: OllamaEmbedder
-    ) -> None:
+    def test_embed_count_mismatch_raises(self, embedder: OllamaEmbedder) -> None:
         """A count mismatch (2 texts, 1 embedding) raises RuntimeError."""
         embedder.client.embed.return_value = {
             "embeddings": [[0.1, 0.2]],  # only 1, but we sent 2
@@ -125,6 +122,7 @@ class TestEmbedEndpoint:
     def test_embed_success(self, client, mock_embed) -> None:
         """POST /embed with 2 texts returns 200 with correct shape."""
         import src.server as srv
+
         srv._embedder = mock_embed
         resp = client.post("/embed", json={"texts": ["hello", "world"]})
         assert resp.status_code == 200
@@ -136,6 +134,7 @@ class TestEmbedEndpoint:
     def test_embed_forwards_managed_ollama_host(self, client, mock_embed) -> None:
         """Rust may override the default host per embedding request."""
         import src.server as srv
+
         srv._embedder = mock_embed
 
         resp = client.post(
@@ -156,6 +155,7 @@ class TestEmbedEndpoint:
     def test_embed_empty_texts(self, client, mock_embed) -> None:
         """POST /embed with empty texts list returns 400."""
         import src.server as srv
+
         srv._embedder = mock_embed
         resp = client.post("/embed", json={"texts": []})
         assert resp.status_code == 400
@@ -163,6 +163,7 @@ class TestEmbedEndpoint:
     def test_embed_too_many_texts(self, client, mock_embed) -> None:
         """POST /embed with 129 texts returns 400."""
         import src.server as srv
+
         srv._embedder = mock_embed
         resp = client.post("/embed", json={"texts": ["x"] * 129})
         assert resp.status_code == 400
@@ -170,6 +171,7 @@ class TestEmbedEndpoint:
     def test_embed_embedder_none(self, client) -> None:
         """POST /embed when _embedder is None returns 503."""
         import src.server as srv
+
         srv._embedder = None
         resp = client.post("/embed", json={"texts": ["hello"]})
         assert resp.status_code == 503
@@ -177,6 +179,7 @@ class TestEmbedEndpoint:
     def test_embed_runtime_error(self, client) -> None:
         """POST /embed when embed() raises RuntimeError returns 503 with hint."""
         import src.server as srv
+
         error_embedder = MagicMock()
         error_embedder.embed.side_effect = RuntimeError(
             "Embedding request failed (model=bge-m3). Is Ollama running "

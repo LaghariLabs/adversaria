@@ -1,0 +1,27 @@
+{
+  "name": "mining_annual_value",
+  "note": "Invented practice case: predictive-maintenance value at a fictional copper mine.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is the annual value of deploying this model?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [
+      "Me: Assume a true alert converts an unplanned repair into a planned one."
+    ],
+    "stated_figures": [
+      "Me: The fleet has 120 haul trucks.",
+      "Me: Trucks experience 3.2 unplanned failures per truck per year.",
+      "Me: The mean unplanned downtime per failure is 26 hours.",
+      "Me: When the same repair is done as planned maintenance, downtime is 8 hours.",
+      "Me: Each hour a truck is down costs the mine 4,200 dollars in lost contribution margin.",
+      "Me: Suppose that at the chosen alert threshold, the model catches 55% of failures, and 40% of the alerts it raises are genuine.",
+      "Me: And a false alert costs 3 hours of inspection downtime plus 1,500 dollars in labor and parts."
+    ],
+    "passages": []
+  },
+  "expect": {
+    "say_number": {"value": 11499840, "tolerance_pct": 3}
+  }
+}

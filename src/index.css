@@ -118,6 +118,8 @@
   /* Inter is self-hosted via @fontsource-variable/inter (bundled, no CDN call). */
   --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-serif: "Instrument Serif", Georgia, serif;
+  /* Copilot text is NOT theme dependent: every copilot surface uses Inter. */
+  --font-copilot: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
   /* Shared action scale, mirrored in prototype.css for either stylesheet's
      standalone token context. */
@@ -426,7 +428,7 @@
   /* Brand fonts (vendored from lagharilabs-website, OFL) — pixel display,
      mono body: the Laghari Labs arcade identity. */
   --font-serif: "Pixelify Sans", Georgia, serif;
-  --font-sans: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, "Cascadia Mono", Consolas, monospace;
 }
 
 :root[data-theme="navy"] {
@@ -585,7 +587,7 @@ body {
   50% { opacity: 0.4; }
 }
 .record-pill-time {
-  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, "Cascadia Mono", Consolas, monospace);
   font-size: 11px;
   color: #fff;
   font-variant-numeric: tabular-nums;
@@ -697,10 +699,15 @@ body {
   color: var(--text-recording-secondary);
 }
 .isl-time {
-  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, "Cascadia Mono", Consolas, monospace);
   font-size: 12.5px;
   color: #fff;
   font-variant-numeric: tabular-nums;
+}
+/* The docked expressive island is the large variant; the floating 330x132
+   island keeps the base sizes above. */
+.notch-island-expressive .isl-time {
+  font-size: 14px;
 }
 /* Base island text serves the physical-notch dock, which stays black. The
    ordinary floating island gets theme-aware overrides below. */
@@ -713,6 +720,9 @@ body {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+}
+.notch-island-expressive .isl-cap {
+  font-size: 14px;
 }
 .isl-idle {
   color: rgba(255, 255, 255, 0.4);
@@ -738,6 +748,9 @@ body {
 .isl-wave-row .record-pill-wave {
   height: 16px;
 }
+.notch-island-expressive .isl-wave-row .record-pill-wave {
+  height: 20px;
+}
 /* The "them" (system-audio) channel is muted grey; "you" (mic) stays accent. */
 .record-pill-wave.them span {
   background: #6f6f7a;
@@ -756,6 +769,10 @@ body {
   justify-content: center;
   cursor: pointer;
   transition: background-color 0.15s ease;
+}
+.notch-island-expressive .isl-stop {
+  width: 26px;
+  height: 26px;
 }
 .isl-stop:hover {
   background: #ff342b;

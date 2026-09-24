@@ -108,3 +108,6 @@ python-service/prompts/*.bak-*.md
 # Local tool state, not product source — kept out of the public mirror.
 .impeccable/
 PRODUCT.md
+
+# Thumbnail renders (large binaries; the prompts beside them are the source)
+marketing/thumbnails/*.png

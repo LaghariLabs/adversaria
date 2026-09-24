@@ -13,6 +13,10 @@ const tauriMocks = vi.hoisted(() => ({
   setFolderInstructions: vi.fn(),
   setWorkspaceNetworkAllowed: vi.fn(),
   getFolderOverview: vi.fn(),
+  exportAdversaria: vi.fn(),
+  hasCopilotApiKey: vi.fn().mockResolvedValue(false),
+  hasDeepSeekCopilotApiKey: vi.fn().mockResolvedValue(false),
+  setFolderCopilotMode: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../lib/tauri", () => tauriMocks);
@@ -101,6 +105,8 @@ beforeEach(() => {
   tauriMocks.getFolderOverview.mockReset();
   // Default: return empty for zero? For meetings present, return ready overview.
   tauriMocks.getFolderOverview.mockResolvedValue(overviewFixture());
+  tauriMocks.exportAdversaria.mockReset();
+  tauriMocks.exportAdversaria.mockResolvedValue("/tmp/folder.adversaria");
 });
 
 describe("FolderView", () => {
@@ -407,5 +413,12 @@ describe("FolderView", () => {
     // Resolve to finish loading
     resolveOverview(overviewFixture());
     expect(await screen.findByText(/This folder is about launching/)).toBeVisible();
+  });
+
+  it("folder export button invokes export_adversaria with folder id", async () => {
+    const user = userEvent.setup();
+    renderFolderView();
+    await user.click(screen.getByRole("button", { name: /Export folder as \.adversaria/ }));
+    expect(tauriMocks.exportAdversaria).toHaveBeenCalledWith([], 4);
   });
 });

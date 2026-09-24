@@ -17,6 +17,7 @@ import {
   requestMicrophonePermission,
 } from "../../lib/tauri";
 import type { CapturePermissions, PermissionState } from "../../lib/tauri";
+import { COPY, IS_MAC } from "../../lib/platform";
 
 /** One row of the Record → Transcribe → Notes ledger. */
 interface Stage {
@@ -374,7 +375,7 @@ export function SetupStatusSection({
   const embedderState = health.health?.embedder_state;
   const embeddingFailed = ["failed", "error"].includes(embeddingDownload?.state ?? "");
   const semanticReady = embeddingDownload?.state === "ready" || embedderState === "ready";
-  const semanticPlace = setup?.platform === "macos" ? "this Mac" : "this computer";
+  const semanticPlace = IS_MAC ? "this Mac" : "this computer";
 
   return (
     <div className={`settings-section-card${active ? " active-card" : ""}`}>
@@ -513,7 +514,7 @@ export function SetupStatusSection({
                 disabled={permissionBusy !== ""}
                 onClick={() => void openPermissionSettings("microphone")}
               >
-                Open System Settings
+                Open {COPY.systemSettings}
               </button>
             ) : null}
           </div>
@@ -530,7 +531,7 @@ export function SetupStatusSection({
           <div style={{ flex: 1, minWidth: 0 }}>
             <strong>System audio</strong>
             <p className="settings-help" style={{ margin: "2px 0 0" }}>
-              What your Mac plays (&quot;Them&quot;)
+              What your {COPY.device} plays (&quot;Them&quot;)
             </p>
           </div>
           <span
@@ -557,7 +558,7 @@ export function SetupStatusSection({
                 disabled={permissionBusy !== ""}
                 onClick={() => void openPermissionSettings("system_audio")}
               >
-                Open System Settings
+                Open {COPY.systemSettings}
               </button>
             )}
           </div>

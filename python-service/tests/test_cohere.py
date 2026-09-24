@@ -21,9 +21,7 @@ from src.server import app
 FIRST_WINDOW = Path("/first-window.wav")
 
 COHERE_KEY = "cohere-transcribe-2b"
-COHERE_REPO = (
-    "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01"
-)
+COHERE_REPO = "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01"
 
 client = TestClient(app)
 
@@ -211,9 +209,7 @@ def test_server_detects_spanish_then_routes_to_cohere(
     monkeypatch.setenv("WHISPER_BACKEND", "mlx")
     monkeypatch.setattr(server, "_transcriber", resident)
     monkeypatch.setattr(server, "_TRANSCRIBER_STATE", "ready")
-    monkeypatch.setattr(
-        server, "decode_first_asr_window", lambda path: FIRST_WINDOW
-    )
+    monkeypatch.setattr(server, "decode_first_asr_window", lambda path: FIRST_WINDOW)
     monkeypatch.setattr(
         server,
         "get_cohere_transcriber",
@@ -241,9 +237,7 @@ def test_server_unsupported_language_uses_resident_for_whole_job(
     monkeypatch.setenv("WHISPER_BACKEND", "mlx")
     monkeypatch.setattr(server, "_transcriber", resident)
     monkeypatch.setattr(server, "_TRANSCRIBER_STATE", "ready")
-    monkeypatch.setattr(
-        server, "decode_first_asr_window", lambda path: FIRST_WINDOW
-    )
+    monkeypatch.setattr(server, "decode_first_asr_window", lambda path: FIRST_WINDOW)
     get_cohere = MagicMock()
     monkeypatch.setattr(server, "get_cohere_transcriber", get_cohere)
 
@@ -271,9 +265,7 @@ def test_server_detection_failure_uses_english_cohere(
     monkeypatch.setenv("WHISPER_BACKEND", "mlx")
     monkeypatch.setattr(server, "_transcriber", resident)
     monkeypatch.setattr(server, "_TRANSCRIBER_STATE", "ready")
-    monkeypatch.setattr(
-        server, "decode_first_asr_window", lambda path: FIRST_WINDOW
-    )
+    monkeypatch.setattr(server, "decode_first_asr_window", lambda path: FIRST_WINDOW)
     monkeypatch.setattr(server, "get_cohere_transcriber", lambda repo: cohere)
 
     response = client.post(

@@ -14,6 +14,7 @@ import type {
   MeetingWorkspaceBinding,
   PersonProfile,
   Folder,
+  FolderCopilotBrief,
   FolderOverview,
   FolderSummary,
   FolderSuggestion,
@@ -56,14 +57,19 @@ import type {
 
 // ---- Recording ----
 
-export function startRecording(): Promise<void> {
-  return invoke("start_recording");
+export interface StartRecordingResult {
+  copilot_session_id: string;
+}
+
+export function startRecording(copilotFolderId?: number | null): Promise<StartRecordingResult> {
+  return invoke("start_recording", { copilotFolderId: copilotFolderId ?? null });
 }
 
 export interface StopRecordingResult {
   system_path: string;
   mic_path: string | null;
   warning: string | null;
+  copilot_session_id: string;
 }
 
 export function stopRecording(): Promise<StopRecordingResult> {
@@ -149,11 +155,26 @@ export function enqueueRecording(
   audioFilePath: string,
   templateName?: string,
   userNotes?: string,
+  copilotSessionId?: string | null,
 ): Promise<Meeting> {
+  if (copilotSessionId != null) {
+    const trimmed = copilotSessionId.trim();
+    if (trimmed === "") {
+      return Promise.reject(new Error("copilotSessionId must be a nonblank string"));
+    }
+    // normalize to trimmed value for the invoke
+    return invoke("enqueue_recording", {
+      audioPath: audioFilePath,
+      template: templateName ?? "general",
+      userNotes: userNotes ?? null,
+      copilotSessionId: trimmed,
+    });
+  }
   return invoke("enqueue_recording", {
     audioPath: audioFilePath,
     template: templateName ?? "general",
     userNotes: userNotes ?? null,
+    copilotSessionId: null,
   });
 }
 
@@ -303,6 +324,11 @@ export function updateMeetingTags(id: number, tags: Tag[]): Promise<void> {
   return invoke("update_meeting_tags", { id, tags });
 }
 
+/** Rename a meeting. Resolves to the saved (trimmed) title. */
+export function updateMeetingTitle(id: number, title: string): Promise<string> {
+  return invoke("update_meeting_title", { id, title });
+}
+
 /** Save summary text to a user-chosen .md file. Resolves to the saved path,
  *  or null if the user cancelled the save dialog. */
 export function exportSummary(
@@ -331,6 +357,18 @@ export function exportMeetingBundle(id: number): Promise<string | null> {
  *  Returns the new Meeting, or null if cancelled. */
 export function importMeetingBundle(): Promise<Meeting | null> {
   return invoke("import_meeting_bundle");
+}
+
+export function exportAdversaria(meetingIds: number[], folderId: number | null): Promise<string | null> {
+  return invoke("export_adversaria", { meetingIds, folderId });
+}
+
+export function importAdversaria(path?: string): Promise<import("../types").ImportReport | null> {
+  return invoke("import_adversaria", { path: path ?? null });
+}
+
+export function takePendingOpenFiles(): Promise<string[]> {
+  return invoke("take_pending_open_files");
 }
 
 /** Back up all meetings (+ action items + Ask history) to one JSON file.
@@ -821,6 +859,45 @@ export function suggestFolderForMeeting(
   return invoke("suggest_folder_for_meeting", { meetingId });
 }
 
+export function getFolderCopilotBrief(folderId: number): Promise<FolderCopilotBrief> {
+  return invoke("get_folder_copilot_brief", { folderId });
+}
+
+export function setFolderCopilotMode(
+  folderId: number,
+  mode: Folder["copilot_mode"],
+): Promise<void> {
+  return invoke("set_folder_copilot_mode", { folderId, mode });
+}
+
+export function listFolderSources(folderId: number): Promise<import("../types").FolderSource[]> {
+  return invoke("list_folder_sources", { folderId });
+}
+
+export function addFolderSource(folderId: number, path: string, kind: "file" | "dir"): Promise<import("../types").FolderSource> {
+  return invoke("add_folder_source", { folderId, path, kind });
+}
+
+export function removeFolderSource(sourceId: number): Promise<void> {
+  return invoke("remove_folder_source", { sourceId });
+}
+
+export function refreshFolderProfile(folderId: number): Promise<string> {
+  return invoke("refresh_folder_profile", { folderId });
+}
+
+export function setFolderCopilotFields(folderId: number, fields: { purpose: string; voice_1: string; voice_2: string }): Promise<void> {
+  return invoke("set_folder_copilot_fields", { folderId, purpose: fields.purpose, voice1: fields.voice_1, voice2: fields.voice_2 });
+}
+
+export function setFolderProfile(folderId: number, profile: string): Promise<void> {
+  return invoke("set_folder_profile", { folderId, profile });
+}
+
+export function pickFolderPath(): Promise<string | null> {
+  return invoke("pick_folder_path");
+}
+
 // ---- Workspaces ----
 
 /** Load the cached project overview, generating it when missing or explicitly refreshed. */
@@ -1118,7 +1195,7 @@ export function getLatestWorkspaceRun(taskId: number): Promise<WorkspaceRun | nu
   return invoke("get_latest_workspace_run", { taskId });
 }
 
-/** Open a workspace artifact with its default macOS application. */
+/** Open a workspace artifact with its default application. */
 export function openWorkspaceArtifact(path: string): Promise<void> {
   return invoke("open_workspace_artifact", { path });
 }
@@ -1133,7 +1210,145 @@ export function revealWorkspaceArtifact(path: string): Promise<void> {
   return invoke("reveal_workspace_artifact", { path });
 }
 
+// ---- Live copilot (Slice B) ----
+
+export function copilotSetLiveContext(
+  sessionId: string,
+  context: import("../types").CopilotLiveContext,
+): Promise<void> {
+  const trimmed = sessionId?.trim();
+  if (!trimmed) {
+    return Promise.reject(new Error("copilotSetLiveContext requires a nonblank session_id"));
+  }
+  return invoke("copilot_set_live_context", { sessionId: trimmed, context });
+}
+
+// v2: returns acknowledgement {session_id, card_id}
+export function copilotAskLast(useMeFallback: boolean): Promise<import("../types").CopilotCommandAck> {
+  return invoke("copilot_ask_last", { useMeFallback });
+}
+
+export function copilotCancel(cardId: number): Promise<void> {
+  return invoke("copilot_cancel", { cardId });
+}
+
+export function copilotRetry(cardId: number): Promise<import("../types").CopilotCommandAck> {
+  return invoke("copilot_retry", { cardId });
+}
+
+export function setFolderCopilotWeb(folderId: number, enabled: boolean, copilotSessionId: string): Promise<void> {
+  const trimmed = copilotSessionId?.trim();
+  if (!trimmed) {
+    return Promise.reject(new Error("setFolderCopilotWeb requires a nonblank copilotSessionId"));
+  }
+  return invoke("set_folder_copilot_web", { folderId, enabled, copilotSessionId: trimmed });
+}
+
+// Compatibility alias for older call sites/tests — UI should use copilotAskLast
+export function copilotForceCard(): Promise<import("../types").CopilotCommandAck> {
+  return copilotAskLast(false);
+}
+
+// ---- Live copilot (Slice C) ----
+
+export function copilotSetMode(mode: import("../types").CopilotMode): Promise<import("../types").CopilotMode> {
+  return invoke("copilot_set_mode", { mode });
+}
+
+export function copilotGetMode(): Promise<import("../types").CopilotMode> {
+  return invoke("copilot_get_mode");
+}
+
+export async function copilotSetMicQuestions(enabled: boolean): Promise<void> {
+  await invoke("copilot_set_mic_questions", { enabled });
+}
+
+export function setCopilotApiKey(key: string): Promise<void> {
+  return invoke("set_copilot_api_key", { key });
+}
+
+export function clearCopilotApiKey(): Promise<void> {
+  return invoke("clear_copilot_api_key");
+}
+
+export function hasCopilotApiKey(): Promise<boolean> {
+  return invoke("has_copilot_api_key");
+}
+
+export function setDeepSeekCopilotApiKey(key: string): Promise<void> {
+  return invoke("set_deepseek_copilot_api_key", { key });
+}
+
+export function clearDeepSeekCopilotApiKey(): Promise<void> {
+  return invoke("clear_deepseek_copilot_api_key");
+}
+
+export function hasDeepSeekCopilotApiKey(): Promise<boolean> {
+  return invoke("has_deepseek_copilot_api_key");
+}
+
+export function getCopilotReceipt(meetingId: number): Promise<import("../types").CopilotReceipt> {
+  return invoke("get_copilot_receipt", { meetingId });
+}
+
+export function getCopilotHistory(meetingId: number): Promise<import("../types").MeetingCopilotHistory> {
+  return invoke("copilot_cards_for_meeting", { meetingId });
+}
+
+export function copilotCardReview(sessionId: string, cardId: number, action: import("../types").CopilotReviewAction): Promise<import("../types").CopilotCardReviewState> {
+  return invoke("copilot_card_review", { sessionId, cardId, action });
+}
+
+export function copilotLiveState(sessionId: string): Promise<import("../types").LiveState> { return invoke("copilot_live_state", { sessionId }); }
+export function copilotLiveConfigure(sessionId: string, enabled: boolean): Promise<import("../types").LiveState> { return invoke("copilot_live_configure", { sessionId, enabled }); }
+export function copilotLiveReview(sessionId: string, itemId: string, action: "edit" | "delete" | "restore" | "accept" | "edit_accept" | "dismiss", fields?: { text?: string; owner?: string | null; due?: string | null }): Promise<import("../types").LiveState> { return invoke("copilot_live_review", { sessionId, itemId, action, text: fields?.text ?? null, owner: fields?.owner ?? null, due: fields?.due ?? null }); }
+
+export function copilotFolderReadiness(sessionId: string): Promise<import("../types").CopilotFolderReadiness> {
+  const trimmed = sessionId?.trim();
+  if (!trimmed) {
+    return Promise.reject(new Error("copilotFolderReadiness requires a nonblank sessionId"));
+  }
+  return invoke("copilot_folder_readiness", { sessionId: trimmed });
+}
+
 /** Up to 3 related meetings surfaced under a note, with human-readable match reasons. */
 export function relatedMeetings(meetingId: number): Promise<RelatedMeetingRef[]> {
   return invoke("related_meetings", { meetingId });
+}
+
+// ---- Floating copilot HUD (Contract H) ----
+
+/** Show the floating copilot HUD window (`copilot-hud`). */
+export function showCopilotHud(): Promise<void> {
+  return invoke("show_copilot_hud");
+}
+
+/** Hide the floating copilot HUD window. */
+export function hideCopilotHud(): Promise<void> {
+  return invoke("hide_copilot_hud");
+}
+
+/** Toggle the floating copilot HUD window. */
+export function toggleCopilotHud(): Promise<void> {
+  return invoke("toggle_copilot_hud");
+}
+
+/** Start an OS-native drag of the floating copilot HUD window. */
+export function copilotHudStartDrag(): Promise<void> {
+  return invoke("copilot_hud_start_drag");
+}
+
+/** Persist the HUD's logical top-left position (written via config update). */
+export function copilotHudSavePosition(x: number, y: number): Promise<void> {
+  return invoke("copilot_hud_save_position", { x, y });
+}
+
+/** Persist the HUD's logical size (written via config update). */
+export function copilotHudSaveSize(w: number, h: number): Promise<void> {
+  return invoke("copilot_hud_save_size", { w, h });
+}
+
+/** Whether the floating copilot HUD window is currently open. */
+export function copilotHudIsOpen(): Promise<boolean> {
+  return invoke("copilot_hud_is_open");
 }

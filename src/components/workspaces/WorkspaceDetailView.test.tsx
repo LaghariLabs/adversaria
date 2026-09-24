@@ -13,6 +13,7 @@ import type {
   WorkspaceTask,
 } from "../../types";
 import { WorkspaceDetailView } from "./WorkspaceDetailView";
+import { COPY } from "../../lib/platform";
 
 const engines: WorkspaceEngine[] = [
   {
@@ -417,7 +418,7 @@ describe("WorkspaceDetailView two-pane project screen", () => {
 
     renderDetail(detail);
 
-    await screen.findByRole("button", { name: "Reveal in Finder" });
+    await screen.findByRole("button", { name: `Show in ${COPY.fileManager}` });
     const taskRow = screen.getByRole("button", {
       name: "Prepare launch plan details",
     });

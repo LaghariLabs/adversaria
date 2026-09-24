@@ -21,6 +21,7 @@ import { RecordingSection } from "./settings/RecordingSection";
 import { NotificationsSection } from "./settings/NotificationsSection";
 import { TranscriptionSection } from "./settings/TranscriptionSection";
 import { NotesSection } from "./settings/NotesSection";
+import { CopilotSection } from "./settings/CopilotSection";
 import { IntegrationsSection } from "./settings/IntegrationsSection";
 import { PrivacyDataSection } from "./settings/PrivacyDataSection";
 import { GeneralSection } from "./settings/GeneralSection";
@@ -259,6 +260,7 @@ export function Settings({ initialTab, tabNonce, onReplayTour }: SettingsProps) 
           update={update}
           models={models}
         />
+        <CopilotSection active={activeSettingsTab === "notes"} config={config} update={update} />
         <IntegrationsSection
           active={activeSettingsTab === "integrations"}
           config={config}

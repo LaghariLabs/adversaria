@@ -290,6 +290,7 @@ mod tests {
     fn meeting() -> Meeting {
         Meeting {
             id: 7,
+            uid: String::new(),
             title: "Q3 Planning: Budget & Roadmap".to_string(),
             recorded_at: "2026-07-06T08:00:00+00:00".to_string(),
             duration_seconds: 60.0,

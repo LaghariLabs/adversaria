@@ -568,6 +568,7 @@ mod tests {
     ) -> Meeting {
         Meeting {
             id: 0,
+            uid: String::new(),
             title: title.to_string(),
             recorded_at: "2026-07-09T14:00:00Z".to_string(),
             duration_seconds: 0.0,
@@ -723,6 +724,7 @@ mod tests {
     ) -> Meeting {
         Meeting {
             id,
+            uid: String::new(),
             title: title.to_string(),
             recorded_at: "2026-07-09T14:00:00Z".to_string(),
             duration_seconds: 0.0,

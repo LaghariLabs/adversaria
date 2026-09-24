@@ -87,9 +87,7 @@ class TestTranscribeStructured503:
         # A missing model is retried on demand: the model may have just landed.
         assert init_calls == [True]
 
-    def test_loading_does_not_retry_init(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_loading_does_not_retry_init(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(server, "_TRANSCRIBER_STATE", "loading")
         monkeypatch.setattr(server, "_TRANSCRIBER_DETAIL", None)
         init_calls: list[bool] = []

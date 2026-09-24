@@ -2,7 +2,37 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
+from typing import Literal
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+
+DEEPSEEK_COPILOT_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_COPILOT_MODEL = "deepseek-v4-pro"
+DEEPSEEK_COPILOT_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+
+
+def validate_copilot_deepseek_endpoint(base_url: str | None) -> str:
+    """Accept only DeepSeek's fixed first-party HTTPS Chat Completions base."""
+    if base_url is None:
+        raise ValueError("DeepSeek endpoint is missing")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("DeepSeek endpoint is invalid") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "api.deepseek.com"
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/", "/v1", "/v1/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("DeepSeek endpoint is invalid")
+    return DEEPSEEK_COPILOT_BASE_URL
 
 
 # --- Request models ---
@@ -80,6 +110,28 @@ class TranscribeRequest(BaseModel):
         if self.audio_path is None and self.mic_audio_path is None:
             raise ValueError("audio_path or mic_audio_path is required")
         return self
+
+
+class PriorMeeting(BaseModel):
+    """An earlier meeting the user attached while recording, with its still-open action items."""
+
+    title: str
+    date: str = ""  # "YYYY-MM-DD" or ""
+    open_items: list[str] = Field(
+        default_factory=list
+    )  # e.g. "Jena: share the profile with Shadyfah (due 2026-09-05)"
+
+
+class AcceptedLiveItem(BaseModel):
+    """An item confirmed by the user during the live meeting."""
+
+    id: str
+    kind: Literal["decision", "action", "question"]
+    text: str
+    owner: str | None = None
+    due: str | None = None
+    evidence_turn_ids: list[str] = Field(default_factory=list)
+    revision: int = 1
 
 
 class SummarizeRequest(BaseModel):
@@ -170,6 +222,20 @@ class SummarizeRequest(BaseModel):
             "malformed = no date context, and no dates are resolved."
         ),
     )
+    prior_meetings: list[PriorMeeting] = Field(
+        default_factory=list,
+        description=(
+            "Previous meetings the user attached while recording; each open "
+            "action item gets a follow-up check in the notes."
+        ),
+    )
+    accepted_live_items: list[AcceptedLiveItem] = Field(
+        default_factory=list,
+        description=(
+            "Items confirmed by the user during the meeting. When present, "
+            "they are traced facts to include under the matching section."
+        ),
+    )
 
 
 class TemplateSaveRequest(BaseModel):
@@ -199,8 +265,373 @@ class ChatRequest(BaseModel):
     )
 
 
+class CopilotAnswerPassage(BaseModel):
+    title: str
+    text: str
+    source: str = ""
+
+    @field_validator("text")
+    @classmethod
+    def text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("passage text cannot be blank")
+        trimmed = value.strip()
+        if len(trimmed) > 600:
+            raise ValueError("passage text exceeds 600 characters")
+        return trimmed
+
+    @field_validator("title", "source")
+    @classmethod
+    def trim_passage_metadata(cls, value: str, info) -> str:
+        trimmed = value.strip()
+        limit = 200 if info.field_name == "title" else 300
+        if len(trimmed) > limit:
+            raise ValueError(f"{info.field_name} exceeds {limit} characters")
+        return trimmed
+
+
+class RecentCard(BaseModel):
+    card_ref: str
+    question: str
+    say: str
+    points: list[str] = Field(default_factory=list, max_length=6)
+    origin: Literal["generated_suggestion"] = "generated_suggestion"
+    evidence_refs: list[str] = Field(default_factory=list, max_length=3)
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        if len(value) > 2000:
+            raise ValueError("question exceeds 2000 characters")
+        return value
+
+    @field_validator("say")
+    @classmethod
+    def validate_say(cls, value: str) -> str:
+        if len(value) > 1200:
+            raise ValueError("say exceeds 1200 characters")
+        return value
+
+    @field_validator("points")
+    @classmethod
+    def validate_points(cls, value: list[str]) -> list[str]:
+        if any(len(item) > 400 for item in value):
+            raise ValueError("points item exceeds 400 characters")
+        return value
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def validate_evidence_refs(cls, value: list[str]) -> list[str]:
+        if len(value) > 3:
+            raise ValueError("evidence_refs exceeds 3 items")
+        return value
+
+
+class CopilotAnswerRequest(BaseModel):
+    schema_version: Literal[5, 6, 7] = 7
+    provider: Literal["claude", "deepseek", "local"]
+    question: str
+    question_source: Literal["Me", "Them"] = "Them"
+    answer_shape: Literal["brief", "steps"] = "brief"
+    context_turns: list[str] = Field(default_factory=list, max_length=8)
+    passages: list[CopilotAnswerPassage] = Field(default_factory=list, max_length=3)
+    persona: str | None = None
+    voice_samples: list[str] = Field(default_factory=list, max_length=2)
+    meeting_header: str | None = None
+    running_summary: str | None = None
+    standing_pack: str | None = None
+    recent_cards: list[RecentCard] = Field(default_factory=list, max_length=3)
+    stated_figures: list[str] = Field(default_factory=list, max_length=32)
+    resolved_question: str | None = None
+    question_source_tier: Literal["partial", "confirmed"] = "confirmed"
+    web_search: bool = False
+    api_key: str | None = None
+    model: str | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+
+    @field_validator("question")
+    @classmethod
+    def question_must_not_be_blank(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("question cannot be blank")
+        if len(trimmed) > 2000:
+            raise ValueError("question exceeds 2000 characters")
+        return trimmed
+
+    @field_validator("standing_pack")
+    @classmethod
+    def validate_standing_pack(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value.encode("utf-8")) > 6000:
+            raise ValueError("standing_pack exceeds 6000 UTF-8 bytes")
+        return value
+
+    @field_validator("recent_cards")
+    @classmethod
+    def validate_recent_cards(cls, value: list[RecentCard]) -> list[RecentCard]:
+        if len(value) > 3:
+            raise ValueError("recent_cards exceeds 3 items")
+        return value
+
+    @field_validator("stated_figures")
+    @classmethod
+    def validate_stated_figures(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            stripped = item.strip()
+            if not stripped:
+                continue
+            if len(stripped) > 240:
+                raise ValueError("stated figure exceeds 240 characters")
+            cleaned.append(stripped)
+        total = sum(len(entry.encode("utf-8")) for entry in cleaned)
+        if total > 4000:
+            raise ValueError("stated_figures exceeds 4000 bytes")
+        return cleaned
+
+    @field_validator("resolved_question")
+    @classmethod
+    def validate_resolved_question(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) > 2000:
+            raise ValueError("resolved_question exceeds 2000 characters")
+        return value
+
+    @field_validator("context_turns")
+    @classmethod
+    def validate_context_turn_lengths(cls, value: list[str]) -> list[str]:
+        if any(len(item) > 600 for item in value):
+            raise ValueError("context turn exceeds 600 characters")
+        if any(not item.strip() for item in value):
+            raise ValueError("context turns cannot be blank")
+        return [item.strip() for item in value]
+
+    @field_validator("voice_samples")
+    @classmethod
+    def validate_voice_samples(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            stripped = item.strip()
+            if not stripped:
+                raise ValueError("voice samples cannot be blank")
+            if len(stripped) > 600 or len(item) > 600:
+                raise ValueError("voice sample exceeds 600 characters")
+            cleaned.append(stripped)
+        return cleaned
+
+    @field_validator("meeting_header", "running_summary")
+    @classmethod
+    def validate_optional_context_strings(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if len(stripped) > 1600 or len(value) > 1600:
+            raise ValueError(f"{info.field_name} exceeds 1600 characters")
+        return stripped
+
+    @field_validator("persona")
+    @classmethod
+    def trim_optional_persona(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if len(trimmed) > 400:
+            raise ValueError("persona exceeds 400 characters")
+        return trimmed or None
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self) -> "CopilotAnswerRequest":
+        if self.provider in {"claude", "deepseek"} and len(self.context_turns) > 4:
+            raise ValueError("context turns exceed 4 for cloud providers")
+        if self.provider in {"claude", "deepseek"} and self.stated_figures:
+            raise ValueError("stated figures are local only")
+        if self.provider == "local":
+            if self.api_key is not None or self.web_search:
+                raise ValueError(
+                    "local provider cannot use Claude credentials or web search"
+                )
+            if self.llm_api_key is not None and self.llm_base_url is None:
+                raise ValueError("local credentials require llm_base_url")
+            if self.llm_base_url is not None:
+                try:
+                    parsed = urlsplit(self.llm_base_url)
+                    port = parsed.port
+                except ValueError as exc:
+                    raise ValueError(
+                        "local engine must be a loopback HTTP endpoint"
+                    ) from exc
+                if (
+                    parsed.scheme != "http"
+                    or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                    or port is None
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.path not in {"", "/", "/v1", "/v1/"}
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    raise ValueError("local engine must be a loopback HTTP endpoint")
+        elif self.provider == "deepseek":
+            if self.api_key is not None or self.web_search:
+                raise ValueError(
+                    "DeepSeek provider cannot use Claude credentials or web search"
+                )
+            self.llm_base_url = validate_copilot_deepseek_endpoint(self.llm_base_url)
+            if not (self.llm_api_key or "").strip():
+                raise ValueError("DeepSeek API key missing")
+            self.llm_api_key = self.llm_api_key.strip()
+            if self.model not in DEEPSEEK_COPILOT_MODELS:
+                raise ValueError("DeepSeek model is invalid")
+        elif self.llm_base_url is not None or self.llm_api_key is not None:
+            raise ValueError("claude provider cannot use local engine fields")
+        return self
+
+
+class CopilotWarmRequest(BaseModel):
+    model: str
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+
+
+class CopilotWarmResponse(BaseModel):
+    ok: bool
+    ms: int
+    detail: str | None = None
+
+
+class LiveTurn(BaseModel):
+    id: str
+    start_ms: int
+    end_ms: int
+    source: Literal["Me", "Them"]
+    text: str
+
+
+class LiveItemIn(BaseModel):
+    id: str
+    kind: Literal["decision", "action", "question"]
+    text: str
+    owner: str | None = None
+    due: str | None = None
+    status: Literal["proposed", "accepted"]
+    evidence_turn_ids: list[str] = Field(default_factory=list)
+
+
+class LiveSummary(BaseModel):
+    bullets: list[str] = Field(default_factory=list)
+    evidence_turn_ids: list[str] = Field(default_factory=list)
+
+
+class LiveExtractRequest(BaseModel):
+    request_id: str
+    session_id: str
+    base_revision: int
+    model: str
+    num_ctx: int = 8192  # ignored: live extraction always uses COPILOT_NUM_CTX
+    update_summary: bool = False
+    turns: list[LiveTurn] = Field(default_factory=list)
+    items: list[LiveItemIn] = Field(default_factory=list)
+    summary: LiveSummary = Field(default_factory=LiveSummary)
+    new_turn_ids: list[str] = Field(default_factory=list)
+
+
+class LiveUpsert(BaseModel):
+    id: str | None = None
+    kind: Literal["decision", "action", "question"]
+    text: str
+    owner: str | None = None
+    due: str | None = None
+    evidence_turn_ids: list[str] = Field(default_factory=list)
+    supersedes_id: str | None = None
+
+
+class LiveRetraction(BaseModel):
+    id: str
+    evidence_turn_ids: list[str]
+    reason_code: Literal["explicit_withdrawal", "explicit_replacement"]
+    withdrawal_quote: str = Field(min_length=1)
+
+
+class LiveExtractResponse(BaseModel):
+    request_id: str
+    session_id: str
+    base_revision: int
+    status: Literal["ok", "error"]
+    reason: str | None = None
+    through_ms: int | None = None
+    upserts: list[LiveUpsert] = Field(default_factory=list)
+    retractions: list[LiveRetraction] = Field(default_factory=list)
+    summary: LiveSummary | None = None
+
+
+class LiveExtractModelOutput(BaseModel):
+    upserts: list[LiveUpsert]
+    retractions: list[LiveRetraction]
+
+
+class LiveExtractModelOutputNoSummary(LiveExtractModelOutput):
+    pass
+
+
+class LiveExtractModelOutputWithSummary(LiveExtractModelOutput):
+    summary: LiveSummary
+
+
+class GateRequest(BaseModel):
+    candidate: str
+    speaker: Literal["Me", "Them"]
+    mode: Literal["interview", "self_ask"]
+    context_turns: list[str] = Field(default_factory=list)
+    recent_questions: list[str] = Field(default_factory=list)
+    model: str
+
+
+class GateResponse(BaseModel):
+    action: Literal["answer", "ignore"]
+    resolved_question: str | None = None
+    reason_code: Literal[
+        "direct_question",
+        "embedded_question",
+        "narration",
+        "answered_in_turn",
+        "repeat",
+        "no_request",
+        "unclear",
+        # Not a model verdict: the gate backend itself failed (model call
+        # raised, output was unparseable, or the summarizer was missing), so
+        # the desktop app must apply its reason-aware fallback instead of
+        # treating this as the model genuinely saying "ignore".
+        "backend_error",
+    ] = "unclear"
+
+
+class GateModelOutput(BaseModel):
+    # The schema is compiled into a llama.cpp grammar (Ollama `format`), which rejects string repetitions of 2000 or more ("failed to parse grammar"); 1500 also fits the 400-token `num_predict`. Post-parse validation stays at 2000 characters.
+    resolved_question: str = Field(min_length=1, max_length=1500)
+    action: Literal["answer", "ignore"]
+    reason_code: Literal[
+        "direct_question",
+        "embedded_question",
+        "narration",
+        "answered_in_turn",
+        "repeat",
+        "no_request",
+        "unclear",
+    ]
+
+
 class DraftRequest(BaseModel):
-    brief: str = Field(..., description="Task brief with all context the writer may use")
+    brief: str = Field(
+        ..., description="Task brief with all context the writer may use"
+    )
     instruction: str = Field(..., description="What to produce from the brief")
     model: str | None = Field(
         default=None,
@@ -234,7 +665,19 @@ class EmbedRequest(BaseModel):
 
 
 class LlmHostRequest(BaseModel):
-    ollama_host: str = Field(..., description="Loopback Ollama host owned by the desktop app")
+    ollama_host: str | None = Field(
+        default=None, description="Loopback Ollama host owned by the desktop app"
+    )
+    local_openai_base_url: str | None = Field(
+        default=None,
+        description="Loopback OpenAI-compatible base owned by the desktop app",
+    )
+
+    @model_validator(mode="after")
+    def require_registered_host(self) -> "LlmHostRequest":
+        if self.ollama_host is None and self.local_openai_base_url is None:
+            raise ValueError("at least one local LLM host is required")
+        return self
 
 
 class EmbedResponse(BaseModel):
@@ -385,6 +828,10 @@ class LiveFeedRequest(BaseModel):
 
 class LiveFeedResponse(BaseModel):
     captions: list[str] = Field(default_factory=list)
+    caption_boundaries: list[Literal["silence", "forced"]] = Field(
+        default_factory=list,
+        description="Boundary for each caption: forced continues the current speech turn; silence completes it.",
+    )
     partial: str = Field(
         "",
         description="Best-effort text for audio after the last confirmed utterance of this source (streaming preview; replaced each feed, empty when idle or when no streaming engine is available)",

@@ -44,25 +44,20 @@ pub fn set_client(
         client_secret: client_secret.map(|s| s.to_string()),
     };
     let json = serde_json::to_string(&creds).map_err(|e| format!("serialize: {e}"))?;
-    let entry = keyring::Entry::new(SERVICE, &account).map_err(|e| format!("keyring open: {e}"))?;
-    entry
-        .set_password(&json)
-        .map_err(|e| format!("keyring write: {e}"))
+    crate::secrets::set(SERVICE, &account, &json)
 }
 
 /// Read the user's OAuth client credentials from the OS keychain.
 /// Returns `Ok(None)` if no credentials exist yet.
 pub fn get_client(provider: &str) -> Result<Option<ClientCreds>, String> {
     let account = format!("{provider}:client");
-    let entry = keyring::Entry::new(SERVICE, &account).map_err(|e| format!("keyring open: {e}"))?;
-    match entry.get_password() {
-        Ok(json) => {
+    match crate::secrets::get(SERVICE, &account)? {
+        Some(json) => {
             let creds: ClientCreds =
                 serde_json::from_str(&json).map_err(|e| format!("deserialize: {e}"))?;
             Ok(Some(creds))
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keyring read: {e}")),
+        None => Ok(None),
     }
 }
 
@@ -74,35 +69,27 @@ pub fn get_client(provider: &str) -> Result<Option<ClientCreds>, String> {
 pub fn set_tokens(provider: &str, tokens: &TokenSet) -> Result<(), String> {
     let account = format!("{provider}:tokens");
     let json = serde_json::to_string(tokens).map_err(|e| format!("serialize tokens: {e}"))?;
-    let entry = keyring::Entry::new(SERVICE, &account).map_err(|e| format!("keyring open: {e}"))?;
-    entry
-        .set_password(&json)
-        .map_err(|e| format!("keyring write tokens: {e}"))
+    crate::secrets::set(SERVICE, &account, &json)
+        .map_err(|e| e.replacen("keyring write: ", "keyring write tokens: ", 1))
 }
 
 /// Read OAuth tokens for a provider. Returns `Ok(None)` if no tokens exist yet.
 pub fn get_tokens(provider: &str) -> Result<Option<TokenSet>, String> {
     let account = format!("{provider}:tokens");
-    let entry = keyring::Entry::new(SERVICE, &account).map_err(|e| format!("keyring open: {e}"))?;
-    match entry.get_password() {
-        Ok(json) => {
+    match crate::secrets::get(SERVICE, &account)
+        .map_err(|e| e.replacen("keyring read: ", "keyring read tokens: ", 1))?
+    {
+        Some(json) => {
             let tokens: TokenSet =
                 serde_json::from_str(&json).map_err(|e| format!("deserialize tokens: {e}"))?;
             Ok(Some(tokens))
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keyring read tokens: {e}")),
+        None => Ok(None),
     }
 }
 
 /// Delete the keychain entry for a given account key.
 #[allow(dead_code)]
 pub fn delete_entry(account_key: &str) -> Result<(), String> {
-    let entry =
-        keyring::Entry::new(SERVICE, account_key).map_err(|e| format!("keyring open: {e}"))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()), // already gone
-        Err(e) => Err(format!("keyring delete: {e}")),
-    }
+    crate::secrets::delete(SERVICE, account_key)
 }

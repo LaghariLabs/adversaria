@@ -1,16 +1,26 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { Folder } from "lucide-react";
 import { formatDate, formatDateTime } from "../lib/dateFormat";
 import { cleanMeetingTitle } from "../lib/summary";
 import {
+  exportAdversaria,
   getActionItems,
   getFolderOverview,
+  hasCopilotApiKey,
+  hasDeepSeekCopilotApiKey,
   setActionItemDone,
+  setFolderCopilotMode,
   setFolderInstructions,
 } from "../lib/tauri";
+import { CopilotConsentBar } from "./CopilotConsentBar";
+import type { CopilotMode } from "../types";
 import type { ActionItem, FolderOverview, FolderSummary, Meeting } from "../types";
 import { ThinkingIndicator } from "./ThinkingIndicator";
+
+const FolderCopilotCard = lazy(() =>
+  import("./FolderCopilotCard").then((m) => ({ default: m.FolderCopilotCard })),
+);
 
 interface FolderViewProps {
   folder: FolderSummary;
@@ -53,9 +63,8 @@ const FOLDER_WORDS = [
 ];
 
 function derivePeople(meetings: Meeting[]): Array<{ display: string; count: number }> {
-  // Map lower -> { display (first spelling), count, seenMeetingIds? } but count at most once per meeting.
   const map = new Map<string, { display: string; count: number }>();
-  const order = new Map<string, string>(); // lower -> first display
+  const order = new Map<string, string>();
 
   for (const meeting of meetings) {
     const seenInMeeting = new Set<string>();
@@ -81,7 +90,6 @@ function derivePeople(meetings: Meeting[]): Array<{ display: string; count: numb
   const list = Array.from(map.values());
   list.sort((a, b) => {
     if (b.count !== a.count) return b.count - a.count;
-    // name ascending, case-insensitive but stable
     const al = a.display.toLowerCase();
     const bl = b.display.toLowerCase();
     if (al < bl) return -1;
@@ -104,6 +112,29 @@ export function FolderView({
   const [instructionsSaved, setInstructionsSaved] = useState(false);
   const [instructionsError, setInstructionsError] = useState<string | null>(null);
   const [openItems, setOpenItems] = useState<ActionItem[]>([]);
+  const [exportFolderMsg, setExportFolderMsg] = useState<string | null>(null);
+  const [copilotMode, setCopilotMode] = useState<CopilotMode>((folderDetails.copilot_mode as CopilotMode) ?? "no_ai");
+  const [hasClaudeKey, setHasClaudeKey] = useState(false);
+  const [hasDeepSeekKey, setHasDeepSeekKey] = useState(false);
+  useEffect(() => {
+    setCopilotMode((folderDetails.copilot_mode as CopilotMode) ?? "no_ai");
+  }, [folderDetails.copilot_mode]);
+  useEffect(() => {
+    hasCopilotApiKey().then(setHasClaudeKey).catch(() => {});
+    hasDeepSeekCopilotApiKey().then(setHasDeepSeekKey).catch(() => {});
+  }, []);
+
+  const handleExportFolder = async () => {
+    try {
+      const path = await exportAdversaria([], folderDetails.id);
+      if (path) {
+        setExportFolderMsg(`Saved to ${path}`);
+        setTimeout(() => setExportFolderMsg(null), 4000);
+      }
+    } catch (e) {
+      setExportFolderMsg(String(e));
+    }
+  };
 
   // Folder overview state
   const [overview, setOverview] = useState<FolderOverview | null>(null);
@@ -148,7 +179,6 @@ export function FolderView({
   const people = useMemo(() => derivePeople(meetings), [meetings]);
 
   const meetingsSignature = useMemo(() => {
-    // Stable signature over source hash inputs: id, title, recorded_at, summary, attendees
     return JSON.stringify(
       meetings.map((m) => ({
         id: m.id,
@@ -164,8 +194,6 @@ export function FolderView({
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      // Zero meetings: backend returns empty without model, but we still call to get correct empty state with stale false.
-      // Show loading only when we have no overview yet.
       const hadOverview = overview !== null;
       if (!hadOverview) setOverviewLoading(true);
       else setRefreshing(true);
@@ -177,9 +205,7 @@ export function FolderView({
         setOverviewError(null);
       } catch (error) {
         if (cancelled) return;
-        // Keep existing overview visible; show error.
         setOverviewError(String(error));
-        // If we had no overview and error, overview stays null so initial error UI shows.
       } finally {
         if (cancelled) return;
         setOverviewLoading(false);
@@ -194,7 +220,6 @@ export function FolderView({
   }, [folderDetails.id, folderDetails.instructions, meetingsSignature]);
 
   const handleRefresh = async () => {
-    // Keep existing prose visible while disabling trigger and showing progress.
     setRefreshing(true);
     setOverviewError(null);
     try {
@@ -202,7 +227,6 @@ export function FolderView({
       setOverview(result);
       setOverviewError(null);
     } catch (error) {
-      // Retain prose if we had it; show inline error.
       setOverviewError(String(error));
     } finally {
       setRefreshing(false);
@@ -297,6 +321,19 @@ export function FolderView({
           <h1 className="viewer-title">{folderDetails.name}</h1>
         </div>
         <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>{knowsLine}</div>
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ height: 28, fontSize: 11, padding: "0 10px" }}
+            onClick={() => void handleExportFolder()}
+          >
+            Export folder as .adversaria…
+          </button>
+          {exportFolderMsg && (
+            <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>{exportFolderMsg}</span>
+          )}
+        </div>
       </div>
 
       <div className="viewer-body">
@@ -423,7 +460,6 @@ export function FolderView({
                   )}
                 </div>
               ) : (
-                // No cached summary but not loading/error/empty – fallback (should not happen)
                 <div style={{ color: "var(--text-muted)", fontSize: 12 }}>No overview yet.</div>
               )}
 
@@ -521,6 +557,25 @@ export function FolderView({
                 <div style={{ color: "var(--text-muted)", fontSize: 12 }}>No meetings filed here yet. Drag one in from the sidebar.</div>
               )}
               </div>
+
+              <div className="folder-card" style={CARD_STYLE}>
+                <div style={CARD_CAP_STYLE}>Copilot default for this folder</div>
+                <CopilotConsentBar
+                  mode={copilotMode}
+                  hasClaudeKey={hasClaudeKey}
+                  hasDeepSeekKey={hasDeepSeekKey}
+                  onChange={(mode) => {
+                    setCopilotMode(mode);
+                    setFolderCopilotMode(folderDetails.id, mode)
+                      .then(() => onFolderUpdated())
+                      .catch((e) => console.error(e));
+                  }}
+                />
+              </div>
+
+              <Suspense fallback={null}>
+                <FolderCopilotCard folder={folderDetails} onFolderUpdated={onFolderUpdated} />
+              </Suspense>
 
               {/* Folder controls belong with folder context, beneath Meetings. */}
               <div className="folder-card folder-standing-card" style={CARD_STYLE}>

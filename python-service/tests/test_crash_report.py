@@ -40,9 +40,13 @@ class TestCrashFile:
 
         run_service._write_crash(type(exc), exc, exc.__traceback__)
 
-        content = (tmp_path / "appdata" / "service-crash.txt").read_text(encoding="utf-8")
+        content = (tmp_path / "appdata" / "service-crash.txt").read_text(
+            encoding="utf-8"
+        )
         assert "Traceback (most recent call last)" in content
-        assert "RuntimeError: libcudnn_ops.so: cannot open shared object file" in content
+        assert (
+            "RuntimeError: libcudnn_ops.so: cannot open shared object file" in content
+        )
 
     def test_holds_crash_evidence_only(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -65,7 +69,9 @@ class TestCrashFile:
     ) -> None:
         """Mode "w" per crash: the death being diagnosed is the last one."""
         monkeypatch.setenv("ADVERSARIA_DATA_DIR", str(tmp_path))
-        (tmp_path / "service-crash.txt").write_text("an older death\n", encoding="utf-8")
+        (tmp_path / "service-crash.txt").write_text(
+            "an older death\n", encoding="utf-8"
+        )
         exc = _boom()
 
         run_service._write_crash(type(exc), exc, exc.__traceback__)

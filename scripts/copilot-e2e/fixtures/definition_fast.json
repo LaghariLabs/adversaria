@@ -1,0 +1,18 @@
+{
+  "name": "definition_fast",
+  "note": "Invented practice case: general-knowledge definition latency probe.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is a vector database?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "stated_figures": [],
+    "passages": []
+  },
+  "expect": {
+    "must_match": ["vector database is"],
+    "max_first_text_s": 3.0
+  }
+}

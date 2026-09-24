@@ -269,7 +269,7 @@ export function RecordingBubble() {
                   title="Stop & summarize"
                   aria-label="Stop recording"
                 >
-                  <Square size={11} fill="currentColor" aria-hidden="true" />
+                  <Square size={12} fill="currentColor" aria-hidden="true" />
                 </button>
               </div>
             </div>

@@ -6,12 +6,14 @@ design spec, see [`superpowers/specs/2026-06-11-meeting-note-taker-design.md`](.
 
 ## Overview
 
-A three-layer local desktop app, cross-platform across **Windows** and **macOS**
-(Apple Silicon). Everything runs on one machine; the only network traffic is
-loopback HTTP between the Rust backend and the Python service, plus the Python
-service talking to a local Ollama server. Only the OS-specific layers differ —
-audio capture, meeting detection, and the Whisper backend (see the per-layer
-notes below); the React UI, SQLite store, config, and HTTP client are shared.
+A three-layer desktop app, cross-platform across **Windows** and **macOS**
+(Apple Silicon). The private default path runs on one machine through loopback
+HTTP between Rust, the Python service, and local engines such as Ollama. When
+the user explicitly configures a cloud transcription or LLM provider, or opts
+into Live Copilot's Claude and web modes, the Python service also makes those
+consented external requests. Only the OS-specific layers differ: audio capture,
+meeting detection, and the Whisper backend (see the per-layer notes below); the
+React UI, SQLite store, config, and HTTP client are shared.
 
 ```
 ┌──────────────┐  invoke()   ┌────────────────────┐  HTTP :9876   ┌─────────────────────┐
@@ -101,14 +103,17 @@ all communication with the Python service.
   - **`wasapi.rs`** (Windows) — two OS threads: the default *render* device in
     loopback mode + the default *capture* device. Shared-mode WASAPI delivers
     32-bit float (`format_tag=3`).
-  - **`macos.rs`** — **ScreenCaptureKit** for system audio (planar f32 @ 48 kHz,
-    interleaved into the same float-WAV format) + **cpal** for the mic on its own
-    thread. The `SCStream` is held in `AudioCapture` so it stays alive between the
-    start/stop IPC calls.
+  - **`macos.rs`** — a **Core Audio process tap** (`AudioHardwareCreateProcessTap`,
+    driven through cpal's loopback input) for system audio + **cpal** for the mic on
+    its own thread. ScreenCaptureKit was removed on 2026-08-13 (`9589e8c`); the tap
+    needs the *System Audio Recording* grant, not *Screen Recording* (see
+    LESSONS_LEARNED 2026-08-17). The tap stays anchored to the default output
+    device chosen at start (`audio/macos.rs` header).
   Mic capture is **best-effort** on both: a missing/failing/denied mic flags
   itself not-OK and the meeting falls back to system audio only — it never aborts
-  the recording. macOS system-audio capture requires the **Screen Recording**
-  permission (granted once in System Settings, then restart).
+  the recording. macOS system-audio capture requires the **System Audio Recording**
+  permission (`kTCCServiceAudioCapture`; an app that already holds Screen Recording
+  is silently denied the prompt, see LESSONS_LEARNED 2026-08-17).
 - **`http_client.rs`** — typed `reqwest` client: `transcribe(audio_path, mic?, me_label?,
   vocabulary?, diarize)`, `summarize(...)`, `chat(...)` and streaming `chat_stream(...)`
   (parses the `/chat_stream` SSE via `resp.chunk()`), `embed(texts)` (batch vectors for
@@ -141,6 +146,42 @@ all communication with the Python service.
   still starts and the tray menu remains the control.
 - **`types.rs`** — shared serde types (`Meeting`, `AppConfig`, the response DTOs).
 
+### Live Copilot v2 (2026-09-05, `feat/live-copilot-c`; ADR-020, spec `docs/superpowers/specs/2026-09-05-realtime-copilot-v2.md`)
+
+Realtime, session-bound answer cards while recording with local passages first and one grounded answer (Local or Claude, by consent):
+
+- **Durable Session Identity & Isolation:** Each recording session generates a UUIDv4 `session_id` (`copilot_session.rs`, `storage.rs`) tracked in `copilot_sessions(session_id PRIMARY KEY, meeting_id, started_at)`. All authoritative IPC events (`copilot-card`, `copilot-answer`) and database rows are tagged with `session_id`. (The expressive bubble headline `copilot-headline` is deferred; the companion answer strip and slide-over sheet are implemented.) The frontend listener drops any event whose `session_id` does not match the active recording session, eliminating cross-session leakage.
+- **Latest-Intent Queue & Backpressure:** Replaced legacy FIFO/blackout with a 1-active + 1-waiting slot model (`CopilotSession`). A new distinct question replaces the waiting job (`skipped {reason: "superseded"}`) while the active stream completes without interruption. Distinct check compares normalized text against active, waiting, and the last 3 answered questions.
+- **Two-Level Cancellation Model:** Session `CancellationToken` parents per-card child tokens. Stopping recording, starting a new recording, or changing modes (`copilot_set_mode`) triggers immediate cancellation (`cancelled {session_ended | mode_changed}`), retires the active Rust request, and preserves partial markdown. Python's control path polls disconnects every 50 ms and an offline cooperative-generator test closes within 500 ms; actual live SDK/socket teardown timing remains unmeasured.
+- **Grounding & Egress Snapshot Timing:** Provider, mode, question, context turns (≤ 2 preceding Them turns ≤ 600 chars each), persona, and web preferences are frozen at capture when a question is heard. Grounding passages (top 3 ≤ 600 chars each, source basename) are retrieved when a queued card transitions to active; retry reuses them only when the original retrieval completed and otherwise retrieves again. Bounds are enforced in Rust before dispatch; `egress_bytes` measures the sidecar request JSON after removing the API key.
+- **Registered Local Endpoints:** Local provider requests are restricted to approved loopback endpoints (default Ollama `http://127.0.0.1:11434`, managed Ollama, and managed Rapid-MLX `http://127.0.0.1:port/v1`). Unapproved hosts, non-http schemes, userinfo credentials, or remote endpoints are rejected at snapshot creation in Rust and return HTTP 400 in Python before any socket connection.
+- **Authoritative Stream Termination:** Python (`copilot_answer.py`, `summarizer.py`) emits `data: [DONE]` only on authoritative stop signals (`finish_reason: "stop"` or Claude final message). Premature EOF, `length` token cutoff, or exceptions emit typed error frames (`ended_early`, `length`, etc.) and never emit `[DONE]`. Rust treats EOF without `[DONE]` or missing usage as `error {ended_early}`.
+- **Deterministic Provenance & Grounding:** `copilot_provenance.rs` assigns `notes` when a bullet shares ≥ 5 consecutive normalized tokens with a passage; `web` requires token match + URL + `web_performed > 0`; otherwise `model`. Questions containing `\b(you|your|yourself)\b` without passages enforce a `"Not in your notes"` prefix on the first bullet.
+- **Guarded Persistence & Accounting:** One INSERT when heard; terminal persistence (`done`, `skipped`, `cancelled`, `error`) is guarded, persisted before emit, and retried three times, with no recovery after all three SQLite attempts fail. Meeting attach maps `session_id` to `meeting_id`. Finished meeting receipt calculates `questions`, `claude_questions`, `egress_bytes`, and authoritative `web_performed`.
+- **Companion UX:** Balanced view features a one-line answer strip above tabs. Transcript-first view mounts a 360 px slide-over sheet (`companion-copilot-sheet`) above the transcript without unmounting it. Pin to notes writes bracketed provenance tags (`[your notes]`, `[Local]`, `[Claude]`). Mode/key changes handle errors optimistically with UI notices.
+
+### Export formats (2026-09-03)
+
+- **Slide / PDF:** `buildSlideHtml(meeting, ExportTheme)` (`src/lib/exportDocument.ts`) renders one self-contained HTML deck from a snapshot of the live theme tokens (`readExportTheme()` reads `data-theme` + the `--bg-*`, `--text-*`, `--accent-*`, `--font-*` variables); `@media print` keeps the theme (`print-color-adjust: exact`) and the deck carries a `Print / Save as PDF` button. Written by `export_html` (rfd save dialog). There is no native PDF renderer.
+- **`.adversaria` document** (`src-tauri/src/adversaria_doc.rs`): UTF-8 JSON `{format:"adversaria", schema_version:1, document_uid, exported_at, app_version, scope{kind,root_uid}, folders[{uid,name,color,instructions,copilot_mode,meeting_uids}], meetings[{uid, …meeting fields…, action_items[{ord,text,assignee,due,done,status,completed_by,completed_at,evidence}], attachments[{kind,label,file_name,meeting_uid}]}]}` — no audio, no embeddings, no paths, no file bytes. `meetings.uid` / `folders.uid` (UUID v4, backfilled by migration) make re-import idempotent. Commands: `export_adversaria(meeting_ids, folder_id)` (selection or whole folder), `import_adversaria(path?) -> ImportReport` (skips existing uids, matches folders by uid then name, else creates; legacy `{schema_version:1, meeting}` `.adversaria.json` still imports), `take_pending_open_files`. OS: `bundle.fileAssociations` registers `.adversaria`; `RunEvent::Opened` (macOS), argv (Windows/Linux) and single-instance args feed the `open-adversaria-file` event (queued until the frontend mounts). The old `export_meeting_bundle` / `import_meeting_bundle` are thin wrappers.
+
+### Live Copilot rev 6 (2026-09-06 to 2026-09-09, `feat/live-copilot-c`, uncommitted; contracts in `.recon/copilot-rev6/` and `.recon/interview-copilot-20260908/spec2-pinned.md`)
+
+Rev 6 turns the copilot into an **interview copilot** (founder decision 2026-09-08; the meeting flow is unchanged). Answers are four labelled sections streamed as `{"t","sec","i"}` frames: `SAY` (spoken, first person, one of four shapes: definition, how/why, compressed STAR experience, design), `SPECIFIC`, `NOTES` (`P<n> | "quote" | clause`, only on real keyword overlap), `NEXT`. The context envelope per request (schema v7, `python-service/src/models.py` `CopilotAnswerRequest`) is, in order: **PACK** (standing pack: the folder profile plus the first paragraph of every `<project>-overview.md` among the folder's sources, ≤ 6,000 bytes, byte-stable so DeepSeek/Anthropic prefix caches hit; built by `folder_sources::build_pack`, stored on `copilot_sessions.pack_text/pack_hash`, frozen per job), **HEADER** (`Purpose:` then `About Me:`), **SUMMARY** (reserved), **RECENT CARDS** (the last three `done` cards of the session as reference-only JSON, ≤ 2,400 bytes local / 1,600 cloud), recent **turns** (8 local / 4 cloud), up to **3 passages** (600 chars, 1,000 bytes cloud), **VOICE** samples, the **QUESTION**; drop order VOICE, RECENT CARDS, SUMMARY, HEADER, PACK, oldest turns, highest passages; envelope 32,768 bytes local / 24,576 cloud; `COPILOT_MAX_TOKENS` 640.
+
+Retrieval (`copilot.rs`): question keywords (≥ 4 letters, plus the folder's acronym allowlist `folders.folder_terms` rebuilt at sync from doc titles) → tiers live notes (0.9) · folder meetings FTS (0.85) · attachments (0.8) · vault/project context under the folder's source paths (semantic, ≥ 0.55) · **folder docs** (FTS5, title ×10, one best paragraph per file, score `0.86 + 0.10 × coverage`, fully covered hits first) → canonical dedup (`file:<path>`, `meeting:<id>`, `notes`, `project:<dir>`) → 3 passages within 900 ms. A `resolved_question` (question keywords plus up to four from the previous card when the question is short or reuses the previous SAY's words) drives retrieval and the NOTES floor. Providers: Local (`copilot_local_model`, default `qwen3.6:35b`, preloaded by `POST /copilot/warm` with the answer path's `num_ctx` and `keep_alive` 30 min), DeepSeek (`copilot_deepseek_model`, default `deepseek-v4-flash`, endpoint locked), Claude (API key, PACK as its own cached block), No AI (passages only). Session start emits `copilot-folder-ready` (`indexing` → `ready {count, pack_projects, pack_chars, pack_hash}` | `error`), mirrored by the `copilot_folder_readiness` command; the retrieval consumer waits for readiness up to 10 s. Deferred: speculative start on partial captions, the practice runner with blind ratings, the running summary, a semantic tier for folder docs. Evidence format for folder sources: `docs/COPILOT_DOSSIER_RECIPE.md`.
+
+### Live Copilot v3 (2026-09-14, `feat/live-copilot-c`, uncommitted; contracts in `.recon/copilot-ux-20260913/slice1-contract.md` and `slice2-contract.md`)
+
+- **History:** `copilot_cards` gains `pinned_at`, `dismissed_at`; Tauri `copilot_cards_for_meeting(meetingId) -> MeetingCopilotHistory` (rows with `meeting_id` or session-attached rows with null meeting_id; `sections` parsed from `answer_md` by `copilot_provenance::parse_sections`) and `copilot_card_review(sessionId, cardId, action: pin|unpin|dismiss|restore)`. Frontend: lazy `CopilotHistory.tsx` behind the note view's **AI Copilot** tab.
+- **Live review:** `copilot_live.rs` (pure scheduler/state: `push_turn`, `should_extract`, `build_request`, `apply_response`, `review`, `snapshot`), `copilot_session.rs::run_live_extractor` (5 s tick; runs only when enabled, mode `local`, ≥ 45 s since last run, ≥ 80 new words, no active/waiting answer job, ≥ 3 s after the last answer; back-off 60 s / 180 s after three errors), tables `copilot_live_items` and `copilot_live_summary`, commands `copilot_live_state`, `copilot_live_configure`, `copilot_live_review`, event `copilot-live-state` (`LiveState` snapshot, revision-gated on the frontend). Python `POST /copilot/live_extract` (`live_extract.py`: JSON-schema one-shot Ollama call, `think=False`, temperature 0, `num_predict=768`; evidence ids validated against the request turns). Frontend: lazy `LiveReviewPanels.tsx` under the copilot cards in `RecordingCompanion.tsx`.
+- **Accepted items → summary (slice 3):** `SummarizeParams.accepted_live_items` (Rust, omitted when empty; from `accepted_live_items_for_session` at the first summary, `_for_meeting` on regenerate) → `SummarizeRequest.accepted_live_items` → `<accepted_live_items>` prompt block + `general.md` exception → `_ensure_accepted_items_section` before `_render`. `MeetingCopilotHistory.live_items` feeds the AI Copilot tab's Live review group.
+- **Secrets:** `secrets.rs` is the single keychain boundary (copilot keys, calendar tokens, spool key, DB key). Release builds use the OS keychain; debug builds use `<app_data>/dev-secrets.json` (0600) with a one-time keychain→file copy on a miss, so unsigned dev rebuilds stop prompting; `ADVERSARIA_SECRET_STORE=keychain|file` overrides.
+- **Trigger policy:** `copilot::classify_candidate` → mode rules, soft gap and intent suppression in `copilot_session.rs` → optional `POST /copilot/gate` (`copilot_gate.py`, `answer|ignore` + `resolved_question`) before retrieval; `resolved_question` reaches retrieval, the answer prompt (`HEARD AS`) and the card.
+- **Answer shape (updated 2026-09-19):** brief = one plain SAY sentence that names the subject (definition questions: "X is a [category], [field or branch], that [defining mechanism]", at most 30 words, no markdown) plus two or three SPECIFIC lines of the form `**Keyword**: short phrase` (at most 16 words, each one concrete fact); steps = a plain approach sentence plus 2 to 6 steps of at most 10 words, optionally one bold term. Specific caps are 3 (brief) and 6 (steps) in both the Python parser and Rust `specific_cap`; `**` passes through untouched and the frontend renders it with `src/lib/inlineBold.tsx`. Every copilot call to the local model uses `COPILOT_NUM_CTX` (16384) so Ollama never reloads the runner. Recent cards (max 3, oldest first) carry `question`, `say` and `points` (the card's SPECIFIC lines, max 6) so follow-ups can continue a list.
+- **Notes editor:** `src/components/NotesEditor.tsx` (TipTap 3.31.3, `@tiptap/markdown`, `@tiptap/extension-list` task items, image by URL; lazy chunk ~480 kB) used by the Personal Notes tab and the companion Notes tab; the stored value stays markdown (`update_meeting_notes` unchanged).
+- **Styles:** new per-feature stylesheets `src/styles/live-copilot.css`, `src/styles/copilot-history.css`, `src/styles/notes-editor.css` (tokens only) instead of growing `prototype.css`.
+
 ## Layer 3 — Python ML service (`python-service/`)
 
 A FastAPI app (uvicorn, port 9876) that does the heavy ML. Since V3
@@ -161,9 +202,10 @@ Endpoints:
 | `GET /templates/{name}` | raw template | → `{name, content}` |
 | `POST /live_feed` | live captions, two tiers | `{audio_path (delta WAV of NEW audio), session (recording epoch), source: "them"\|"me"}` → `{captions: [confirmed utterances], partial: "grey preview of the unconfirmed tail"}` (2026-09-01, ADR-019) |
 | `POST /transcribe` | speech→text (+ diarization) | `{audio_path, mic_audio_path?, me_label?, vocabulary?, diarize}` → `{text, language, duration_seconds}` |
-| `POST /summarize` | text→notes | `{transcript, template_name, model?, llm_base_url?, llm_api_key?}` → `{summary, template_used, title, attendees, category}` |
+| `POST /summarize` | text→notes | `{transcript, template_name, model?, output_language?, user_notes?, attached_context?, prior_meetings?: [{title, date, open_items[]}], meeting_date?, llm_base_url?, llm_api_key?}` → `{summary, template_used, title, attendees, category, attendee_details}` — `user_notes` steer the notes and get a final "From Your Notes" section; `attached_context` (file text + an attached meeting's summary) is background only; `prior_meetings` (attached meetings' OPEN action items, built by `commands.rs::prior_meetings_for`) yield a deterministic "Follow-up from <meeting>" section (`summarizer.py::_ensure_followup_section`, Done/Discussed only with a verbatim transcript quote) |
 | `POST /chat` | grounded Q&A | `{transcript, question, model?, llm_base_url?, llm_api_key?}` → `{answer}` |
 | `POST /chat_stream` | streaming Q&A | same as `/chat` → SSE: `data:{"t":"…"}` frames, ended by `[DONE]` |
+| `POST /copilot_answer_stream` | live copilot answer (slice C) | `{provider: "claude"\|"local", question, context_turns[≤2], passages[≤3]{title,text≤600,source}, persona?, web_search, api_key? (claude), model?, llm_base_url?, llm_api_key?}` → SSE frames `{"t"}` text, `{"c":{kind:notes,passage_index,cited_text}}` / `{"c":{kind:web,url,title,cited_text}}`, `{"w":"searching"}`, `{"usage":{input_tokens,output_tokens,web_searches}}`, `{"error"}`; `[DONE]`. Claude: `anthropic` SDK `messages.stream`, `claude-opus-5`, adaptive thinking, effort low, max_tokens 400, passages as `document` blocks with citations, `web_search_20260209` max_uses 1 `allowed_callers: ["direct"]`. Local: `summarizer.copilot_stream` on the same dispatcher as `/chat_stream` (`copilot_answer.py`) |
 | `POST /embed` | batch text embeddings (hybrid Ask) | `{texts, model?}` → `{embeddings, model, dim}`; 503 + `ollama pull bge-m3` hint when the model is missing |
 
 - **`live.py`** — live captions, two tiers per audio source (ADR-019). `LiveCaptionSession`

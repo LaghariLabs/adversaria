@@ -32,6 +32,7 @@ for pkg in (
     "tiktoken",
     "huggingface_hub",
     "certifi",
+    "anthropic",
     # Speaker diarization: ships native libs under sherpa_onnx/lib (the
     # _sherpa_onnx extension + libonnxruntime + libsherpa-onnx-*); all must be
     # collected or the frozen sidecar can't dlopen them.

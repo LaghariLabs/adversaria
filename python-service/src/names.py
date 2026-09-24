@@ -81,9 +81,7 @@ def dedupe_attendees(names: list[str]) -> list[str]:
     return [display for display, _, _ in kept]
 
 
-def ground_to_roster(
-    attendees: list[str], known_attendees: list[str]
-) -> list[str]:
+def ground_to_roster(attendees: list[str], known_attendees: list[str]) -> list[str]:
     """Map extracted names to canonical roster spellings.
 
     Each extracted name that maps to exactly one known attendee

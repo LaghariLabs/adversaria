@@ -23,6 +23,7 @@ use crate::recording_spool::{self, AudioFormat, Frame, StreamWriter};
 
 type WriterFailure = Arc<Mutex<Option<String>>>;
 
+mod convert;
 #[cfg(windows)]
 mod wasapi;
 #[cfg(windows)]

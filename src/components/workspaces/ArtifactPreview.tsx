@@ -7,6 +7,7 @@ import {
   revealWorkspaceArtifact,
 } from "../../lib/tauri";
 import type { WorkspaceArtifact } from "../../types";
+import { COPY } from "../../lib/platform";
 
 interface ArtifactPreviewProps {
   artifact: WorkspaceArtifact;
@@ -104,7 +105,7 @@ export function ArtifactPreview({ artifact }: ArtifactPreviewProps) {
           disabled={actionPending}
           onClick={() => void runAction(revealWorkspaceArtifact)}
         >
-          Reveal in Finder
+          Show in {COPY.fileManager}
         </button>
       </div>
     </>

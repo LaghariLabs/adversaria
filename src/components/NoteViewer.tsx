@@ -1,12 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
+  exportAdversaria,
   exportHtml,
-  exportMeetingBundle,
   exportSummary,
   getActionItems,
   getConfig,
+  getCopilotReceipt,
   getMeeting,
   getMeetingStats,
+  listMeetingAttachments,
   listTemplates,
   mergeMeetingSpeakers,
   renameMeetingPerson,
@@ -23,10 +25,12 @@ import {
   updateMeetingNotes,
   updateMeetingSummary,
   updateMeetingTags,
+  updateMeetingTitle,
 } from "../lib/tauri";
 import type {
   ActionItem,
   Meeting,
+  MeetingAttachment,
   MeetingStats,
   RelatedMeetingRef,
   SummaryLanguage,
@@ -43,19 +47,27 @@ import {
   summaryToHtml,
   summaryToPlainText,
   withoutSpeakerLabels,
-} from "../lib/summary";
-import { buildSlideHtml, exportFileBase } from "../lib/exportDocument";
+} from "../lib/summary";import { buildSlideHtml, exportFileBase, readExportTheme } from "../lib/exportDocument";
 import { formatDate, formatDateTime } from "../lib/dateFormat";
+import { open } from "@tauri-apps/plugin-shell";
 import { templateDisplayName } from "../lib/templateNames";
 import {
+  ChevronDown,
   Download,
   FileJson,
+  FileText,
   Folder,
+  History,
   Lock,
+  NotebookPen,
+  Pencil,
   Pin,
   Presentation,
   Trash2,
 } from "lucide-react";
+
+const CopilotHistory = lazy(() => import("./CopilotHistory"));
+const NotesEditor = lazy(() => import("./NotesEditor"));
 
 const LANGUAGE_OPTIONS: { value: SummaryLanguage; label: string }[] = [
   { value: "en", label: "English" },
@@ -108,7 +120,7 @@ interface NoteViewerProps {
   onOpenMeetingId?: (meetingId: number) => void;
 }
 
-type Tab = "transcript" | "summary" | "chat" | "notes" | "insights";
+type Tab = "transcript" | "summary" | "chat" | "notes" | "insights" | "copilot";
 
 interface TranscriptSelection {
   text: string;
@@ -243,6 +255,58 @@ export function NoteViewer({
   ]);
   const [activeTab, setActiveTab] = useState<Tab>("summary");
   const [relatedMeetingsList, setRelatedMeetingsList] = useState<RelatedMeetingRef[]>([]);
+  const [attachments, setAttachments] = useState<MeetingAttachment[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    listMeetingAttachments(meeting.id)
+      .then((items) => {
+        if (!cancelled) {
+          setAttachments(Array.isArray(items) ? items : []);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.warn("[note] could not load attachments:", error);
+          setAttachments([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [meeting.id]);
+
+  const [copilotReceiptLine, setCopilotReceiptLine] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getCopilotReceipt(meeting.id)
+      .then((r) => {
+        if (cancelled || !r || r.questions === 0) return;
+        let dest: string;
+        const hasClaude = r.claude_questions > 0;
+        const hasDeepSeek = r.deepseek_questions > 0;
+        const hasLocal = r.local_questions > 0;
+        const providers = [
+          hasClaude ? "Claude" : "",
+          hasDeepSeek ? "DeepSeek" : "",
+          hasLocal ? "the local model" : "",
+        ].filter(Boolean);
+        if (providers.length === 0) dest = "without a provider dispatch";
+        else if (providers.length === 1) dest = `to ${providers[0]}`;
+        else dest = `to ${providers.slice(0, -1).join(", ")} and ${providers.at(-1)}`;
+        const line = `Copilot sent ${r.questions} questions and ${r.passages} passages ${dest} \u00b7 ${r.web_performed} web searches`;
+        if (!cancelled) setCopilotReceiptLine(line);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [meeting.id]);
+
+  const noteLines = (meeting.user_notes ?? "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean).length;
 
   useEffect(() => {
     let cancelled = false;
@@ -483,6 +547,92 @@ export function NoteViewer({
   const [tagPopupOpen, setTagPopupOpen] = useState(false);
   const [tagLabel, setTagLabel] = useState("");
   const [tagColor, setTagColor] = useState<Tag["color"]>("blue");
+
+  // Collapsible meeting header: collapsed by default (title row only), choice
+  // remembered globally. Every localStorage touch is guarded — a blocked
+  // store must never break the note view.
+  const HEADER_COLLAPSED_KEY = "viewer.headerCollapsed";
+  const [headerCollapsed, setHeaderCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(HEADER_COLLAPSED_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleHeaderCollapsed = () => {
+    setHeaderCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(HEADER_COLLAPSED_KEY, next ? "1" : "0");
+      } catch {
+        // Non-fatal: the toggle still applies for this session.
+      }
+      return next;
+    });
+  };
+
+  // Inline meeting rename (pencil button / double-click on the title).
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [titleError, setTitleError] = useState<string | null>(null);
+  const [savingTitle, setSavingTitle] = useState(false);
+  const titleEditActiveRef = useRef(false);
+  const titleSavingRef = useRef(false);
+  // Stable so the input keeps what the user types: an inline ref would
+  // re-run focus+select on every keystroke and collapse the draft.
+  const titleInputRef = useCallback((el: HTMLInputElement | null) => {
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, []);
+
+  const startTitleEdit = () => {
+    setTitleDraft(cleanMeetingTitle(meeting.title));
+    setTitleError(null);
+    titleEditActiveRef.current = true;
+    setEditingTitle(true);
+  };
+  const cancelTitleEdit = () => {
+    titleEditActiveRef.current = false;
+    setTitleError(null);
+    setEditingTitle(false);
+  };
+  const saveTitle = async () => {
+    if (!titleEditActiveRef.current || titleSavingRef.current) return;
+    const trimmed = titleDraft.trim();
+    if (trimmed === "") {
+      setTitleError("Title can't be empty.");
+      return;
+    }
+    if (trimmed === cleanMeetingTitle(meeting.title)) {
+      cancelTitleEdit();
+      return;
+    }
+    titleSavingRef.current = true;
+    setSavingTitle(true);
+    try {
+      const saved = await updateMeetingTitle(meeting.id, trimmed);
+      titleEditActiveRef.current = false;
+      setTitleError(null);
+      setEditingTitle(false);
+      onMeetingUpdated({ ...meeting, title: saved });
+    } catch (e) {
+      setTitleError(String(e));
+    } finally {
+      titleSavingRef.current = false;
+      setSavingTitle(false);
+    }
+  };
+
+  // A new meeting discards any in-progress rename of the previous one.
+  useEffect(() => {
+    titleEditActiveRef.current = false;
+    titleSavingRef.current = false;
+    setEditingTitle(false);
+    setTitleError(null);
+    setSavingTitle(false);
+  }, [meeting.id]);
 
   const addTag = async () => {
     const label = tagLabel.trim();
@@ -838,16 +988,36 @@ export function NoteViewer({
     }
   };
 
-  // Export the meeting as a self-contained dark "Meeting Minutes" slide (.html).
-  // Opens in any browser; can be turned into a PDF from there (Cmd/Ctrl+P).
   const handleExportSlide = async () => {
     try {
+      const theme = readExportTheme();
       const path = await exportHtml(
         `${exportFileBase(meeting)}.html`,
-        buildSlideHtml(meeting),
+        buildSlideHtml(meeting, theme),
       );
       if (path) {
-        setExportMsg(`Saved to ${path}`);
+        setExportMsg(`Saved ${theme.label} deck to ${path}`);
+        setTimeout(() => setExportMsg(null), 4000);
+      }
+    } catch (e) {
+      setExportMsg(String(e));
+    }
+  };
+
+  const handleExportPdf = async () => {
+    try {
+      const theme = readExportTheme();
+      const path = await exportHtml(
+        `${exportFileBase(meeting)}-print.html`,
+        buildSlideHtml(meeting, theme),
+      );
+      if (path) {
+        try {
+          await open(`file://${path}#print`);
+          setExportMsg(`Opened the deck in your browser — press Save as PDF in the print dialog`);
+        } catch {
+          setExportMsg(`Saved to ${path} — open it and use Print / Save as PDF`);
+        }
         setTimeout(() => setExportMsg(null), 4000);
       }
     } catch (e) {
@@ -857,7 +1027,7 @@ export function NoteViewer({
 
   const handleExportBundle = async () => {
     try {
-      const path = await exportMeetingBundle(meeting.id);
+      const path = await exportAdversaria([meeting.id], null);
       if (path) {
         setExportMsg(`Saved to ${path}`);
         setTimeout(() => setExportMsg(null), 4000);
@@ -871,6 +1041,106 @@ export function NoteViewer({
     <div className="viewer-layout">
       {/* Note Header */}
       <div className="viewer-header">
+        <div className="viewer-title-row">
+          <button
+            type="button"
+            className="viewer-collapse-btn"
+            aria-expanded={!headerCollapsed}
+            aria-controls="meeting-details"
+            aria-label={headerCollapsed ? "Show meeting details" : "Hide meeting details"}
+            title={headerCollapsed ? "Show meeting details" : "Hide meeting details"}
+            onClick={toggleHeaderCollapsed}
+          >
+            <ChevronDown
+              size={18}
+              aria-hidden="true"
+              style={{
+                transform: headerCollapsed ? "rotate(-90deg)" : undefined,
+                transition: "transform 0.15s ease",
+              }}
+            />
+          </button>
+          {editingTitle ? (
+            <input
+              className="viewer-title-input"
+              value={titleDraft}
+              dir="auto"
+              autoFocus
+              ref={titleInputRef}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void saveTitle();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelTitleEdit();
+                }
+              }}
+              onBlur={() => void saveTitle()}
+              aria-label="Meeting title"
+              disabled={savingTitle}
+            />
+          ) : (
+            <>
+              <h1
+                className="viewer-title"
+                dir={isRtl(meeting.title) ? "rtl" : "ltr"}
+                onDoubleClick={startTitleEdit}
+                title="Double-click to rename"
+              >
+                {cleanMeetingTitle(meeting.title)}
+              </h1>
+              <button
+                type="button"
+                className="viewer-rename-btn"
+                aria-label="Rename meeting"
+                title="Rename meeting"
+                onClick={startTitleEdit}
+              >
+                <Pencil size={14} aria-hidden="true" />
+              </button>
+            </>
+          )}
+
+          {/* Glassmorphic toolbar pill */}
+          <div className="glass-toolbar">
+            <button
+              className={`toolbar-btn${meeting.pinned ? " active" : ""}`}
+              title="Pin note"
+              aria-label="Pin note"
+              onClick={() => onTogglePin?.(meeting)}
+            >
+              <Pin aria-hidden="true" />
+            </button>
+            <div className="toolbar-separator"></div>
+            <button
+              className={`toolbar-btn${meeting.locked ? " active" : ""}`}
+              title="Lock with privacy PIN"
+              aria-label="Lock with privacy PIN"
+              onClick={() => onToggleLock?.(meeting)}
+            >
+              <Lock aria-hidden="true" />
+            </button>
+            <div className="toolbar-separator"></div>
+            <button
+              className="toolbar-btn delete"
+              title="Delete note"
+              aria-label="Delete note"
+              onClick={() => onDelete?.(meeting)}
+            >
+              <Trash2 aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+        {editingTitle && titleError && (
+          <p className="viewer-title-error" role="alert">
+            {titleError}
+          </p>
+        )}
+        {!headerCollapsed && (
+        <div id="meeting-details">
         <div className="viewer-meta-row">
           <span>{formatDateTime(meeting.recorded_at)}</span>
           <span style={{ color: "var(--text-muted)" }} aria-hidden="true">
@@ -932,45 +1202,6 @@ export function NoteViewer({
             </button>
           </div>
         )}
-
-        <div className="viewer-title-row">
-          <h1
-            className="viewer-title"
-            dir={isRtl(meeting.title) ? "rtl" : "ltr"}
-          >
-            {cleanMeetingTitle(meeting.title)}
-          </h1>
-
-          {/* Glassmorphic toolbar pill */}
-          <div className="glass-toolbar">
-            <button
-              className={`toolbar-btn${meeting.pinned ? " active" : ""}`}
-              title="Pin note"
-              aria-label="Pin note"
-              onClick={() => onTogglePin?.(meeting)}
-            >
-              <Pin aria-hidden="true" />
-            </button>
-            <div className="toolbar-separator"></div>
-            <button
-              className={`toolbar-btn${meeting.locked ? " active" : ""}`}
-              title="Lock with privacy PIN"
-              aria-label="Lock with privacy PIN"
-              onClick={() => onToggleLock?.(meeting)}
-            >
-              <Lock aria-hidden="true" />
-            </button>
-            <div className="toolbar-separator"></div>
-            <button
-              className="toolbar-btn delete"
-              title="Delete note"
-              aria-label="Delete note"
-              onClick={() => onDelete?.(meeting)}
-            >
-              <Trash2 aria-hidden="true" />
-            </button>
-          </div>
-        </div>
 
         {/* Tags & Addition Row */}
         <div className="detail-tags-container">
@@ -1228,6 +1459,8 @@ export function NoteViewer({
             </span>
           )}
         </div>
+        </div>
+        )}
       </div>
 
       {/* Note Tabs Bar */}
@@ -1245,6 +1478,7 @@ export function NoteViewer({
           >
             Transcript
           </button>
+          <button className={`tab-link${activeTab === "copilot" ? " active" : ""}`} onClick={() => setActiveTab("copilot")}>AI Copilot</button>
           <button
             className={`tab-link${activeTab === "insights" ? " active" : ""}`}
             onClick={() => setActiveTab("insights")}
@@ -1558,6 +1792,17 @@ export function NoteViewer({
                             role="menuitem"
                             onClick={() => {
                               setExportMenuOpen(false);
+                              handleExportPdf();
+                            }}
+                          >
+                            <Presentation size={15} aria-hidden="true" />
+                            Export as PDF (opens print)…
+                          </button>
+                          <button
+                            className="settings-menu-item"
+                            role="menuitem"
+                            onClick={() => {
+                              setExportMenuOpen(false);
                               handleExport();
                             }}
                           >
@@ -1574,8 +1819,11 @@ export function NoteViewer({
                             }}
                           >
                             <FileJson size={15} aria-hidden="true" />
-                            Export bundle (.json)…
+                            Export as .adversaria…
                           </button>
+                          <div style={{ fontSize: 11, color: "var(--text-muted)", padding: "4px 8px 2px", lineHeight: 1.4 }}>
+                            Plain-text file: contains the transcript and notes.
+                          </div>
                         </div>
                       </>
                     )}
@@ -1585,16 +1833,29 @@ export function NoteViewer({
             </div>
             {editingSummary ? (
               <>
-                <textarea
-                  className="notes-textarea"
-                  value={summaryDraft}
-                  onChange={(e) => setSummaryDraft(e.target.value)}
-                  dir="auto"
-                  style={{ fontFamily: "var(--font-mono, monospace)", minHeight: "60vh" }}
-                />
+                <div className="summary-editor" style={{ minHeight: "60vh" }}>
+                  <Suspense
+                    fallback={
+                      <textarea
+                        className="notes-textarea"
+                        value={summaryDraft}
+                        onChange={(e) => setSummaryDraft(e.target.value)}
+                        dir="auto"
+                        style={{ fontFamily: "var(--font-mono, monospace)", minHeight: "60vh" }}
+                      />
+                    }
+                  >
+                    <NotesEditor
+                      value={summaryDraft}
+                      onChange={setSummaryDraft}
+                      ariaLabel="Meeting notes"
+                      placeholder="Meeting notes"
+                    />
+                  </Suspense>
+                </div>
                 <p style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                  Editing the raw summary (Markdown). Use this to merge names that
-                  were picked up as separate people, or fix any other detail.
+                  Editing the meeting notes. Headings and checkboxes are kept; saved
+                  as Markdown.
                 </p>
               </>
             ) : meeting.summary.trim() === "" && meeting.transcript.trim() !== "" ? (
@@ -1629,6 +1890,54 @@ export function NoteViewer({
               </div>
             ) : (
               <>
+                {(noteLines > 0 || attachments.length > 0 || copilotReceiptLine) && (
+                  <div className="context-used" role="list" aria-label="Context used for these notes">
+                    <span className="context-used-label">Context used</span>
+                    {noteLines > 0 && (
+                      <span
+                        className="context-used-chip"
+                        role="listitem"
+                        title="Your typed notes steered these notes and appear under “From Your Notes”."
+                      >
+                        <NotebookPen size={14} aria-hidden="true" />
+                        Your notes · {noteLines} {noteLines === 1 ? "line" : "lines"}
+                      </span>
+                    )}
+                    {copilotReceiptLine && (
+                      <span className="context-used-chip" role="listitem">{copilotReceiptLine}</span>
+                    )}
+                    {attachments.map((attachment) =>
+                      attachment.kind === "meeting" ? (
+                        <button
+                          type="button"
+                          key={attachment.id}
+                          role="listitem"
+                          className="context-used-chip context-used-chip--link"
+                          title="Its open action items got a follow-up check in these notes. Click to open it."
+                          onClick={() => onOpenMeetingId?.(Number(attachment.value))}
+                        >
+                          <History size={14} aria-hidden="true" />
+                          <span dir="auto">{attachment.label}</span>
+                        </button>
+                      ) : (
+                        <span
+                          key={attachment.id}
+                          role="listitem"
+                          className="context-used-chip"
+                          title={`Used as background for the notes (${attachment.value})`}
+                        >
+                          <FileText size={14} aria-hidden="true" />
+                          <span dir="auto">
+                            {attachment.label}
+                            {!attachment.value.includes("/") && !attachment.value.includes("\\") ? (
+                              <span style={{ color: "var(--text-muted)", marginLeft: 4 }}>(file not included)</span>
+                            ) : null}
+                          </span>
+                        </span>
+                      ),
+                    )}
+                  </div>
+                )}
                 <SummaryView
                   summary={meeting.summary}
                   actionItems={actionItems}
@@ -1908,14 +2217,26 @@ export function NoteViewer({
         {/* TAB: Personal Notes Editable */}
         {activeTab === "notes" && (
           <div className="tab-content active" id="tab-content-notes">
-            <textarea
-              className="notes-textarea"
-              value={userNotes}
-              onChange={(e) => setUserNotes(e.target.value)}
-              onBlur={handleSaveNotes}
-              dir="auto"
-              placeholder="Jot down notes or thoughts regarding this meeting here. Saves automatically on blur..."
-            />
+            <Suspense
+              fallback={
+                <textarea
+                  className="notes-textarea"
+                  value={userNotes}
+                  onChange={(e) => setUserNotes(e.target.value)}
+                  onBlur={handleSaveNotes}
+                  dir="auto"
+                  placeholder="Jot down notes or thoughts regarding this meeting here. Saves automatically on blur..."
+                />
+              }
+            >
+              <NotesEditor
+                value={userNotes}
+                onChange={setUserNotes}
+                onBlur={handleSaveNotes}
+                placeholder="Jot down notes or thoughts regarding this meeting here. Saves automatically on blur..."
+                ariaLabel="Personal notes"
+              />
+            </Suspense>
             <div
               style={{
                 display: "flex",
@@ -1948,6 +2269,13 @@ export function NoteViewer({
               Tip: edit your notes, then "Regenerate Notes" to fold them back into
               the summary.
             </p>
+          </div>
+        )}
+        {activeTab === "copilot" && (
+          <div className="tab-content active" id="tab-content-copilot">
+            <Suspense fallback={<p className="copilot-history-loading">Loading Copilot history…</p>}>
+              <CopilotHistory meetingId={meeting.id} />
+            </Suspense>
           </div>
         )}
       </div>

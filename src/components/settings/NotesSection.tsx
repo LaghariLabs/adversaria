@@ -15,6 +15,7 @@ import {
   testLlmConnection,
 } from "../../lib/tauri";
 import { templateDisplayName, templateSlug } from "../../lib/templateNames";
+import { IS_MAC } from "../../lib/platform";
 
 const PROVIDER_LABEL: Record<string, string> = {
   groq: "Groq",
@@ -28,9 +29,6 @@ const PROVIDER_LABEL: Record<string, string> = {
 // the alias `qwen3.6-35b`; Windows uses the Ollama tag `qwen3.6:35b-a3b`. Pick
 // the right one so switching to "Local" sets a model the local server actually
 // has (otherwise the request 404s with "model … does not exist").
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /mac/i.test(navigator.platform || navigator.userAgent || "");
 const LOCAL_DEFAULT_MODEL = IS_MAC ? "qwen3.5-4b-4bit" : "qwen3.6:35b-a3b";
 
 // Default model for each provider, applied when the user switches engine so the
@@ -342,6 +340,19 @@ export function NotesSection({ active, config, update, models }: NotesSectionPro
             />
           )}
           {modelMsg && <p className="settings-msg">{modelMsg}</p>}
+          <div className="settings-form-group" style={{ marginTop: 12 }}>
+            <label className="settings-label" htmlFor="settings-copilot-model">Copilot model</label>
+            <input
+              id="settings-copilot-model"
+              aria-label="Copilot model"
+              type="text"
+              value={config.copilot_local_model ?? ""}
+              onChange={(e) => update({ copilot_local_model: e.target.value })}
+              className="settings-input-text"
+              placeholder="qwen3.6:35b"
+            />
+            <p className="settings-help">Ollama tag used by the Live Copilot&apos;s Local mode. Leave empty to use the meeting model.</p>
+          </div>
         </div>
       )}
 

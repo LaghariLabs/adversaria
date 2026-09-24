@@ -1,7 +1,7 @@
 {
   "name": "meeting-note-taker",
   "private": true,
-  "version": "0.3.83",
+  "version": "0.4.1",
   "author": "Mohammad Hamza Laghari <hamza@lagharilabs.com>",
   "type": "module",
   "engines": {
@@ -26,6 +26,14 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2",
     "@tauri-apps/plugin-updater": "^2.10.1",
+    "@tiptap/core": "3.31.3",
+    "@tiptap/extension-image": "3.31.3",
+    "@tiptap/extension-list": "3.31.3",
+    "@tiptap/extension-placeholder": "3.31.3",
+    "@tiptap/markdown": "3.31.3",
+    "@tiptap/pm": "3.31.3",
+    "@tiptap/react": "3.31.3",
+    "@tiptap/starter-kit": "3.31.3",
     "@types/cytoscape": "^3.21.9",
     "cytoscape": "^3.34.0",
     "cytoscape-d3-force": "^1.1.4",

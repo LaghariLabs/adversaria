@@ -1,0 +1,17 @@
+{
+  "name": "context_defined_unknown",
+  "note": "Guards the context exception: when the supplied turns define Vortelquin R7 (webhook retry queue), the answer must use that context instead of the unfamiliar-name clarification.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is Vortelquin R7?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": ["Them: We built an internal tool called Vortelquin R7 that reroutes failed webhooks to a retry queue."],
+    "passages": []
+  },
+  "expect": {
+    "must_match": ["webhook|retry queue"],
+    "must_not_match": ["not familiar"]
+  }
+}

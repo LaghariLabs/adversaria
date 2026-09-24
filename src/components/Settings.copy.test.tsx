@@ -181,7 +181,9 @@ describe("Settings copy", () => {
     // Calendar setup used to hide behind a "Show calendar setup" disclosure. In a
     // section whose whole job is integrations, selecting it is enough.
     await user.click(await screen.findByRole("button", { name: "Integrations settings" }));
-    await screen.findByText(/Apple Calendar \(this Mac\)/);
+    // Apple Calendar is macOS-only (EventKit), so wait on the card every
+    // platform renders.
+    await screen.findByRole("button", { name: /Save to/ });
 
     expectNoJargon(container, "cloud/PIN/calendar branches");
   });

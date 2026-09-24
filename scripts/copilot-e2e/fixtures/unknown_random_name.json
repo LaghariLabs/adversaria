@@ -1,0 +1,18 @@
+{
+  "name": "unknown_random_name",
+  "note": "Guards that an invented random name (Vortelquin R7) gets 'I'm not familiar with X' instead of an invented definition or a does-not-exist/confusion claim.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is Vortelquin R7?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": []
+  },
+  "expect": {
+    "specific_count": [0, 0],
+    "must_match": ["not familiar with"],
+    "must_not_match": ["does not exist", "confusion", "typo", "blend", "satellite", "Vortelquin R7 is a"]
+  }
+}

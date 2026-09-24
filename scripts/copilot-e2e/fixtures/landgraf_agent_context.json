@@ -1,0 +1,19 @@
+{
+  "name": "landgraf_agent_context",
+  "note": "Guards card 377: Landgraf in an agent-framework discussion must correct to LangGraph, not trigger the unfamiliar-name sentence.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "Why is Landgraf so popular?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": ["Them: We are comparing frameworks for AI agents with persistent state and tool calls."],
+    "passages": []
+  },
+  "expect": {
+    "say_count": [1, 2],
+    "specific_count": [2, 5],
+    "say_must_match": ["\\bLangGraph\\b", "\\b(?:state|workflow|graph|checkpoint)\\w*\\b"],
+    "must_not_match": ["not familiar|which (?:product|person|company|term) do you mean"]
+  }
+}

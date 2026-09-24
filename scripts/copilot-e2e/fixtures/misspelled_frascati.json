@@ -1,0 +1,17 @@
+{
+  "name": "misspelled_frascati",
+  "note": "Guards meeting 404: 'Frescati manual' misspelled by transcription in a research-spending discussion must identify the Frascati Manual, never the unfamiliar-name sentence.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is a Frescati manual?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": ["Them: We were talking about how countries measure research spending."],
+    "passages": []
+  },
+  "expect": {
+    "say_must_match": ["Frascati|OECD|research and development|R&D"],
+    "must_not_match": ["not familiar"]
+  }
+}

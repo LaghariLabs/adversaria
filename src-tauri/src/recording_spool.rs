@@ -817,72 +817,41 @@ fn recording_key() -> Result<[u8; 32], String> {
     if let Some(key) = *RECORDING_KEY_CACHE.lock().unwrap() {
         return Ok(key);
     }
-    #[cfg(debug_assertions)]
-    let hex = dev_recording_key_hex()?;
-    #[cfg(not(debug_assertions))]
-    let hex = keychain_recording_key_hex()?;
+    let hex = recording_key_hex()?;
     let key = hex_decode::<32>(&hex)?;
     *RECORDING_KEY_CACHE.lock().unwrap() = Some(key);
     Ok(key)
 }
 
-#[cfg(not(debug_assertions))]
-fn keychain_recording_key_hex() -> Result<String, String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .map_err(|e| format!("Recording keychain is unavailable: {e}"))?;
-    match entry.get_password() {
-        Ok(value) => Ok(value),
-        Err(keyring::Error::NoEntry) => {
+fn recording_key_hex() -> Result<String, String> {
+    let existing = crate::secrets::get(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|e| {
+        if let Some(e) = e.strip_prefix("keyring open: ") {
+            format!("Recording keychain is unavailable: {e}")
+        } else if let Some(e) = e.strip_prefix("keyring read: ") {
+            format!(
+                "Recording encryption key is unavailable ({e}). Unlock the OS keychain and try again; plaintext capture is never used as a fallback."
+            )
+        } else {
+            e
+        }
+    })?;
+    match existing {
+        Some(value) => Ok(value),
+        None => {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
             let value = hex_encode(&key);
-            entry
-                .set_password(&value)
-                .map_err(|e| format!("Could not store the recording encryption key: {e}"))?;
+            crate::secrets::set(KEYRING_SERVICE, KEYRING_ACCOUNT, &value).map_err(|e| {
+                if let Some(e) = e.strip_prefix("keyring open: ") {
+                    format!("Recording keychain is unavailable: {e}")
+                } else {
+                    let e = e.strip_prefix("keyring write: ").unwrap_or(&e);
+                    format!("Could not store the recording encryption key: {e}")
+                }
+            })?;
             Ok(value)
         }
-        Err(e) => Err(format!(
-            "Recording encryption key is unavailable ({e}). Unlock the OS keychain and try again; plaintext capture is never used as a fallback."
-        )),
     }
-}
-
-/// Debug builds get a fresh ad-hoc code signature on every rebuild, and macOS
-/// binds keychain ACLs to the signature — so each rebuild re-prompted for the
-/// login password ("Always Allow" cannot survive a signature change; founder
-/// hit this on every dev run, 2026-08-13). Dev therefore keeps the key in a
-/// plain file in the app-data dir. Seeded FROM the keychain when it answers,
-/// so pending dev spools stay decryptable across the transition; release
-/// builds never compile this path and keep the keychain exclusively.
-#[cfg(debug_assertions)]
-fn dev_recording_key_hex() -> Result<String, String> {
-    let path = crate::config::app_data_dir().join("dev-spool-key");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    let hex = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .ok()
-        .and_then(|entry| entry.get_password().ok())
-        .unwrap_or_else(|| {
-            let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
-            hex_encode(&key)
-        });
-    std::fs::write(&path, &hex).map_err(|e| {
-        format!(
-            "Could not store the dev recording key at {}: {e}",
-            path.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(hex)
 }
 
 fn additional_data(

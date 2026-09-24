@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
 
+import { IS_WINDOWS } from "../../lib/platform";
 import type { AppConfig } from "../../types";
 
-/** Windows machines have no notch, so the pill previews would be picturing
- *  hardware the user doesn't own. There is no platform IPC wrapper on the
- *  frontend, so the user agent is the only signal available here. */
-const IS_WINDOWS = navigator.userAgent.includes("Windows");
+/** Windows machines have no notch: the pill floats below the top edge of the
+ *  screen instead (commands.rs::show_recording_bubble, non-macOS branch), so
+ *  the previews draw a free-standing pill rather than the notch island. */
+const FLOATING_PILL = IS_WINDOWS;
 
 interface PreviewOptionProps {
   /** Radio group name — shared by every option in one group. */
@@ -282,78 +283,79 @@ export function RecordingSection({
           crashed the app and was reverted). The pill style is read off disk
           each time a pill is created, so a change needs Save to take effect. */}
       <div className="settings-form-group">
-        <span className="settings-label" id="settings-notch-pill-label">Notch pill</span>
-        {IS_WINDOWS ? (
-          <p className="settings-preview-note">
-            This PC has no notch, so there is no pill to show. The pill is a Mac
-            feature — recording works the same either way.
-          </p>
-        ) : (
-          <>
-            <div
-              className="settings-previews"
-              data-cols="3"
-              role="radiogroup"
-              aria-labelledby="settings-notch-pill-label"
-            >
-              <PreviewOption
-                group="settings-notch-pill"
-                value="minimal"
-                checked={config.notch_pill_style === "minimal"}
-                onSelect={() => update({ notch_pill_style: "minimal" })}
-                title="Minimal"
-                note="Dot, timer, waveform."
-                isDefault
-              >
-                <span className="settings-screen-top">
-                  <span className="settings-island">
-                    <IslandWings />
-                  </span>
-                </span>
-              </PreviewOption>
+        <span className="settings-label" id="settings-notch-pill-label">
+          {FLOATING_PILL ? "Recording pill" : "Notch pill"}
+        </span>
+        <div
+          className="settings-previews"
+          data-cols="3"
+          role="radiogroup"
+          aria-labelledby="settings-notch-pill-label"
+        >
+          <PreviewOption
+            group="settings-notch-pill"
+            value="minimal"
+            checked={config.notch_pill_style === "minimal"}
+            onSelect={() => update({ notch_pill_style: "minimal" })}
+            title="Minimal"
+            note="Dot, timer, waveform."
+            isDefault
+          >
+            <span className="settings-screen-top">
+              <span className={FLOATING_PILL ? "settings-island settings-island-floating" : "settings-island"}>
+                <IslandWings />
+              </span>
+            </span>
+          </PreviewOption>
 
-              <PreviewOption
-                group="settings-notch-pill"
-                value="expressive"
-                checked={config.notch_pill_style === "expressive"}
-                onSelect={() => update({ notch_pill_style: "expressive" })}
-                title="Expressive"
-                note="Expands on hover. Not available yet."
+          <PreviewOption
+            group="settings-notch-pill"
+            value="expressive"
+            checked={config.notch_pill_style === "expressive"}
+            onSelect={() => update({ notch_pill_style: "expressive" })}
+            title="Expressive"
+            note="Expands on hover. Not available yet."
+          >
+            <span className="settings-screen-top">
+              <span
+                className={
+                  FLOATING_PILL
+                    ? "settings-island settings-island-expressive settings-island-floating"
+                    : "settings-island settings-island-expressive"
+                }
               >
-                <span className="settings-screen-top">
-                  <span className="settings-island settings-island-expressive">
-                    <span className="settings-island-strip">
-                      <IslandWings />
-                    </span>
-                    <span className="settings-island-body">
-                      <span className="settings-island-line">Weekly sync</span>
-                      <span className="settings-island-line dim">Recording · 12:04</span>
-                    </span>
-                  </span>
+                <span className="settings-island-strip">
+                  <IslandWings />
                 </span>
-              </PreviewOption>
+                <span className="settings-island-body">
+                  <span className="settings-island-line">Weekly sync</span>
+                  <span className="settings-island-line dim">Recording · 12:04</span>
+                </span>
+              </span>
+            </span>
+          </PreviewOption>
 
-              {/* "Hidden" is a privacy affordance, not a cosmetic choice: the
-                  pill is captured by screen sharing and this is the way to
-                  keep it out of frame. Never drop this option. */}
-              <PreviewOption
-                group="settings-notch-pill"
-                value="hidden"
-                checked={config.notch_pill_style === "hidden"}
-                onSelect={() => update({ notch_pill_style: "hidden" })}
-                title="Hidden"
-                note="No pill — nothing shows when you share your screen."
-              >
-                <span className="settings-screen-top">
-                  <span className="settings-notch" />
-                </span>
-              </PreviewOption>
-            </div>
-            <p className="settings-help">
-              The small pill by the notch while you record. Expressive isn't available yet — it currently shows the minimal pill.
-            </p>
-          </>
-        )}
+          {/* "Hidden" is a privacy affordance, not a cosmetic choice: the
+              pill is captured by screen sharing and this is the way to
+              keep it out of frame. Never drop this option. */}
+          <PreviewOption
+            group="settings-notch-pill"
+            value="hidden"
+            checked={config.notch_pill_style === "hidden"}
+            onSelect={() => update({ notch_pill_style: "hidden" })}
+            title="Hidden"
+            note="No pill — nothing shows when you share your screen."
+          >
+            <span className="settings-screen-top">
+              {FLOATING_PILL ? null : <span className="settings-notch" />}
+            </span>
+          </PreviewOption>
+        </div>
+        <p className="settings-help">
+          {FLOATING_PILL
+            ? "The small always-on-top pill at the top of your screen while you record. Expressive isn't available yet — it currently shows the minimal pill."
+            : "The small pill by the notch while you record. Expressive isn't available yet — it currently shows the minimal pill."}
+        </p>
       </div>
     </div>
   );

@@ -1,0 +1,18 @@
+{
+  "name": "unknown_plausible_name",
+  "note": "Guards that a plausible-but-unestablished model name (Qwen 5 Nova) gets 'I'm not familiar with X' instead of an invented definition or release history.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is Qwen 5 Nova?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": []
+  },
+  "expect": {
+    "specific_count": [0, 0],
+    "must_match": ["not familiar with"],
+    "must_not_match": ["Qwen 5 Nova is a", "released", "does not exist", "confusion"]
+  }
+}

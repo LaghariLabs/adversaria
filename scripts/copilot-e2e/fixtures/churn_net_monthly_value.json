@@ -1,0 +1,27 @@
+{
+  "name": "churn_net_monthly_value",
+  "note": "Invented practice case: retention-campaign value at a fictional mobile operator.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "Using exhibits 1 and 2, what is the net monthly value of the proposed campaign?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "stated_figures": [
+      "Me: The operator has 4 million postpaid subscribers.",
+      "Me: Monthly churn is 1.5%.",
+      "Me: Each subscriber generates $25 of contribution margin per month.",
+      "Me: A customer who is saved from churning stays for an average of 18 more months.",
+      "Me: The campaign targets the top 10% by churn risk, which is 400,000 customers.",
+      "Me: That top 10% contains 45% of all customers who would churn that month.",
+      "Me: The retention offer is a discount worth $60 in total for each customer who accepts it.",
+      "Me: 50% of targeted customers accept the offer, whether or not they were going to churn.",
+      "Me: Among the churners who accept 30% are actually saved."
+    ],
+    "passages": []
+  },
+  "expect": {
+    "say_number": {"value": -10177500, "tolerance_pct": 3}
+  }
+}

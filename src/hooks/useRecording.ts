@@ -8,6 +8,7 @@ import {
   getConfig,
   getMeetings,
   addMeetingAttachments,
+  setMeetingFolder,
 } from "../lib/tauri";
 import type { AttachmentDraft, CalendarEvent } from "../types";
 import { isUnrecoverable } from "../lib/recordingErrors";
@@ -60,11 +61,14 @@ interface UseRecordingReturn {
   /** Id of a meeting auto-deleted because its recording contained no speech;
    *  pair with settledTick. */
   lastDiscardedId: number | null;
-  start: () => Promise<void>;
+  /** Durable Copilot session id for the active recording, or null when idle. */
+  copilotSessionId: string | null;
+  start: (copilotFolderId?: number | null) => Promise<void>;
   stop: (
     templateName?: string,
     userNotes?: string,
     attachments?: AttachmentDraft[],
+    recordingFolderId?: number | null,
   ) => Promise<void>;
   dismissError: () => void;
   dismissRosterSuggestion: () => void;
@@ -81,6 +85,11 @@ export function useRecording(): UseRecordingReturn {
   const [lastMeetingId, setLastMeetingId] = useState<number | null>(null);
   const [rosterSuggestion, setRosterSuggestion] =
     useState<RosterSuggestion | null>(null);
+
+  // Copilot session id — durable UUID per recording, passed through to enqueue
+  const [copilotSessionId, setCopilotSessionId] = useState<string | null>(null);
+  const copilotSessionIdRef = useRef<string | null>(null);
+  copilotSessionIdRef.current = copilotSessionId;
 
   // Background transcription queue. On stop, a recording is saved as a pending
   // meeting and pushed here; a single-worker drain (concurrency 1, PAUSED while a
@@ -117,12 +126,20 @@ export function useRecording(): UseRecordingReturn {
     };
   }, []);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (copilotFolderId?: number | null) => {
     setError(null);
     setRosterSuggestion(null);
     setStatus("recording");
     try {
-      await startRecording();
+      const result: any = await startRecording(copilotFolderId ?? null);
+      const sessionId = result?.copilot_session_id ?? null;
+      if (sessionId) {
+        setCopilotSessionId(sessionId);
+        copilotSessionIdRef.current = sessionId;
+      } else {
+        setCopilotSessionId(null);
+        copilotSessionIdRef.current = null;
+      }
     } catch (e) {
       if (String(e).includes("Already recording")) {
         // A capture is already running (two toggle sources raced) — keep the
@@ -130,6 +147,8 @@ export function useRecording(): UseRecordingReturn {
         // Stop still works.
         return;
       }
+      setCopilotSessionId(null);
+      copilotSessionIdRef.current = null;
       setError(String(e));
       setStatus("idle");
     }
@@ -140,11 +159,26 @@ export function useRecording(): UseRecordingReturn {
       templateName?: string,
       userNotes?: string,
       attachments?: AttachmentDraft[],
+      recordingFolderId?: number | null,
     ) => {
       setStatus("stopping");
       try {
-        const stopped = await stopRecording();
+        const stopped: any = await stopRecording();
         const audioPath = stopped.system_path;
+        const returnedIdRaw: unknown = stopped.copilot_session_id ?? stopped.copilotSessionId;
+        const returnedId = typeof returnedIdRaw === "string" ? returnedIdRaw.trim() : "";
+        if (!returnedId) {
+          setError("Recording stopped but the Copilot session id was missing — the recording was not linked to Copilot.");
+          setStatus("idle");
+          return;
+        }
+        // Consistency check against in-memory ref; never use ref if it differs
+        const activeRef = copilotSessionIdRef.current?.trim() ?? "";
+        if (activeRef && activeRef !== returnedId) {
+          setError(`Copilot session mismatch (expected ${activeRef}, got ${returnedId}). The stopped recording will use the session id returned by the recorder.`);
+          // still use authoritative returnedId, but surface error visibly
+        }
+        const sessionIdForEnqueue = returnedId;
         // Persist the recording as a pending meeting and enqueue it, then free
         // the UI immediately — the next meeting can be recorded without waiting
         // for transcription. The background worker (below) does the rest.
@@ -152,6 +186,7 @@ export function useRecording(): UseRecordingReturn {
           audioPath,
           templateName ?? "general",
           userNotes,
+          sessionIdForEnqueue,
         );
         if (attachments && attachments.length > 0) {
           try {
@@ -163,12 +198,22 @@ export function useRecording(): UseRecordingReturn {
             );
           }
         }
+        if (recordingFolderId != null) {
+          try {
+            await setMeetingFolder(pending.id, recordingFolderId);
+          } catch (folderError) {
+            console.warn("[recording] could not set meeting folder (non-fatal):", folderError);
+          }
+        }
         setLastMeetingId(pending.id);
         setQueue((q) => [...q, { id: pending.id, recordedAt: pending.recorded_at }]);
         if (stopped.warning) {
           setError(`${stopped.warning} The encrypted audio was preserved and queued for recovery.`);
         }
         setStatus("idle");
+        // Clear only after enqueue succeeds — never let a stopped session become the next recording's id
+        setCopilotSessionId(null);
+        copilotSessionIdRef.current = null;
       } catch (e) {
         setError(String(e));
         setStatus("idle");
@@ -271,6 +316,7 @@ export function useRecording(): UseRecordingReturn {
     settledTick,
     lastSettledId,
     lastDiscardedId,
+    copilotSessionId,
     start,
     stop,
     dismissError,

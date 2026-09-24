@@ -86,21 +86,48 @@ def _whisper_pins() -> dict[str, ModelPin]:
 #: LLM tiers, instead of the old fire-and-pray `/whisper_download` endpoint.
 #: Verified against live Hugging Face state 2026-07-31.
 _WHISPER_KEY_REVISIONS_MLX = {
-    "large-v3": ("mlx-community/whisper-large-v3-mlx", "49e6aa286ad60c14352c404340ded53710378a11"),
-    "large-v3-turbo": ("mlx-community/whisper-large-v3-turbo", "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"),
-    "large-v3-turbo-q4": ("mlx-community/whisper-large-v3-turbo-q4", "660c343bbf4e52ac257f0b7d952e5388e6f93bef"),
+    "large-v3": (
+        "mlx-community/whisper-large-v3-mlx",
+        "49e6aa286ad60c14352c404340ded53710378a11",
+    ),
+    "large-v3-turbo": (
+        "mlx-community/whisper-large-v3-turbo",
+        "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+    ),
+    "large-v3-turbo-q4": (
+        "mlx-community/whisper-large-v3-turbo-q4",
+        "660c343bbf4e52ac257f0b7d952e5388e6f93bef",
+    ),
     # Non-whisper picker engines ride the same pinned pipeline (their Download
     # buttons 400'd as unknown profiles — founder hit it live on Cohere,
     # 2026-08-14). Revisions verified against live Hugging Face state 2026-08-14.
-    "qwen3-asr-0.6b": ("mlx-community/Qwen3-ASR-0.6B-bf16", "eae2b51f96265328f1e7beced788adb0e4536f92"),
-    "qwen3-asr-1.7b": ("mlx-community/Qwen3-ASR-1.7B-bf16", "e1f6c266914abc5a46e8756e02580f834a6cf8a7"),
-    "cohere-transcribe-2b": ("csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01", "156a470cf08eefe706a0004f3c52d9ee567ca7a0"),
+    "qwen3-asr-0.6b": (
+        "mlx-community/Qwen3-ASR-0.6B-bf16",
+        "eae2b51f96265328f1e7beced788adb0e4536f92",
+    ),
+    "qwen3-asr-1.7b": (
+        "mlx-community/Qwen3-ASR-1.7B-bf16",
+        "e1f6c266914abc5a46e8756e02580f834a6cf8a7",
+    ),
+    "cohere-transcribe-2b": (
+        "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+        "156a470cf08eefe706a0004f3c52d9ee567ca7a0",
+    ),
 }
 _WHISPER_KEY_REVISIONS_CT2 = {
-    "large-v3": ("Systran/faster-whisper-large-v3", "edaa852ec7e145841d8ffdb056a99866b5f0a478"),
-    "large-v3-turbo": ("deepdml/faster-whisper-large-v3-turbo-ct2", "4df90f75321148c3a29a9e2351b7ddf8f5b115a8"),
+    "large-v3": (
+        "Systran/faster-whisper-large-v3",
+        "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+    ),
+    "large-v3-turbo": (
+        "deepdml/faster-whisper-large-v3-turbo-ct2",
+        "4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
+    ),
     # Cohere is registered on the CT2/Windows side too (sherpa is platform-neutral).
-    "cohere-transcribe-2b": ("csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01", "156a470cf08eefe706a0004f3c52d9ee567ca7a0"),
+    "cohere-transcribe-2b": (
+        "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+        "156a470cf08eefe706a0004f3c52d9ee567ca7a0",
+    ),
 }
 
 WHISPER_MODEL_PROFILE_PREFIX = "whisper-model:"
@@ -453,7 +480,9 @@ def _mark_equivalent_ready(
 def _equivalent_profile_ready(profile_id: str) -> bool:
     equivalent = _equivalent_profile_ids(profile_id)
     with _LOCK:
-        return any(_STATES[candidate_id].state == "ready" for candidate_id in equivalent)
+        return any(
+            _STATES[candidate_id].state == "ready" for candidate_id in equivalent
+        )
 
 
 def _run_download(profile_id: str) -> None:

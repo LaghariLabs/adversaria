@@ -6,6 +6,7 @@ export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     default_prompt_template: "general",
     auto_detect_meetings: false,
     ollama_model: "qwen3.6-35b",
+    copilot_local_model: "",
     summary_language: "auto",
     theme: "dark",
     user_name: "",
@@ -42,6 +43,7 @@ export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     todo_digest_enabled: true,
     todo_digest_hour: 9,
     tour_completed: false,
+    copilot_deepseek_model: "deepseek-v4-flash",
     calendar: {
       google: null,
       microsoft: null,
