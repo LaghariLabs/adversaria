@@ -285,7 +285,7 @@ pub async fn install() -> Result<(), String> {
 
     // Windows 10+ ships bsdtar as tar.exe, and it extracts zip archives —
     // no archive crate needed for a Windows-only path.
-    let extracted = std::process::Command::new("tar")
+    let extracted = crate::os_shell::hide_console(&mut std::process::Command::new("tar"))
         .arg("-xf")
         .arg(&archive)
         .arg("-C")

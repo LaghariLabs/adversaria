@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { AppConfig } from "../../types";
 import { exportAllMeetings, importAllMeetings } from "../../lib/tauri";
 import { hashPin, verifyPin } from "../../lib/pin";
+import { COPY, IS_MAC } from "../../lib/platform";
 
 interface PrivacyDataSectionProps {
   active: boolean;
@@ -26,7 +27,7 @@ export function PrivacyDataSection({ active, config, persist }: PrivacyDataSecti
       setEncMsg(
         enabled
           ? "Database will be encrypted on next launch — restart the app to apply."
-          : "Encryption will be turned off on next launch (database decrypted, keychain prompt removed) — restart the app to apply."
+          : "Encryption will be turned off on next launch (database decrypted) — restart the app to apply."
       );
     } catch (e) {
       setEncMsg(String(e));
@@ -136,9 +137,10 @@ export function PrivacyDataSection({ active, config, persist }: PrivacyDataSecti
         </label>
         <p className="settings-help">
           Encrypts your meetings on disk (SQLCipher) with a key kept in your
-          system keychain — protects your notes if this device is lost or stolen.
-          Turning it off decrypts the database and removes the macOS keychain
-          password prompt. Takes effect after an app restart.
+          system {COPY.credentialStore} — protects your notes if this device is
+          lost or stolen. Turning it off decrypts the database
+          {IS_MAC ? " and removes the macOS keychain password prompt" : ""}. Takes
+          effect after an app restart.
         </p>
         {encMsg && <p className="settings-msg ok">{encMsg}</p>}
       </div>
@@ -205,10 +207,10 @@ export function PrivacyDataSection({ active, config, persist }: PrivacyDataSecti
             checked={config.biometric_unlock}
             onChange={(e) => handleBiometricToggle(e.target.checked)}
           />
-          Unlock locked meetings with Touch ID
+          Unlock locked meetings with {COPY.biometric}
         </label>
         <p className="settings-help">
-          Use your fingerprint (Touch ID on Mac, Windows Hello on Windows) to open
+          Use {COPY.biometric} to open
           locked meetings, falling back to the PIN above if biometrics aren't available.
         </p>
         {bioMsg && <p className="settings-msg err">{bioMsg}</p>}

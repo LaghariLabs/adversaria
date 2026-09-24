@@ -18,7 +18,7 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 ## Features
 
 - **Record → transcribe → summarize**, fully on-device; the audio is deleted right after.
-- **A recording companion view** — while recording, the app collapses into a slim panel made for docking beside a call: record bar (timer · live audio level · Stop & summarize), an auto-scrolling live transcript, and your notes split 50/50 (or pick **Transcript-first** in Settings → Recording view to give the transcript the whole window, notes in a one-tap footer). Toggle recording from anywhere with **⌘⇧M** (macOS) / **Ctrl+Shift+M** (Windows); **⌘⇧N** jots a quick note.
+- **A recording companion view** — while recording, the app collapses into a slim panel made for docking beside a call: record bar (timer · live audio level · Stop & summarize), an auto-scrolling live transcript, and your notes split 50/50 (or pick **Transcript-first** in Settings → Recording view to give the transcript the whole window, notes in a one-tap footer). Toggle recording from anywhere with **⌘⇧M** (macOS) / **Ctrl+Shift+M** (Windows).
 - **Live captions preview** — while you speak, grey English words appear within about half a second and revise as you go; at each pause the confirmed Whisper caption replaces them. Fully on-device: a 44 MB Moonshine model (sherpa-onnx) downloads once on first launch, with a status row in Settings → Transcription. English-only for now; other languages keep the confirmed captions.
 - **Meeting Room** — at wide window sizes the live transcript docks beside your notes instead of stacking above them, and **+ add context** lets you attach reference documents or prior meeting summaries mid-recording. Attachments fold into the summary as reference material.
 - **A floating recording pill** — switch away from the app mid-recording and a compact pill tucks in just below the notch (dot · timer · live waveform). Choose **Notch pill → Expressive** in Settings → Notch & alerts for a richer island — timer, the running live caption, both channels, and a one-tap Stop — or **Hidden** to turn it off.
@@ -180,8 +180,11 @@ meetings" → click _Save Settings_** (ticking alone doesn't apply it — you mu
 Save). No restart needed. When a recognized call app (Zoom, Teams, Webex, Slack,
 or a browser meeting like Google Meet) uses your mic for ~4–6 s, a floating
 "Meeting detected — Record / Dismiss" card appears. It's **mic-based, not
-calendar-based**, and never records on its own — you click _Record_. macOS 14.4+
-only; WhatsApp/FaceTime aren't recognized yet.
+calendar-based**, and never records on its own — you click _Record_. Works on
+Windows 10/11 (GoTo, Vivaldi, and Arc are recognized there too) and macOS
+14.4+; WhatsApp/FaceTime aren't recognized yet. On Windows it needs **Settings ›
+Privacy › Microphone › Let desktop apps access your microphone** turned on, the
+same switch that lets Adversaria record your side of the call.
 
 ### ML service environment variables
 
@@ -229,7 +232,7 @@ src-tauri/src/        Rust backend
   commands.rs         Tauri IPC commands (record, transcribe, history, config)
   http_client.rs      Typed client for the Python service
   storage.rs          SQLite meeting store
-  tray.rs             System tray + global hotkeys (⌘⇧M / Ctrl+Shift+M record, ⌘⇧N quick note)
+  tray.rs             System tray + global hotkey (⌘⇧M / Ctrl+Shift+M record)
 python-service/
   src/server.py       FastAPI app: /health /transcribe /summarize /templates
   src/transcriber.py  faster-whisper wrapper (CUDA with CPU fallback)

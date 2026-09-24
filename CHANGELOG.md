@@ -5,6 +5,54 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed (Windows)
+- **Google Calendar sign-in works on Windows.** The sign-in page opened with
+  everything after the first `&` cut off, so Google rejected it and the app
+  waited forever. Links now open without going through the command prompt,
+  which also stops a console window flashing.
+- **A recording that can't hear system audio now says so at the start.**
+  Windows used to report "recording" even when the audio device failed to
+  open, and only warned vaguely at stop. It now fails up front with the
+  reason, like the Mac.
+- **Recording survives a headset being plugged in or the default device
+  changing.** The capture follows the new default speaker or microphone
+  instead of recording silence, and keeps both sides in time across the
+  switch.
+- **Microphone recordings are much smaller.** The mic track is stored as one
+  channel instead of the device's full channel count; a many-channel virtual
+  input could produce multi-gigabyte files.
+- **Setup status tells you when the Windows microphone switch is off.** It
+  used to show the microphone as allowed regardless. "Open Windows Settings"
+  now goes straight to Privacy › Microphone.
+- **"Open" on a workspace file works on Windows**, and "Show in File
+  Explorer" selects the file even when its path has spaces.
+- **The recording pill can be hidden on Windows.** Settings said Windows had
+  no pill while one was shown on screen (and in screen shares). Settings ›
+  Recording now offers the pill styles, including Hidden, drawn as the
+  floating pill Windows actually shows.
+- **The recording pill and the meeting-detected card stay clear of the
+  taskbar** wherever it is docked, on any display scaling.
+- **Meeting detection recognizes more Windows apps**: the Webex desktop app,
+  GoTo, Vivaldi, and Arc. Apps that merely embed Edge (the new Outlook,
+  Widgets) no longer trigger "a browser meeting".
+- **Live captions are faster on Windows.** Confirmed captions decode greedily
+  on the loaded model instead of with the meeting transcript's full beam.
+- **GPU transcription finds NVIDIA's standalone cuDNN install**, and registers
+  CUDA folders with the DLL loader, so a machine with the CUDA toolkit no
+  longer falls back to CPU.
+- **Speaker labels no longer stay off after an interrupted model download.**
+  A leftover file made every later download fail on Windows.
+- **The local AI service shuts down cleanly on Windows** instead of being
+  terminated mid-teardown.
+- **Claude Code and Codex are detected on Windows** when installed through
+  npm, and the workspace runs no longer damage the system PATH.
+- **Windows copy throughout**: Ctrl+Shift+M instead of ⌘⇧M, Windows Settings,
+  File Explorer, Credential Manager, and Windows Hello instead of their Mac
+  names. The Apple Calendar card is hidden on Windows, where it could only
+  fail. Dropdowns are readable in every theme.
+
 ## [0.3.83] - 2026-09-02
 
 ### Added

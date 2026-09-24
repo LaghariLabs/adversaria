@@ -1118,7 +1118,7 @@ export function getLatestWorkspaceRun(taskId: number): Promise<WorkspaceRun | nu
   return invoke("get_latest_workspace_run", { taskId });
 }
 
-/** Open a workspace artifact with its default macOS application. */
+/** Open a workspace artifact with its default application. */
 export function openWorkspaceArtifact(path: string): Promise<void> {
   return invoke("open_workspace_artifact", { path });
 }

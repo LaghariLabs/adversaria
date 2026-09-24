@@ -30,6 +30,7 @@ pub mod llama_engine;
 pub mod local_output;
 pub mod meeting_reminders;
 pub mod ollama_engine;
+pub mod os_shell;
 pub mod permissions;
 pub mod project_overview;
 pub mod recap;

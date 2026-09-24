@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-shell";
 import { TriangleAlert } from "lucide-react";
 
+import { COPY, IS_MAC } from "../../lib/platform";
 import type {
   AppConfig,
   CalendarAccount,
@@ -192,7 +193,7 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
       );
       setGoogleCredsSaved(true);
       setHasGoogleCreds(true);
-      flashCalendarMsg("Credentials saved to keychain.", 2000);
+      flashCalendarMsg(`Credentials saved to ${COPY.credentialStore}.`, 2000);
     } catch (e) {
       setCalendarMsg(String(e));
     }
@@ -421,15 +422,16 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
             we never create, edit, or delete calendar events.
           </p>
           <p style={{ marginTop: 8 }}>
-            <strong>Where data lives:</strong> tokens in this machine's keychain
+            <strong>Where data lives:</strong> tokens in this machine's {COPY.credentialStore}
             (never in config or the database), fetched events in memory only.
             Nothing leaves this device.
           </p>
         </div>
       </div>
 
-      {/* Apple Calendar (this Mac) — no platform gate today, so this also shows on
-          Windows, where the Rust command answers "EventKit is macOS-only". */}
+      {/* Apple Calendar (this Mac) — EventKit exists only on macOS; on Windows
+          the Rust command answers "EventKit is macOS-only", so hide the card. */}
+      {IS_MAC && (
       <div className={`settings-subcard${ekEnabled ? " ok" : ""}`}>
         <div className="settings-subcard-head">
           🍎 Apple Calendar (this Mac)
@@ -455,6 +457,7 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
           <p className={`settings-msg${ekMsg.includes("denied") ? " warn" : ""}`}>{ekMsg}</p>
         )}
       </div>
+      )}
 
       {/* Google Calendar — two steps: credentials into the keychain first, then
           Connect appears. */}
@@ -470,7 +473,10 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
           <>
             <p className="settings-help" style={{ marginTop: 0 }}>
               A power-user option: because there's no backend, you register your own
-              Google OAuth client. Most people should use Apple Calendar above.
+              Google OAuth client.{" "}
+              {IS_MAC
+                ? "Most people should use Apple Calendar above."
+                : "It's the calendar option available on Windows today."}
             </p>
 
             <details className="settings-advanced">
@@ -521,7 +527,7 @@ export function IntegrationsSection({ active, config, update, persist }: Integra
               />
               <div className="settings-row">
                 <button onClick={handleGoogleCredsSave} disabled={!googleClientId.trim()} className="btn-primary">
-                  {googleCredsSaved ? "Saved ✓" : "Save to Keychain"}
+                  {googleCredsSaved ? "Saved ✓" : `Save to ${COPY.credentialStore}`}
                 </button>
                 {hasGoogleCreds && (
                   <button onClick={handleGoogleConnect} disabled={calendarConnecting} className="btn-ghost">

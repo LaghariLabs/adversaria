@@ -899,15 +899,23 @@ pub fn select_related_meetings(
         .collect()
 }
 
-/// Prefix a child process PATH with common macOS GUI-missing binary locations.
+/// Prefix a child process PATH with common macOS GUI-missing binary locations,
+/// and keep a console window from flashing on Windows. A GUI app launched from
+/// Finder gets a minimal PATH on macOS; Windows GUI apps inherit the user's
+/// full PATH, and prepending POSIX directories with `:` there would glue them
+/// onto the first real entry (usually `C:\Windows\system32`) and drop it.
 pub fn configure_gui_path(command: &mut Command) {
-    let path = std::env::var("PATH").unwrap_or_default();
-    command.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"));
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"));
+    }
+    crate::os_shell::hide_console(command);
 }
 
 /// Probe one CLI without assuming it is installed on the current machine.
 pub fn probe_cli(bin: &str) -> (bool, String) {
-    let mut command = Command::new(bin);
+    let mut command = Command::new(crate::os_shell::resolve_cli(bin));
     command.arg("--version");
     configure_gui_path(&mut command);
     match command.output() {

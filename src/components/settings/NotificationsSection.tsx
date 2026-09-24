@@ -1,3 +1,4 @@
+import { COPY, IS_MAC } from "../../lib/platform";
 import type { AppConfig } from "../../types";
 
 interface NotificationsSectionProps {
@@ -50,12 +51,14 @@ export function NotificationsSection({ active, config, update }: NotificationsSe
           onChange={(e) => update({ meeting_alert_style: e.target.value })}
           className="settings-select"
         >
-          <option value="notch_drop">Notch drop — a card offering to record (default)</option>
+          <option value="notch_drop">
+            {IS_MAC ? "Notch drop" : "Pop-up card"} — a card offering to record (default)
+          </option>
           <option value="pill_nudge">Pill nudge — a quiet "Record →" pill</option>
           <option value="off">Off — no alert</option>
         </select>
         <p className="settings-help">
-          Adversaria never records on its own — an alert only offers; recording starts when you confirm or press ⌘⇧M. (Pill nudge and Off aren't wired yet.)
+          Adversaria never records on its own — an alert only offers; recording starts when you confirm or press {COPY.recordShortcut}. (Pill nudge and Off aren't wired yet.)
         </p>
       </div>
 

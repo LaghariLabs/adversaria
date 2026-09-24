@@ -1150,6 +1150,53 @@ def relabel_turns(turns: list[TranscriptTurn], me_label: str | None) -> list[Tra
     ]
 
 
+#: Handles returned by os.add_dll_directory; a handle that is closed removes
+#: its directory from the DLL search path again, so they are kept for the life
+#: of the process.
+_DLL_DIRECTORY_HANDLES: list[object] = []
+
+
+def _system_cuda_dll_dirs(program_files: Path, cuda_path: str | None) -> list[Path]:
+    """CUDA runtime and cuDNN DLL folders installed by NVIDIA's own installers.
+
+    Order: the toolkit named by CUDA_PATH (set by the toolkit installer), else
+    the newest toolkit under Program Files; then the newest standalone cuDNN,
+    whose DLLs live one level deeper in a per-CUDA-major folder
+    (``NVIDIA/CUDNN/v9.x/bin/12.x``). Without the cuDNN folder, a machine with
+    the toolkit installed still fell back to CPU at the first cuDNN load.
+    """
+    dirs: list[Path] = []
+
+    def newest_first(root: Path) -> list[Path]:
+        if not root.is_dir():
+            return []
+        return sorted((p for p in root.iterdir() if p.is_dir()), reverse=True)
+
+    toolkit_bin: Path | None = None
+    if cuda_path:
+        candidate = Path(cuda_path) / "bin"
+        if candidate.is_dir():
+            toolkit_bin = candidate
+    if toolkit_bin is None:
+        for version_dir in newest_first(program_files / "NVIDIA GPU Computing Toolkit" / "CUDA"):
+            if (version_dir / "bin").is_dir():
+                toolkit_bin = version_dir / "bin"
+                break
+    if toolkit_bin is not None:
+        dirs.append(toolkit_bin)
+
+    for version_dir in newest_first(program_files / "NVIDIA" / "CUDNN"):
+        bin_dir = version_dir / "bin"
+        if not bin_dir.is_dir():
+            continue
+        candidates = [bin_dir, *newest_first(bin_dir)]
+        with_dlls = [d for d in candidates if any(d.glob("cudnn*.dll"))]
+        if with_dlls:
+            dirs.append(with_dlls[0])
+            break
+    return dirs
+
+
 class WhisperTranscriber:
     """Transcribes audio files to text using faster-whisper.
 
@@ -1175,6 +1222,9 @@ class WhisperTranscriber:
             compute_type: Quantization type ('int8_float16', 'int8', 'float16').
         """
         self._patch_cuda_path()
+        #: Beam width for decoding. Meeting transcripts use 5; the live-caption
+        #: view (GreedyLiveTranscriber) decodes with 1.
+        self.beam_size = 5
         raw_model = model_size or os.environ.get("WHISPER_MODEL") or default_whisper_key()
         # Resolve a friendly registry key ("large-v3") to this backend's repo id
         # so it compares equal to what the Settings picker sends and
@@ -1255,19 +1305,26 @@ class WhisperTranscriber:
                     additions.append(str(bin_dir))
                     existing.add(str(bin_dir).lower())
 
-        # CUDA Toolkit (installed via nvidia installer, not pip)
-        cuda_root = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
-        if cuda_root.is_dir():
-            for version_dir in sorted(cuda_root.iterdir(), reverse=True):
-                bin_dir = version_dir / "bin"
-                if bin_dir.is_dir() and str(bin_dir).lower() not in existing:
-                    additions.append(str(bin_dir))
-                    existing.add(str(bin_dir).lower())
-                    break  # newest version only
+        # CUDA Toolkit and standalone cuDNN (NVIDIA installers, not pip).
+        program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+        for bin_dir in _system_cuda_dll_dirs(program_files, os.environ.get("CUDA_PATH")):
+            if str(bin_dir).lower() not in existing:
+                additions.append(str(bin_dir))
+                existing.add(str(bin_dir).lower())
 
         if additions:
             os.environ["PATH"] = os.pathsep.join(additions) + os.pathsep + os.environ.get("PATH", "")
-            logger.info("Prepended CUDA DLL paths to PATH: %s", additions)
+            # PATH alone is not consulted for DLLs that a Python extension
+            # (ctranslate2) loads on Python 3.8+; register the directories
+            # with the loader too. Keep the handles so they stay registered.
+            add_dll_directory = getattr(os, "add_dll_directory", None)
+            if add_dll_directory is not None:
+                for directory in additions:
+                    try:
+                        _DLL_DIRECTORY_HANDLES.append(add_dll_directory(directory))
+                    except OSError:
+                        logger.debug("add_dll_directory failed for %s", directory)
+            logger.info("Added CUDA DLL paths: %s", additions)
 
     def _load_model(self) -> None:
         """Load the faster-whisper model into memory.
@@ -1465,7 +1522,7 @@ class WhisperTranscriber:
         assert self.model is not None
         segments, info = self.model.transcribe(
             audio_path,
-            beam_size=5,
+            beam_size=self.beam_size,
             vad_filter=True,
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
@@ -1514,6 +1571,37 @@ class WhisperTranscriber:
                 logger.warning("Failed to clean up temporary file: %s", tmp_path)
 
         return result
+
+
+class GreedyLiveTranscriber:
+    """Live-caption view of a faster-whisper transcriber: same loaded model,
+    greedy decoding.
+
+    Apple Silicon gets a dedicated small MLX model for live captions. On
+    CTranslate2 machines (Windows) live captions used to share the meeting
+    model's beam-5 decoding, usually on CPU, so confirmations lagged well
+    behind speech. Greedy decoding on the already-loaded model is several
+    times faster, needs no extra download or memory, and only ever feeds the
+    live preview; the saved transcript is still decoded with the full beam.
+
+    Callers hold ``_WHISPER_LOCK`` (the server's live feed does), which is
+    what makes flipping the shared model's beam width safe.
+    """
+
+    def __init__(self, main: WhisperTranscriber) -> None:
+        self.main = main
+
+    @property
+    def model_size(self) -> str:
+        return self.main.model_size
+
+    def transcribe(self, audio_path: str) -> TranscribeResponse:
+        previous = self.main.beam_size
+        self.main.beam_size = 1
+        try:
+            return self.main.transcribe(audio_path)
+        finally:
+            self.main.beam_size = previous
 
 
 @dataclass

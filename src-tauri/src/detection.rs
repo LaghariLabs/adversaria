@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, LogicalPosition, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::commands::AppState;
 
@@ -133,15 +133,17 @@ fn show_meeting_card(app: &AppHandle, label: &str) {
 
         match built {
             Ok(win) => {
-                // Anchor to the bottom-right, above the taskbar.
+                // Anchor to the bottom-right of the work area, so the card
+                // clears the taskbar wherever it is docked (and the Dock on
+                // macOS) instead of assuming a 48px taskbar at the bottom.
                 if let Ok(Some(monitor)) = win.primary_monitor() {
-                    let size = monitor.size();
-                    let scale = monitor.scale_factor();
-                    let mw = size.width as f64 / scale;
-                    let mh = size.height as f64 / scale;
-                    let x = mw - W - MARGIN;
-                    let y = mh - H - MARGIN - 48.0;
-                    let _ = win.set_position(LogicalPosition::new(x, y));
+                    let (x, y) = crate::os_shell::place_in_work_area(
+                        monitor.work_area(),
+                        monitor.scale_factor(),
+                        (W, H),
+                        crate::os_shell::Anchor::BottomRight { margin: MARGIN },
+                    );
+                    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
                 }
                 eprintln!("[detect] meeting card shown");
             }
@@ -354,16 +356,26 @@ pub fn detect_meeting_app() -> Option<String> {
 }
 
 /// Apps whose mic use indicates a meeting worth recording (lowercased
-/// substrings). Browsers are included because Google Meet / Teams web / Zoom
-/// web run in them; the debounce keeps transient browser mic use from firing.
-#[cfg(windows)]
+/// substrings of a ConsentStore subkey: a package family name, or an exe path).
+/// Browsers are included because Google Meet / Teams web / Zoom web run in
+/// them; the debounce keeps transient browser mic use from firing.
+#[cfg_attr(not(windows), allow(dead_code))]
 const MEETING_APPS: &[&str] = &[
     "teams",
     "msteams",
     "zoom",
     "webex",
+    // The Webex desktop app runs as CiscoCollabHost.exe under a
+    // CiscoSparkLauncher folder; neither path contains "webex".
+    "ciscocollabhost",
+    "ciscospark",
     "slack",
     "gotomeeting",
+    // GoTo (formerly GoToMeeting): GoTo.exe, and the older g2m* helpers.
+    "\\goto\\",
+    "\\goto.exe",
+    "g2mcomm",
+    "g2mstart",
     "bluejeans",
     "ringcentral",
     "whereby",
@@ -372,18 +384,32 @@ const MEETING_APPS: &[&str] = &[
     "firefox",
     "brave",
     "opera",
+    "vivaldi",
+    // Arc is an MSIX package: TheBrowserCompany.Arc_<publisher id>.
+    "thebrowsercompany.arc",
+];
+
+/// Mic users that contain a meeting token but are not meetings. Checked
+/// before the meeting list, so each entry must be specific enough that it can
+/// never be a substring of a real meeting app (the old "steam" entry matched
+/// "msteams" and silently hid Microsoft Teams).
+#[cfg_attr(not(windows), allow(dead_code))]
+const NOT_MEETINGS: &[&str] = &[
+    // The WebView2 runtime hosts the new Outlook, Widgets, and many other
+    // apps; it contains "msedge" but is not the Edge browser.
+    "msedgewebview2",
 ];
 
 /// Map a mic-using app name to a friendly label, or `None` if it isn't a
 /// meeting app.
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn classify(app: &str) -> Option<String> {
     let lower = app.to_lowercase();
-    // Match the meeting list directly. We deliberately do NOT keep a separate
-    // "noise" blocklist checked first: a noise token can be a substring of a
-    // real meeting app (e.g. "steam" ⊂ "msteams"), which silently filtered out
-    // Microsoft Teams. Non-meeting mic users (Steam, Discord, OBS, dictation
-    // tools, …) simply don't match any meeting token and return None here.
+    if NOT_MEETINGS.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+    // Non-meeting mic users (Steam, Discord, OBS, dictation tools, …) simply
+    // don't match any meeting token and return None here.
     if !MEETING_APPS.iter().any(|m| lower.contains(m)) {
         return None;
     }
@@ -391,19 +417,92 @@ fn classify(app: &str) -> Option<String> {
         "Microsoft Teams"
     } else if lower.contains("zoom") {
         "Zoom"
-    } else if lower.contains("webex") {
+    } else if lower.contains("webex") || lower.contains("cisco") {
         "Webex"
     } else if lower.contains("slack") {
         "Slack"
+    } else if lower.contains("goto") || lower.contains("g2m") {
+        "GoTo Meeting"
     } else if lower.contains("chrome")
         || lower.contains("msedge")
         || lower.contains("firefox")
         || lower.contains("brave")
         || lower.contains("opera")
+        || lower.contains("vivaldi")
+        || lower.contains("thebrowsercompany.arc")
     {
         "a browser meeting"
     } else {
         "a meeting"
     };
     Some(label.to_string())
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::classify;
+
+    /// NonPackaged subkeys are exe paths with `\` stored as `#`; the Windows
+    /// reader turns them back into backslashes before classifying, so these
+    /// tests feed real paths.
+    fn exe(path: &str) -> Option<String> {
+        classify(path)
+    }
+
+    #[test]
+    fn recognizes_desktop_meeting_apps() {
+        assert_eq!(
+            exe(r"C:\Users\a\AppData\Roaming\Zoom\bin\Zoom.exe").as_deref(),
+            Some("Zoom")
+        );
+        assert_eq!(
+            classify("MSTeams_8wekyb3d8bbwe").as_deref(),
+            Some("Microsoft Teams")
+        );
+        assert_eq!(
+            exe(r"C:\Users\a\AppData\Local\CiscoSparkLauncher\CiscoCollabHost.exe").as_deref(),
+            Some("Webex")
+        );
+        assert_eq!(
+            exe(r"C:\Users\a\AppData\Local\GoTo\GoTo.exe").as_deref(),
+            Some("GoTo Meeting")
+        );
+        assert_eq!(
+            exe(r"C:\Program Files (x86)\GoToMeeting\19950\g2mcomm.exe").as_deref(),
+            Some("GoTo Meeting")
+        );
+    }
+
+    #[test]
+    fn recognizes_browsers() {
+        for path in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Users\a\AppData\Local\Vivaldi\Application\vivaldi.exe",
+            "TheBrowserCompany.Arc_ttt1ap7aakyb4",
+        ] {
+            assert_eq!(
+                classify(path).as_deref(),
+                Some("a browser meeting"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_webview2_hosts_and_non_meeting_apps() {
+        assert_eq!(
+            exe(
+                r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\128.0\msedgewebview2.exe"
+            ),
+            None
+        );
+        assert_eq!(exe(r"C:\Program Files (x86)\Steam\steam.exe"), None);
+        assert_eq!(
+            exe(r"C:\Users\a\AppData\Local\Discord\app-1.0\Discord.exe"),
+            None
+        );
+        // A folder that merely starts with "goto" is not GoTo.
+        assert_eq!(exe(r"C:\Tools\gotools\recorder.exe"), None);
+    }
 }

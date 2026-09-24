@@ -110,3 +110,22 @@ class TestMergeSimilarSpeakers:
 
     def test_empty(self):
         assert merge_similar_speakers([], {0: [1.0], 1: [1.0]}) == []
+
+
+class TestDownload:
+    def test_download_overwrites_a_leftover_archive(self, tmp_path, monkeypatch):
+        """Path.rename refuses to overwrite on Windows, so a leftover archive
+        from an interrupted extract used to break every later download."""
+        import src.diarizer as diarizer
+
+        dest = tmp_path / "seg.tar.bz2"
+        dest.write_bytes(b"stale")
+
+        def fake_retrieve(url, filename):
+            with open(filename, "wb") as fh:
+                fh.write(b"fresh")
+
+        monkeypatch.setattr(diarizer.urllib.request, "urlretrieve", fake_retrieve)
+        diarizer._download("https://example.invalid/seg.tar.bz2", dest)
+        assert dest.read_bytes() == b"fresh"
+        assert not (tmp_path / "seg.tar.bz2.part").exists()

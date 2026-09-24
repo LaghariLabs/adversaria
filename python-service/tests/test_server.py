@@ -1219,3 +1219,46 @@ class TestModelDownloadReset:
 
         assert response.status_code == 200
         reset.assert_called_once_with("qwen-4b-light", force=True)
+
+
+class TestGracefulExit:
+    """/shutdown must let uvicorn tear down on every platform."""
+
+    def test_windows_raises_sigint_in_process(self, monkeypatch):
+        import signal
+
+        import src.server as server
+
+        calls: list[str] = []
+        monkeypatch.setattr(server.sys, "platform", "win32")
+        monkeypatch.setattr(server.signal, "raise_signal", lambda sig: calls.append(f"raise:{sig}"))
+        monkeypatch.setattr(server.os, "kill", lambda pid, sig: calls.append(f"kill:{sig}"))
+        server._request_graceful_exit()
+        # os.kill(pid, SIGINT) is TerminateProcess on Windows: no teardown.
+        assert calls == [f"raise:{signal.SIGINT}"]
+
+    def test_posix_signals_the_process(self, monkeypatch):
+        import signal
+
+        import src.server as server
+
+        calls: list[str] = []
+        monkeypatch.setattr(server.sys, "platform", "darwin")
+        monkeypatch.setattr(server.signal, "raise_signal", lambda sig: calls.append(f"raise:{sig}"))
+        monkeypatch.setattr(server.os, "kill", lambda pid, sig: calls.append(f"kill:{sig}"))
+        server._request_graceful_exit()
+        assert calls == [f"kill:{signal.SIGINT}"]
+
+
+class TestLiveTranscriberChoice:
+    def test_ctranslate2_live_captions_use_the_greedy_view(self):
+        import src.server as server
+
+        # Through the server module: test_transcriber reloads src.transcriber,
+        # so its class objects can differ from the ones the server imported.
+        main = server.WhisperTranscriber.__new__(server.WhisperTranscriber)
+        main.beam_size = 5
+        main.model_size = "large-v3-turbo"
+        live = server._build_live_transcriber(main)
+        assert isinstance(live, server.GreedyLiveTranscriber)
+        assert live.main is main

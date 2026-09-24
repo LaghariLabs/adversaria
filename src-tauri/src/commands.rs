@@ -8,9 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::{
-    AppHandle, Emitter, LogicalPosition, Manager, State, WebviewUrl, WebviewWindowBuilder,
-};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::audio::AudioCapture;
 use crate::calendar::{oauth, tokens};
@@ -762,8 +760,14 @@ pub fn show_recording_bubble(app: &AppHandle) {
     let expressive = style == "expressive";
     let inner = app.clone();
     let _ = app.run_on_main_thread(move || {
-        /// Floating margin below the menu bar when NOT docked (macOS & Windows).
+        /// Floating margin below the menu bar when NOT docked (macOS).
+        #[cfg(target_os = "macos")]
         const MARGIN: f64 = 38.0;
+        /// Gap between the top of the work area and the pill on Windows, where
+        /// there is no menu bar to clear. The work area already excludes a
+        /// taskbar docked to the top edge.
+        #[cfg(not(target_os = "macos"))]
+        const FLOAT_TOP: f64 = 8.0;
 
         #[cfg(target_os = "macos")]
         let notch = notch_geometry();
@@ -870,13 +874,27 @@ pub fn show_recording_bubble(app: &AppHandle) {
                         }
                     }
                 }
-            } else {
-                if let Ok(Some(monitor)) = win.primary_monitor() {
+            } else if let Ok(Some(monitor)) = win.primary_monitor() {
+                #[cfg(target_os = "macos")]
+                {
                     let size = monitor.size();
                     let scale = monitor.scale_factor();
                     let mw = size.width as f64 / scale;
                     let x = (mw - w) / 2.0; // top-center
-                    let _ = win.set_position(LogicalPosition::new(x, MARGIN));
+                    let _ = win.set_position(tauri::LogicalPosition::new(x, MARGIN));
+                }
+                // Top-center of the work area, in physical pixels: correct on
+                // a secondary-left layout (negative origin), with a top-docked
+                // taskbar, and at any display scaling.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (x, y) = crate::os_shell::place_in_work_area(
+                        monitor.work_area(),
+                        monitor.scale_factor(),
+                        (w, h),
+                        crate::os_shell::Anchor::TopCenter { top: FLOAT_TOP },
+                    );
+                    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
                 }
             }
         }
@@ -5382,17 +5400,10 @@ pub async fn calendar_connect(
             |url| {
                 // Open the authorize URL in the system browser.
                 // We use platform commands rather than tauri-plugin-shell
-                // because we're inside spawn_blocking (no async).
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("open").arg(url).spawn();
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/c", "start", url])
-                        .spawn();
-                }
+                // because we're inside spawn_blocking (no async). On Windows
+                // this must not go through `cmd /c start`, which cut the URL
+                // at its first `&` (see os_shell).
+                let _ = crate::os_shell::open_default(url);
             },
         )
     })
@@ -5574,25 +5585,15 @@ pub async fn probe_system_audio(
     Ok(crate::permissions::check())
 }
 
-/// Open the exact System Settings pane for a permission.
+/// Open the exact settings pane for a permission: System Settings › Privacy on
+/// macOS, Settings › Privacy › Microphone (or Sound) on Windows.
 #[tauri::command]
-pub async fn open_privacy_settings(app: AppHandle, which: String) -> Result<(), String> {
-    let _ = app;
-    let _ = &which;
-    // `open` handles the x-apple.systempreferences: scheme; the shell plugin's
-    // scope would need a matching allowlist entry for a URL this exotic.
-    // Windows has no equivalent deep link (permissions::check() reports
-    // everything granted there), so the whole body is macOS-only — including
-    // resolving the URL, which is otherwise an unused-variable error under the
-    // `-D warnings` clippy gate.
-    #[cfg(target_os = "macos")]
-    {
-        let url = crate::permissions::settings_url(&which);
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("Couldn't open System Settings: {e}"))?;
-    }
+pub async fn open_privacy_settings(which: String) -> Result<(), String> {
+    // `open` / rundll32 handle the x-apple.systempreferences: and ms-settings:
+    // schemes; the shell plugin's scope would need an allowlist entry for
+    // URLs this exotic.
+    let url = crate::permissions::settings_url(&which);
+    crate::os_shell::open_default(url).map_err(|e| format!("Couldn't open settings: {e}"))?;
     Ok(())
 }
 
@@ -6542,15 +6543,13 @@ pub async fn get_latest_workspace_run(task_id: i64) -> Result<Option<WorkspaceRu
         .map_err(|error| format!("Failed to load workspace run: {error}"))
 }
 
-/// Open an artifact with the macOS default application.
+/// Open an artifact with the platform's default application.
 #[tauri::command]
 pub async fn open_workspace_artifact(path: String) -> Result<(), String> {
     if !std::path::Path::new(&path).exists() {
         return Err(format!("Artifact file is missing: {path}"));
     }
-    std::process::Command::new("open")
-        .arg(&path)
-        .spawn()
+    crate::os_shell::open_default(&path)
         .map_err(|error| format!("Couldn't open workspace artifact: {error}"))?;
     Ok(())
 }
@@ -6585,19 +6584,8 @@ pub async fn reveal_workspace_artifact(path: String) -> Result<(), String> {
         return Err(format!("Artifact file is missing: {path}"));
     }
 
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open")
-        .arg("-R")
-        .arg(&path)
-        .spawn();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("explorer")
-        .arg(format!("/select,{path}"))
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return Err("Couldn't reveal workspace artifact: unsupported platform".to_string());
-
-    result.map_err(|error| format!("Couldn't reveal workspace artifact: {error}"))?;
+    crate::os_shell::reveal(&path)
+        .map_err(|error| format!("Couldn't reveal workspace artifact: {error}"))?;
     Ok(())
 }
 
@@ -6951,7 +6939,7 @@ async fn execute_workspace_run_inner(
     }
 
     let mut command = if engine == "claude" {
-        let mut command = std::process::Command::new("claude");
+        let mut command = std::process::Command::new(crate::os_shell::resolve_cli("claude"));
         command
             .arg("-p")
             .arg(&brief)
@@ -6967,7 +6955,7 @@ async fn execute_workspace_run_inner(
         }
         command
     } else {
-        let mut command = std::process::Command::new("codex");
+        let mut command = std::process::Command::new(crate::os_shell::resolve_cli("codex"));
         command
             .arg("exec")
             .arg("--skip-git-repo-check")

@@ -52,6 +52,7 @@ import type {
 } from "../../types";
 import { ArtifactPreview } from "./ArtifactPreview";
 import { engineLabel } from "./engineLabel";
+import { COPY } from "../../lib/platform";
 
 type TaskCapability = "research" | "write" | "visualize" | "present";
 
@@ -974,8 +975,8 @@ export function WorkspaceDetailView({
                   <button
                     className="ws-task-action-button"
                     type="button"
-                    aria-label="Reveal in Finder"
-                    title="Reveal in Finder"
+                    aria-label={`Show in ${COPY.fileManager}`}
+                    title={`Show in ${COPY.fileManager}`}
                     disabled={verdictPending}
                     onClick={(event) => {
                       event.stopPropagation();

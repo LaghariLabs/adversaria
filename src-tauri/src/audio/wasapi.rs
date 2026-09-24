@@ -6,19 +6,38 @@
 //!
 //! Each stream is written to its own WAV file. Mic capture is best-effort — a
 //! missing or failing microphone never aborts the recording; the meeting simply
-//! falls back to system audio only.
+//! falls back to system audio only. System audio is required: `start` waits
+//! for the loopback endpoint to be capturing and returns its error otherwise,
+//! the same contract as the macOS tap.
+//!
+//! Both streams are stored as mono float32 at the rate the recording started
+//! on (see `super::convert`). When an endpoint disappears or the Windows
+//! default device changes mid-meeting (headset plugged in, Bluetooth
+//! reconnect), the capture thread reopens the new default endpoint, resamples
+//! if its rate differs, and pads the gap with silence so both streams stay on
+//! wall-clock time.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use super::{snapshot_since, RecordingPaths, StreamState, WAV_FORMAT_IEEE_FLOAT, WAV_FORMAT_PCM};
+use super::convert::{append_mono_f32, f32_bytes, InputFormat, LinearResampler};
+use super::{snapshot_since, RecordingPaths, StreamState, WAV_FORMAT_IEEE_FLOAT};
 use crate::recording_spool::SpoolSession;
+
+/// How long `start` waits for the loopback endpoint to begin capturing.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the capture loop checks whether the Windows default device moved.
+const DEFAULT_DEVICE_POLL: Duration = Duration::from_secs(2);
+/// Back-off between attempts to reopen a lost endpoint.
+const REOPEN_BACKOFF: Duration = Duration::from_millis(500);
 
 /// WAVEFORMATEXTENSIBLE marker — actual format is in the SubFormat GUID.
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 /// Which WASAPI endpoint a capture stream records from.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum CaptureSource {
     /// Default render device in loopback mode — system audio.
     SystemLoopback,
@@ -89,15 +108,46 @@ impl AudioCapture {
         *self.system_path.lock().unwrap() = Some(PathBuf::from(&spool_path));
         *self.mic_path.lock().unwrap() = None;
 
+        // System audio is the critical stream: wait until its endpoint is
+        // actually capturing. Previously the thread was spawned and `start`
+        // returned Ok at once, so a WASAPI failure produced a "recording"
+        // that captured nothing and only warned vaguely at stop.
+        let (startup_tx, startup_rx) = mpsc::channel();
         let system_handle = spawn_capture_thread(
             CaptureSource::SystemLoopback,
             self.recording.clone(),
             self.system.clone(),
+            Some(startup_tx),
         );
+        let startup = match startup_rx.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "System-audio capture did not start within {} s",
+                STARTUP_TIMEOUT.as_secs()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("System-audio capture stopped before it started".to_string())
+            }
+        };
+        if let Err(error) = startup {
+            *self.recording.lock().unwrap() = false;
+            let _ = system_handle.join();
+            self.system.detach_writer();
+            self.mic.detach_writer();
+            if let Some(spool) = self.spool.lock().unwrap().take() {
+                let _ = spool.finish();
+            }
+            *self.system_path.lock().unwrap() = None;
+            return Err(format!("Couldn't capture system audio: {error}"));
+        }
+
+        // The mic is best-effort: its thread reports failure through
+        // `StreamState::ok`, never by failing the recording.
         let mic_handle = spawn_capture_thread(
             CaptureSource::Microphone,
             self.recording.clone(),
             self.mic.clone(),
+            None,
         );
 
         *self.system_handle.lock().unwrap() = Some(system_handle);
@@ -156,9 +206,12 @@ impl AudioCapture {
 
         *self.recording.lock().unwrap() = false;
 
-        system_handle
+        // A panicked capture thread must not strand the spool: finish it
+        // anyway so the audio captured so far is recoverable, and say so.
+        let panicked = system_handle
             .join()
-            .map_err(|_| "Audio capture thread panicked".to_string())?;
+            .err()
+            .map(|_| "System-audio capture stopped unexpectedly.".to_string());
 
         // The mic thread is best-effort: a panic or failure must not lose
         // the meeting.
@@ -166,7 +219,10 @@ impl AudioCapture {
             let _ = handle.join();
         }
 
-        let writer_error = self.system.writer_error();
+        let writer_error = match (panicked, self.system.writer_error()) {
+            (Some(panic), Some(writer)) => Some(format!("{panic} {writer}")),
+            (panic, writer) => panic.or(writer),
+        };
         self.system.detach_writer();
         self.mic.detach_writer();
         let spool = self
@@ -196,12 +252,14 @@ impl Default for AudioCapture {
     }
 }
 
-/// Spawn a thread that captures one WASAPI stream and writes it to
-/// `output_path` when recording stops.
+/// Spawn a thread that captures one WASAPI stream into `state`. When
+/// `startup` is given, the thread reports on it once: `Ok` when the endpoint
+/// is capturing, or the error that stopped it.
 fn spawn_capture_thread(
     source: CaptureSource,
     recording: Arc<Mutex<bool>>,
     state: StreamState,
+    startup: Option<mpsc::Sender<Result<(), String>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let label = match source {
@@ -209,196 +267,343 @@ fn spawn_capture_thread(
             CaptureSource::Microphone => "mic",
         };
 
-        if let Err(e) = capture_wasapi(source, recording, state.clone()) {
+        let mut startup = startup;
+        if let Err(e) = capture_wasapi(source, &recording, &state, &mut startup) {
             eprintln!("Audio capture error ({label}): {e}");
             *state.ok.lock().unwrap() = false;
+            if let Some(tx) = startup.take() {
+                let _ = tx.send(Err(e));
+            }
         }
     })
 }
 
-/// Run a WASAPI capture loop for the given source. Appends raw PCM
-/// bytes to the stream buffer until `recording` is set to `false`.
-fn capture_wasapi(
-    source: CaptureSource,
-    recording: Arc<Mutex<bool>>,
-    state: StreamState,
-) -> Result<(), String> {
-    use windows::Win32::Media::Audio::*;
-    use windows::Win32::System::Com::*;
+/// One opened WASAPI endpoint: the client, its capture service, and the
+/// native format its packets arrive in.
+struct Endpoint {
+    id: Option<String>,
+    audio_client: windows::Win32::Media::Audio::IAudioClient,
+    capture_client: windows::Win32::Media::Audio::IAudioCaptureClient,
+    format: InputFormat,
+}
 
-    // SAFETY: We initialise COM once per capture session and
-    // uninitialize it when this scope exits.
-    unsafe {
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if hr.is_err() {
-            return Err(format!("CoInitializeEx failed: {hr:?}"));
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        // SAFETY: stopping an initialized client is always valid; the result
+        // is irrelevant because the endpoint is being discarded.
+        unsafe {
+            let _ = self.audio_client.Stop();
         }
+    }
+}
 
-        // Ensure COM is cleaned up even on early returns.
-        let _com_guard = ComGuard;
+/// The endpoint a source records from right now: the default render device
+/// (loopback) or the default capture device (mic), in the console role.
+fn default_device(
+    enumerator: &windows::Win32::Media::Audio::IMMDeviceEnumerator,
+    source: CaptureSource,
+) -> Result<windows::Win32::Media::Audio::IMMDevice, String> {
+    use windows::Win32::Media::Audio::{eCapture, eConsole, eRender};
+    let dataflow = match source {
+        CaptureSource::SystemLoopback => eRender,
+        CaptureSource::Microphone => eCapture,
+    };
+    // SAFETY: plain COM call on a live enumerator.
+    unsafe { enumerator.GetDefaultAudioEndpoint(dataflow, eConsole) }
+        .map_err(|e| format!("GetDefaultAudioEndpoint failed: {e:?}"))
+}
 
-        // Create the device enumerator.
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("CoCreateInstance failed: {e:?}"))?;
+/// Endpoint id string, used to notice that the default device has moved.
+fn device_id(device: &windows::Win32::Media::Audio::IMMDevice) -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    // SAFETY: GetId returns a CoTaskMemAlloc'd wide string that we copy and
+    // then free exactly once.
+    unsafe {
+        let raw = device.GetId().ok()?;
+        let id = raw.to_string().ok();
+        CoTaskMemFree(Some(raw.0 as *const _));
+        id
+    }
+}
 
-        // System audio comes from the default render device in loopback
-        // mode; the microphone is the default capture device.
-        let (dataflow, stream_flags) = match source {
-            CaptureSource::SystemLoopback => (eRender, AUDCLNT_STREAMFLAGS_LOOPBACK),
-            CaptureSource::Microphone => (eCapture, 0),
-        };
+/// Activate, initialize, and start a shared-mode capture client on the
+/// current default endpoint for `source`.
+fn open_endpoint(
+    enumerator: &windows::Win32::Media::Audio::IMMDeviceEnumerator,
+    source: CaptureSource,
+) -> Result<Endpoint, String> {
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
 
-        let device = enumerator
-            .GetDefaultAudioEndpoint(dataflow, eConsole)
-            .map_err(|e| format!("GetDefaultAudioEndpoint failed: {e:?}"))?;
+    let device = default_device(enumerator, source)?;
+    let id = device_id(&device);
+    let stream_flags = match source {
+        CaptureSource::SystemLoopback => AUDCLNT_STREAMFLAGS_LOOPBACK,
+        CaptureSource::Microphone => 0,
+    };
 
-        // Activate the audio client.
+    // SAFETY: standard WASAPI activation sequence. The mix format pointer is
+    // CoTaskMemAlloc'd by GetMixFormat, read while initializing the client,
+    // and freed exactly once below on every path.
+    unsafe {
         let audio_client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
             .map_err(|e| format!("Activate IAudioClient failed: {e:?}"))?;
 
-        // Retrieve the mix format.
         let mix_format = audio_client
             .GetMixFormat()
             .map_err(|e| format!("GetMixFormat failed: {e:?}"))?;
         let wave_format = &*mix_format;
 
-        // Store actual format parameters for the WAV header.
-        *state.sample_rate.lock().unwrap() = wave_format.nSamplesPerSec;
-        *state.num_channels.lock().unwrap() = wave_format.nChannels;
-        *state.bits_per_sample.lock().unwrap() = wave_format.wBitsPerSample as u16;
-        {
-            // Shared-mode mix format is almost always 32-bit IEEE float,
-            // wrapped in WAVEFORMATEXTENSIBLE. The SubFormat GUID's first
-            // dword equals the classic format tag (1 = PCM, 3 = float).
-            let tag = wave_format.wFormatTag;
-            let resolved = if tag == WAVE_FORMAT_EXTENSIBLE {
-                let ext = &*(mix_format as *const WAVEFORMATEXTENSIBLE);
-                ext.SubFormat.data1 as u16
-            } else {
-                tag
-            };
-            *state.format_tag.lock().unwrap() = if resolved == WAV_FORMAT_IEEE_FLOAT {
-                WAV_FORMAT_IEEE_FLOAT
-            } else {
-                WAV_FORMAT_PCM
-            };
+        // Shared-mode mix format is almost always 32-bit IEEE float, wrapped
+        // in WAVEFORMATEXTENSIBLE. The SubFormat GUID's first dword equals the
+        // classic format tag (1 = PCM, 3 = float).
+        let tag = if wave_format.wFormatTag == WAVE_FORMAT_EXTENSIBLE {
+            let ext = &*(mix_format as *const WAVEFORMATEXTENSIBLE);
+            ext.SubFormat.data1 as u16
+        } else {
+            wave_format.wFormatTag
+        };
+        let format = InputFormat {
+            sample_rate: wave_format.nSamplesPerSec,
+            channels: wave_format.nChannels,
+            bits_per_sample: wave_format.wBitsPerSample,
+            float: tag == WAV_FORMAT_IEEE_FLOAT,
+        };
+
+        let hns_buffer_duration = 1_000_000i64; // 100 ms
+        let initialized = audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            stream_flags,
+            hns_buffer_duration,
+            0,
+            wave_format,
+            None,
+        );
+        CoTaskMemFree(Some(mix_format as *const _));
+        initialized.map_err(|e| format!("Initialize audio client failed: {e:?}"))?;
+
+        if !format.is_supported() {
+            return Err(format!("Unsupported device format: {format:?}"));
         }
 
-        // Initialise the client for this capture mode.
-        let hns_buffer_duration = 1_000_000i64; // 100 ms
-        audio_client
-            .Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                stream_flags,
-                hns_buffer_duration,
-                0,
-                wave_format,
-                None,
-            )
-            .map_err(|e| format!("Initialize audio client failed: {e:?}"))?;
-
-        // Obtain the capture client.
         let capture_client: IAudioCaptureClient = audio_client
             .GetService()
             .map_err(|e| format!("GetService IAudioCaptureClient failed: {e:?}"))?;
 
-        // Start recording.
         audio_client
             .Start()
             .map_err(|e| format!("Audio client Start failed: {e:?}"))?;
 
-        let mut data_ptr: *mut u8 = std::ptr::null_mut();
-        let mut frames_available: u32 = 0;
-        let mut flags: u32 = 0;
+        Ok(Endpoint {
+            id,
+            audio_client,
+            capture_client,
+            format,
+        })
+    }
+}
 
-        let block_align = wave_format.nBlockAlign as usize;
-        let sample_rate = wave_format.nSamplesPerSec as u64;
+/// Run a WASAPI capture loop for the given source, appending mono float32 to
+/// the stream until `recording` is set to `false`.
+fn capture_wasapi(
+    source: CaptureSource,
+    recording: &Arc<Mutex<bool>>,
+    state: &StreamState,
+    startup: &mut Option<mpsc::Sender<Result<(), String>>>,
+) -> Result<(), String> {
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::*;
 
-        // A loopback endpoint delivers NOTHING while nothing is playing — not
-        // silent packets, no packets at all. The microphone stream meanwhile
-        // keeps delivering continuously, so every quiet stretch shortens the
-        // system stream relative to the mic one. Left uncorrected the two
-        // spooled streams drift apart, and because `build_labeled_turns`
-        // interleaves them by timestamp, every later "Them" turn is placed
-        // earlier than it was actually spoken. The Core Audio process tap pads
-        // silence for us on macOS, which is why this has no counterpart there.
-        //
-        // So for loopback only, top the stream up with the silence the device
-        // declined to give us, keeping it aligned to wall clock.
-        let pad_silence = source == CaptureSource::SystemLoopback;
-        let started = std::time::Instant::now();
-        let mut frames_written: u64 = 0;
-        // ~50 ms of zeroed frames, reused so a long quiet stretch doesn't
-        // reallocate on every top-up.
-        let silence = vec![0u8; block_align * (sample_rate as usize / 20).max(1)];
+    // SAFETY: COM is initialised once for this thread and uninitialised by
+    // the guard when this scope exits, on every path.
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if hr.is_err() {
+        return Err(format!("CoInitializeEx failed: {hr:?}"));
+    }
+    let _com_guard = ComGuard;
 
-        loop {
-            if !*recording.lock().unwrap() {
-                break;
+    // SAFETY: plain COM instantiation on an initialised thread.
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+            .map_err(|e| format!("CoCreateInstance failed: {e:?}"))?;
+
+    let mut endpoint = Some(open_endpoint(&enumerator, source)?);
+
+    // The stored format is fixed for the whole recording (mono float32 at
+    // the first endpoint's rate), so it is set before the first push and a
+    // replacement endpoint is resampled into it.
+    let output_rate = endpoint.as_ref().map_or(48_000, |e| e.format.sample_rate);
+    *state.sample_rate.lock().unwrap() = output_rate;
+    *state.num_channels.lock().unwrap() = 1;
+    *state.bits_per_sample.lock().unwrap() = 32;
+    *state.format_tag.lock().unwrap() = WAV_FORMAT_IEEE_FLOAT;
+    if let Some(tx) = startup.take() {
+        let _ = tx.send(Ok(()));
+    }
+
+    let mut resampler = LinearResampler::new(output_rate, output_rate);
+    let sample_rate = u64::from(output_rate);
+    const OUT_BLOCK: usize = 4; // one mono f32 frame
+
+    // A loopback endpoint delivers NOTHING while nothing is playing — not
+    // silent packets, no packets at all. The microphone stream meanwhile
+    // keeps delivering continuously, so every quiet stretch shortens the
+    // system stream relative to the mic one. Left uncorrected the two
+    // spooled streams drift apart, and because `build_labeled_turns`
+    // interleaves them by timestamp, every later "Them" turn is placed
+    // earlier than it was actually spoken. The Core Audio process tap pads
+    // silence for us on macOS, which is why this has no counterpart there.
+    //
+    // So for loopback, top the stream up with the silence the device declined
+    // to give us, keeping it aligned to wall clock. The mic gets the same
+    // treatment only while its endpoint is being replaced, so a device switch
+    // does not pull every later "Me" turn earlier.
+    let pad_silence = source == CaptureSource::SystemLoopback;
+    let started = Instant::now();
+    let mut frames_written: u64 = 0;
+    // ~50 ms of zeroed frames, reused so a long quiet stretch doesn't
+    // reallocate on every top-up.
+    let silence = vec![0u8; OUT_BLOCK * (output_rate as usize / 20).max(1)];
+    let mut decoded: Vec<f32> = Vec::new();
+    let mut resampled: Vec<f32> = Vec::new();
+    let mut last_default_check = Instant::now();
+    let mut last_reopen_attempt: Option<Instant> = None;
+    let mut reopen_failures: u32 = 0;
+
+    let mut data_ptr: *mut u8 = std::ptr::null_mut();
+    let mut frames_available: u32 = 0;
+    let mut flags: u32 = 0;
+
+    while *recording.lock().unwrap() {
+        // --- Endpoint lost: keep time, retry the current default device. ---
+        let Some(active) = endpoint.as_ref() else {
+            let due = last_reopen_attempt.is_none_or(|at| at.elapsed() >= REOPEN_BACKOFF);
+            if due {
+                last_reopen_attempt = Some(Instant::now());
+                match open_endpoint(&enumerator, source) {
+                    Ok(next) => {
+                        eprintln!(
+                            "[audio] {source:?} endpoint reopened at {} Hz",
+                            next.format.sample_rate
+                        );
+                        resampler = LinearResampler::new(next.format.sample_rate, output_rate);
+                        endpoint = Some(next);
+                        reopen_failures = 0;
+                    }
+                    Err(error) => {
+                        // Twice a second while no device exists: log the first
+                        // failure and then about once a minute.
+                        #[allow(unknown_lints, clippy::manual_is_multiple_of)]
+                        let log_now = reopen_failures % 120 == 0;
+                        if log_now {
+                            eprintln!("[audio] {source:?} reopen failed: {error}");
+                        }
+                        reopen_failures = reopen_failures.saturating_add(1);
+                    }
+                }
             }
+            pad_to_wall_clock(
+                state,
+                &silence,
+                OUT_BLOCK,
+                sample_rate,
+                started,
+                &mut frames_written,
+            )?;
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
 
-            // Try to get the next buffer of captured audio.
-            let hr = capture_client.GetBuffer(
+        // --- The user picked another default device: follow it. ---
+        if last_default_check.elapsed() >= DEFAULT_DEVICE_POLL {
+            last_default_check = Instant::now();
+            let current = default_device(&enumerator, source)
+                .ok()
+                .and_then(|device| device_id(&device));
+            if current.is_some() && current != active.id {
+                eprintln!("[audio] {source:?} default device changed; switching");
+                endpoint = None;
+                last_reopen_attempt = None;
+                continue;
+            }
+        }
+
+        // SAFETY: the out-pointers are valid locals; a successful GetBuffer
+        // is always paired with ReleaseBuffer below before the next call.
+        let hr = unsafe {
+            active.capture_client.GetBuffer(
                 &mut data_ptr,
                 &mut frames_available,
                 &mut flags,
                 None,
                 None,
-            );
+            )
+        };
 
-            if hr.is_ok() && frames_available > 0 && !data_ptr.is_null() {
-                // Close any gap that opened while the endpoint was idle BEFORE
-                // appending this packet, so the packet lands at its true offset.
-                if pad_silence {
-                    pad_to_wall_clock(
-                        &state,
-                        &silence,
-                        block_align,
-                        sample_rate,
-                        started,
-                        &mut frames_written,
-                    )?;
-                }
-
-                let byte_count = frames_available as usize * block_align;
-                // AUDCLNT_BUFFERFLAGS_SILENT means the packet's contents are
-                // undefined and must be treated as silence — reading them
-                // verbatim feeds whatever the driver left in the buffer into
-                // the transcript.
-                let is_silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-                let result = if is_silent {
-                    push_silence(&state, &silence, byte_count)
-                } else {
-                    state.push(std::slice::from_raw_parts(data_ptr, byte_count))
-                };
-
-                // Release before propagating any error: returning with the
-                // packet still held leaks it and wedges the capture client.
-                let _ = capture_client.ReleaseBuffer(frames_available);
-                result?;
-                frames_written += frames_available as u64;
-            } else {
-                // No packet available (buffer empty or error). Keep the loopback
-                // stream growing in real time rather than only catching up when
-                // audio resumes, then sleep instead of busy-spinning a core.
-                if pad_silence {
-                    pad_to_wall_clock(
-                        &state,
-                        &silence,
-                        block_align,
-                        sample_rate,
-                        started,
-                        &mut frames_written,
-                    )?;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+        if let Err(error) = hr {
+            // AUDCLNT_E_DEVICE_INVALIDATED (unplugged, driver reset, format
+            // change) and friends: the client is dead. Drop it and reopen.
+            eprintln!("[audio] {source:?} endpoint lost: {error:?}");
+            endpoint = None;
+            last_reopen_attempt = None;
+            continue;
         }
 
-        // Stop the audio client.
-        let _ = audio_client.Stop();
+        if frames_available > 0 && !data_ptr.is_null() {
+            // Close any gap that opened while the endpoint was idle BEFORE
+            // appending this packet, so the packet lands at its true offset.
+            if pad_silence {
+                pad_to_wall_clock(
+                    state,
+                    &silence,
+                    OUT_BLOCK,
+                    sample_rate,
+                    started,
+                    &mut frames_written,
+                )?;
+            }
+
+            let format = active.format;
+            let byte_count = frames_available as usize * format.block_align();
+            decoded.clear();
+            // AUDCLNT_BUFFERFLAGS_SILENT means the packet's contents are
+            // undefined and must be treated as silence — reading them
+            // verbatim feeds whatever the driver left in the buffer into the
+            // transcript.
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                decoded.resize(frames_available as usize, 0.0);
+            } else {
+                // SAFETY: WASAPI guarantees `frames_available` whole frames
+                // at `data_ptr` until ReleaseBuffer.
+                let packet = unsafe { std::slice::from_raw_parts(data_ptr, byte_count) };
+                append_mono_f32(packet, &format, &mut decoded);
+            }
+            // Release before pushing: returning with the packet still held
+            // leaks it and wedges the capture client.
+            // SAFETY: releases exactly the frames GetBuffer handed out.
+            let _ = unsafe { active.capture_client.ReleaseBuffer(frames_available) };
+
+            resampled.clear();
+            resampler.process(&decoded, &mut resampled);
+            state.push(&f32_bytes(&resampled))?;
+            frames_written += resampled.len() as u64;
+        } else {
+            // No packet available. Keep the loopback stream growing in real
+            // time rather than only catching up when audio resumes, then
+            // sleep instead of busy-spinning a core.
+            if pad_silence {
+                pad_to_wall_clock(
+                    state,
+                    &silence,
+                    OUT_BLOCK,
+                    sample_rate,
+                    started,
+                    &mut frames_written,
+                )?;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     Ok(())

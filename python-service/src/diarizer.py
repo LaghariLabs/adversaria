@@ -9,6 +9,7 @@ downloaded once to a local cache and run fully offline (no HuggingFace gating).
 from __future__ import annotations
 
 import logging
+import os
 import tarfile
 import urllib.request
 from pathlib import Path
@@ -232,7 +233,10 @@ def _download(url: str, dest: Path) -> None:
     tmp = dest.with_name(dest.name + ".part")
     logger.info("Downloading diarization model → %s", dest.name)
     urllib.request.urlretrieve(url, tmp)
-    tmp.rename(dest)
+    # os.replace, not Path.rename: on Windows rename refuses to overwrite, so a
+    # leftover archive from an interrupted extract made every later download
+    # raise FileExistsError and diarization silently stayed off.
+    os.replace(tmp, dest)
 
 
 def _ensure_models() -> tuple[Path, Path]:

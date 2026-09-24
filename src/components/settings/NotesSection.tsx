@@ -15,6 +15,7 @@ import {
   testLlmConnection,
 } from "../../lib/tauri";
 import { templateDisplayName, templateSlug } from "../../lib/templateNames";
+import { IS_MAC } from "../../lib/platform";
 
 const PROVIDER_LABEL: Record<string, string> = {
   groq: "Groq",
@@ -28,9 +29,6 @@ const PROVIDER_LABEL: Record<string, string> = {
 // the alias `qwen3.6-35b`; Windows uses the Ollama tag `qwen3.6:35b-a3b`. Pick
 // the right one so switching to "Local" sets a model the local server actually
 // has (otherwise the request 404s with "model … does not exist").
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /mac/i.test(navigator.platform || navigator.userAgent || "");
 const LOCAL_DEFAULT_MODEL = IS_MAC ? "qwen3.5-4b-4bit" : "qwen3.6:35b-a3b";
 
 // Default model for each provider, applied when the user switches engine so the

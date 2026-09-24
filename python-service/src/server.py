@@ -59,6 +59,7 @@ from .summarizer import (
     default_llm_backend,
 )
 from .transcriber import (
+    GreedyLiveTranscriber,
     MlxWhisperTranscriber,
     WhisperTranscriber,
     active_whisper_models,
@@ -94,7 +95,9 @@ logger = logging.getLogger(__name__)
 # Module-level singletons set during lifespan
 _transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
 # Dedicated fast model for the live-caption preview (see _build_live_transcriber).
-_live_transcriber: WhisperTranscriber | MlxWhisperTranscriber | None = None
+_live_transcriber: (
+    WhisperTranscriber | MlxWhisperTranscriber | GreedyLiveTranscriber | None
+) = None
 # English live-caption PREVIEW engine (Moonshine v2 via sherpa-onnx). Independent
 # of the Whisper resident + lock; `_PARTIAL_STATE` is what /health reports
 # while it is None: missing | loading | error.
@@ -146,11 +149,14 @@ def _warm_transcriber(t: object) -> None:
 
 def _build_live_transcriber(
     main: WhisperTranscriber | MlxWhisperTranscriber,
-) -> WhisperTranscriber | MlxWhisperTranscriber:
-    """A dedicated fast model for live captions. MLX only (Apple Silicon); on
-    other platforms — or if the small model can't be built — live falls back to
-    the main transcriber (previous behavior)."""
+) -> WhisperTranscriber | MlxWhisperTranscriber | GreedyLiveTranscriber:
+    """A fast transcriber for live captions. On Apple Silicon, a dedicated small
+    MLX model; on CTranslate2 (Windows), a greedy-decoding view of the loaded
+    model. If neither applies, live falls back to the main transcriber."""
     try:
+        if isinstance(main, WhisperTranscriber):
+            logger.info("Live captions use greedy decoding on %s.", main.model_size)
+            return GreedyLiveTranscriber(main)
         if isinstance(main, MlxWhisperTranscriber):
             # V3: never download uninvited — mlx-whisper fetches its repo on
             # first use, so only build the dedicated live model when its
@@ -1177,8 +1183,21 @@ async def shutdown() -> dict[str, str]:
     """Gracefully stop the service. Used by the desktop app when it exits so the
     bundled sidecar process doesn't linger. Replies first, then signals itself."""
     logger.info("Shutdown requested.")
-    threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+    threading.Timer(0.2, _request_graceful_exit).start()
     return {"status": "shutting down"}
+
+
+def _request_graceful_exit() -> None:
+    """Deliver SIGINT to this process so uvicorn runs its lifespan teardown.
+
+    On Windows `os.kill(pid, SIGINT)` is TerminateProcess (exit code 2, no
+    teardown), so raise the signal in-process instead: the C runtime invokes
+    the handler uvicorn installed, exactly as Ctrl+C would.
+    """
+    if sys.platform == "win32":
+        signal.raise_signal(signal.SIGINT)
+    else:
+        os.kill(os.getpid(), signal.SIGINT)
 
 
 def main() -> None:

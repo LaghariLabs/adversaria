@@ -188,3 +188,74 @@ class TestTranscribeResponseTurns:
         assert result.turns == []
         # Restore the original mock
         transcriber.model.transcribe.return_value = ([_fake_segment], _fake_info)
+
+
+class TestGreedyLiveTranscriber:
+    """Live captions on CTranslate2 (Windows) decode greedily on the shared model."""
+
+    def test_live_view_decodes_with_beam_one_and_restores(
+        self, transcriber: WhisperTranscriber, silent_audio_path: str
+    ) -> None:
+        from src.transcriber import GreedyLiveTranscriber
+
+        seen: list[int] = []
+        original = transcriber._collect_segments
+
+        def spy(path: str):
+            seen.append(transcriber.beam_size)
+            return original(path)
+
+        transcriber._collect_segments = spy  # type: ignore[method-assign]
+        live = GreedyLiveTranscriber(transcriber)
+        live.transcribe(silent_audio_path)
+        assert 1 in seen
+        # The meeting transcript keeps the full beam afterwards.
+        assert transcriber.beam_size == 5
+        assert live.model_size == transcriber.model_size
+
+    def test_live_view_restores_beam_after_a_failure(
+        self, transcriber: WhisperTranscriber
+    ) -> None:
+        from src.transcriber import GreedyLiveTranscriber
+
+        def boom(path: str):
+            raise RuntimeError("decode failed")
+
+        transcriber.transcribe = boom  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            GreedyLiveTranscriber(transcriber).transcribe("x.wav")
+        assert transcriber.beam_size == 5
+
+
+class TestSystemCudaDllDirs:
+    """NVIDIA's own installers: CUDA toolkit and standalone cuDNN on Windows."""
+
+    def test_finds_toolkit_and_versioned_cudnn_folder(self, tmp_path: Path) -> None:
+        from src.transcriber import _system_cuda_dll_dirs
+
+        toolkit = tmp_path / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        (toolkit / "v12.4" / "bin").mkdir(parents=True)
+        (toolkit / "v12.8" / "bin").mkdir(parents=True)
+        cudnn = tmp_path / "NVIDIA" / "CUDNN" / "v9.5" / "bin" / "12.6"
+        cudnn.mkdir(parents=True)
+        (cudnn / "cudnn64_9.dll").write_bytes(b"")
+
+        dirs = _system_cuda_dll_dirs(tmp_path, None)
+        assert dirs == [toolkit / "v12.8" / "bin", cudnn]
+
+    def test_cuda_path_wins_and_flat_cudnn_bin_is_accepted(self, tmp_path: Path) -> None:
+        from src.transcriber import _system_cuda_dll_dirs
+
+        custom = tmp_path / "custom-cuda"
+        (custom / "bin").mkdir(parents=True)
+        (tmp_path / "NVIDIA GPU Computing Toolkit" / "CUDA" / "v12.8" / "bin").mkdir(parents=True)
+        flat = tmp_path / "NVIDIA" / "CUDNN" / "v9.1" / "bin"
+        flat.mkdir(parents=True)
+        (flat / "cudnn_ops64_9.dll").write_bytes(b"")
+
+        assert _system_cuda_dll_dirs(tmp_path, str(custom)) == [custom / "bin", flat]
+
+    def test_nothing_installed_means_nothing_added(self, tmp_path: Path) -> None:
+        from src.transcriber import _system_cuda_dll_dirs
+
+        assert _system_cuda_dll_dirs(tmp_path, str(tmp_path / "missing")) == []
