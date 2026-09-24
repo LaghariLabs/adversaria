@@ -50,6 +50,8 @@ def _fake_summarize(
     auto_template: bool = False,
     viewer_label: str | None = None,
     meeting_date: str | None = None,
+    prior_meetings: list[PriorMeeting] | None = None,
+    accepted_live_items=None,
 ) -> MagicMock:
     """Mock summarize that validates input like the real one."""
     if not transcript.strip():
@@ -67,6 +69,7 @@ _fake_summarizer_instance.summarize.side_effect = _fake_summarize
 
 # Use real TemplateInfo-like objects for list_templates
 from src.models import (  # noqa: E402 — must be after module mocks
+    PriorMeeting,
     TemplateInfo,
     TranscriptTurn,
     TranscribeResponse,
@@ -117,7 +120,10 @@ _fake_whisper_segment.text = "hello world"
 _fake_whisper_info = MagicMock()
 _fake_whisper_info.language = "en"
 _fake_whisper_info.duration = 10.5
-_fake_whisper_model.transcribe.return_value = ([_fake_whisper_segment], _fake_whisper_info)
+_fake_whisper_model.transcribe.return_value = (
+    [_fake_whisper_segment],
+    _fake_whisper_info,
+)
 _fake_whisper_mod.WhisperModel.return_value = _fake_whisper_model
 sys.modules["faster_whisper"] = _fake_whisper_mod
 _fake_ollama_mod = MagicMock()
@@ -137,6 +143,15 @@ with (
 _server_mod._transcriber = _fake_transcriber_instance
 _server_mod._live_transcriber = _fake_transcriber_instance
 _server_mod._summarizer = _fake_summarizer_instance
+from src.summarizer import OllamaSummarizer  # noqa: E402
+
+_fake_summarizer_instance.host = "http://127.0.0.1:11434"
+_fake_summarizer_instance.model = "qwen3.6-27b"
+_fake_summarizer_instance.api_key = None
+_fake_summarizer_instance.base_url = "http://127.0.0.1:11434/v1"
+_fake_summarizer_instance.copilot_warm = OllamaSummarizer.copilot_warm.__get__(
+    _fake_summarizer_instance, OllamaSummarizer
+)
 
 client = TestClient(app)
 
@@ -203,7 +218,9 @@ class TestHealthEndpoint:
         else:
             response.json.return_value = payload
             response.raise_for_status.return_value = None
-            monkeypatch.setattr(_server_mod.httpx, "get", MagicMock(return_value=response))
+            monkeypatch.setattr(
+                _server_mod.httpx, "get", MagicMock(return_value=response)
+            )
         try:
             result = client.get("/health")
             assert result.status_code == 200
@@ -317,7 +334,9 @@ class TestTranscribeEndpoint:
             data = response.json()
             assert data["text"] == "Hamza: hello from the microphone"
             assert [turn["speaker"] for turn in data["turns"]] == ["Hamza"]
-            _fake_transcriber_instance.transcribe.assert_called_once_with("/tmp/mic.wav")
+            _fake_transcriber_instance.transcribe.assert_called_once_with(
+                "/tmp/mic.wav"
+            )
             _fake_transcriber_instance.transcribe_dual.assert_not_called()
         finally:
             _fake_transcriber_instance.transcribe.return_value = previous
@@ -410,6 +429,22 @@ class TestSummarizeEndpoint:
                 "transcript": "Them: pricing talk.",
                 "template_name": "general",
                 "user_notes": "- pricing pushback",
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_summarize_accepts_prior_meetings(self) -> None:
+        resp = client.post(
+            "/summarize",
+            json={
+                "transcript": "Them: pricing talk.",
+                "template_name": "general",
+                "prior_meetings": [
+                    {
+                        "title": "X",
+                        "open_items": ["a"],
+                    }
+                ],
             },
         )
         assert resp.status_code == 200
@@ -730,7 +765,13 @@ class TestEventLoopResponsiveness:
         def slow_dual(*args, **kwargs):
             started.set()
             assert release.wait(timeout=10), "test released too late"
-            return MagicMock(text="done", language="en", duration_seconds=1.0, category_hint=None, turns=[])
+            return MagicMock(
+                text="done",
+                language="en",
+                duration_seconds=1.0,
+                category_hint=None,
+                turns=[],
+            )
 
         _fake_transcriber_instance.transcribe_dual.side_effect = slow_dual
         worker = th.Thread(
@@ -915,6 +956,9 @@ class TestLiveFeedSources:
         def pending_utterances(self):
             return [(0, 16000)], 16000  # one finished utterance every feed
 
+        def pending_utterance_events(self):
+            return [(0, 16000, "silence")], 16000
+
         def write_utterance_wav(self, start: int, end: int):
             return Path("/tmp/mnt_live_test_utt.wav")  # transcribe is mocked
 
@@ -952,6 +996,8 @@ class TestLiveFeedSources:
         # session's watermark (the pre-fix shared-singleton bug).
         assert them.json()["captions"] == ["Hello world transcript."]
         assert me.json()["captions"] == ["Hello world transcript."]
+        assert them.json()["caption_boundaries"] == ["silence"]
+        assert me.json()["caption_boundaries"] == ["silence"]
         # One session object per source for the same recording epoch.
         assert set(_server_mod._live_sessions) == {"them", "me"}
         assert _server_mod._live_sessions["them"].ingested == [(1, "/tmp/sys.wav")]
@@ -1219,3 +1265,117 @@ class TestModelDownloadReset:
 
         assert response.status_code == 200
         reset.assert_called_once_with("qwen-4b-light", force=True)
+
+
+class TestCopilotWarm:
+    """Tests for POST /copilot/warm."""
+
+    def test_copilot_warm_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_client = MagicMock()
+        fake_client.chat.return_value = {"message": {"content": "pong"}}
+        monkeypatch.setattr(
+            "src.summarizer.Client", MagicMock(return_value=fake_client)
+        )
+
+        response = client.post(
+            "/copilot/warm",
+            json={"model": "qwen3.6-27b", "llm_base_url": "http://127.0.0.1:11434"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["ms"] >= 0
+        assert data["detail"] is None
+        kwargs = fake_client.chat.call_args.kwargs
+        assert kwargs["options"]["keep_alive"] == "30m"
+        assert kwargs["options"]["num_predict"] == 1
+        assert kwargs["messages"] == [{"role": "user", "content": "ping"}]
+
+    def test_copilot_warm_backend_down(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_client = MagicMock()
+        fake_client.chat.side_effect = ConnectionRefusedError(
+            "Ollama daemon is not running"
+        )
+        monkeypatch.setattr(
+            "src.summarizer.Client", MagicMock(return_value=fake_client)
+        )
+
+        response = client.post(
+            "/copilot/warm",
+            json={"model": "qwen3.6-27b", "llm_base_url": "http://127.0.0.1:11434"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is False
+        assert "Ollama daemon is not running" in data["detail"]
+
+    def test_copilot_warm_never_carries_cloud_credentials(self) -> None:
+        # Non-loopback endpoint rejected
+        resp1 = client.post(
+            "/copilot/warm",
+            json={"model": "gpt-4", "llm_base_url": "https://api.openai.com/v1"},
+        )
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["ok"] is False
+        assert "not a registered loopback endpoint" in data1["detail"]
+
+        # Cloud credentials rejected
+        resp2 = client.post(
+            "/copilot/warm",
+            json={
+                "model": "gpt-4",
+                "llm_base_url": "http://127.0.0.1:11434",
+                "llm_api_key": "sk-secret-cloud-key",
+            },
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["ok"] is False
+        assert (
+            "local credentials are only valid for the registered managed engine"
+            in data2["detail"]
+        )
+
+
+class TestGracefulExit:
+    """/shutdown must let uvicorn tear down on every platform."""
+
+    def test_windows_raises_sigint_in_process(self, monkeypatch):
+        import signal
+
+        import src.server as server
+
+        calls: list[str] = []
+        monkeypatch.setattr(server.sys, "platform", "win32")
+        monkeypatch.setattr(server.signal, "raise_signal", lambda sig: calls.append(f"raise:{sig}"))
+        monkeypatch.setattr(server.os, "kill", lambda pid, sig: calls.append(f"kill:{sig}"))
+        server._request_graceful_exit()
+        # os.kill(pid, SIGINT) is TerminateProcess on Windows: no teardown.
+        assert calls == [f"raise:{signal.SIGINT}"]
+
+    def test_posix_signals_the_process(self, monkeypatch):
+        import signal
+
+        import src.server as server
+
+        calls: list[str] = []
+        monkeypatch.setattr(server.sys, "platform", "darwin")
+        monkeypatch.setattr(server.signal, "raise_signal", lambda sig: calls.append(f"raise:{sig}"))
+        monkeypatch.setattr(server.os, "kill", lambda pid, sig: calls.append(f"kill:{sig}"))
+        server._request_graceful_exit()
+        assert calls == [f"kill:{signal.SIGINT}"]
+
+
+class TestLiveTranscriberChoice:
+    def test_ctranslate2_live_captions_use_the_greedy_view(self):
+        import src.server as server
+
+        # Through the server module: test_transcriber reloads src.transcriber,
+        # so its class objects can differ from the ones the server imported.
+        main = server.WhisperTranscriber.__new__(server.WhisperTranscriber)
+        main.beam_size = 5
+        main.model_size = "large-v3-turbo"
+        live = server._build_live_transcriber(main)
+        assert isinstance(live, server.GreedyLiveTranscriber)
+        assert live.main is main

@@ -19,7 +19,12 @@ import numpy as np
 import faster_whisper.audio  # noqa: F401
 
 from src import live
-from src.live import LiveCaptionSession, completed_utterances, trim_repetition_loop
+from src.live import (
+    LiveCaptionSession,
+    completed_utterance_events,
+    completed_utterances,
+    trim_repetition_loop,
+)
 
 SR = 16000
 
@@ -35,7 +40,9 @@ class TestCompletedUtterances:
     def test_utterance_still_running_waits(self):
         # Only 0.5 s of trailing silence (< 2 s redemption) — still being spoken.
         speech = [{"start": 0, "end": 5 * SR}]
-        ready, mark = completed_utterances(speech, buffer_end=5 * SR + SR // 2, emitted_upto=0)
+        ready, mark = completed_utterances(
+            speech, buffer_end=5 * SR + SR // 2, emitted_upto=0
+        )
         assert ready == []
         assert mark == 0
 
@@ -57,9 +64,29 @@ class TestCompletedUtterances:
         assert ready2 == [(30 * SR, 33 * SR)]
         assert mark2 == 33 * SR
 
+    def test_boundaries_distinguish_forced_cut_from_real_silence(self):
+        forced, forced_mark = completed_utterance_events(
+            [{"start": 0, "end": 9 * SR}],
+            buffer_end=9 * SR,
+            emitted_upto=0,
+            max_utterance_s=8,
+        )
+        assert forced == [(0, 8 * SR, "forced")]
+        assert forced_mark == 8 * SR
+
+        finished, finished_mark = completed_utterance_events(
+            [{"start": 0, "end": 3 * SR}],
+            buffer_end=6 * SR,
+            emitted_upto=0,
+        )
+        assert finished == [(0, 3 * SR, "silence")]
+        assert finished_mark == 3 * SR
+
     def test_already_captioned_skipped(self):
         speech = [{"start": 0, "end": 3 * SR}]
-        ready, mark = completed_utterances(speech, buffer_end=6 * SR, emitted_upto=3 * SR)
+        ready, mark = completed_utterances(
+            speech, buffer_end=6 * SR, emitted_upto=3 * SR
+        )
         assert ready == []
         assert mark == 3 * SR
 
@@ -211,9 +238,7 @@ class TestMoonshinePartialEngine:
             provider="cpu",
         )
 
-    def test_decode_returns_stripped_text_and_caps_input(
-        self, tmp_path, monkeypatch
-    ):
+    def test_decode_returns_stripped_text_and_caps_input(self, tmp_path, monkeypatch):
         _, recognizer = self._fake_module(monkeypatch)
         stream = MagicMock()
         stream.result.text = "  hello wor "
@@ -321,7 +346,12 @@ class TestDropNoSpeechRawSegments:
 
         segs = [
             {"start": 0.0, "end": 1.0, "text": "Thank you.", "no_speech_prob": 0.92},
-            {"start": 1.0, "end": 3.0, "text": "The beta ships Friday.", "no_speech_prob": 0.05},
+            {
+                "start": 1.0,
+                "end": 3.0,
+                "text": "The beta ships Friday.",
+                "no_speech_prob": 0.05,
+            },
         ]
         kept = drop_no_speech_raw_segments(segs)
         assert [s["text"] for s in kept] == ["The beta ships Friday."]

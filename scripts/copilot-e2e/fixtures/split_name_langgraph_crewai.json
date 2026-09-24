@@ -1,0 +1,18 @@
+{
+  "name": "split_name_langgraph_crewai",
+  "note": "Guards card 399: 'Lang graph' split by transcription in an agent-framework comparison must identify LangGraph (and CrewAI), never the unfamiliar-name sentence.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "Why is Lang graph so popular compared to crew AI?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": ["Them: We are comparing frameworks for building AI agents."],
+    "passages": []
+  },
+  "expect": {
+    "say_must_match": ["\\bLangGraph\\b"],
+    "must_match": ["\\bCrewAI\\b|\\bcrew ?ai\\b"],
+    "must_not_match": ["not familiar"]
+  }
+}

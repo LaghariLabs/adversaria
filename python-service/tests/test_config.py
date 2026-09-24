@@ -152,9 +152,7 @@ class TestPackagedPromptSeeding:
     ) -> None:
         """Deleting claims the name too, so per-file seeding cannot bring a
         bundled template the user removed back on the next start."""
-        bundle = self._bundle(
-            tmp_path, {"general.md": "general", "youtube.md": "yt"}
-        )
+        bundle = self._bundle(tmp_path, {"general.md": "general", "youtube.md": "yt"})
         data_dir = tmp_path / "appdata"
         installed = data_dir / "prompts"
         installed.mkdir(parents=True)
@@ -230,7 +228,9 @@ class TestPackagedDataDir:
 
         resolved = config._packaged_data_dir()
 
-        assert resolved == Path(r"C:\Users\hamza\AppData\Roaming") / "meeting-note-taker"
+        assert (
+            resolved == Path(r"C:\Users\hamza\AppData\Roaming") / "meeting-note-taker"
+        )
         assert "Library" not in str(resolved), "the macOS path must not leak to Windows"
 
     def test_windows_without_appdata_falls_back_to_roaming(
@@ -245,18 +245,25 @@ class TestPackagedDataDir:
 
         assert resolved.parts[-3:] == ("AppData", "Roaming", "meeting-note-taker")
 
-    def test_macos_uses_application_support(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_macos_uses_application_support(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """macOS keeps ~/Library/Application Support — unchanged behaviour."""
         monkeypatch.delenv("ADVERSARIA_DATA_DIR", raising=False)
         monkeypatch.setattr(sys, "platform", "darwin")
 
         resolved = config._packaged_data_dir()
 
-        assert resolved.parts[-4:] == (
-            "Library",
-            "Application Support",
-            "meeting-note-taker",
-        ) or resolved == Path.home() / "Library" / "Application Support" / "meeting-note-taker"
+        assert (
+            resolved.parts[-4:]
+            == (
+                "Library",
+                "Application Support",
+                "meeting-note-taker",
+            )
+            or resolved
+            == Path.home() / "Library" / "Application Support" / "meeting-note-taker"
+        )
 
     def test_env_override_wins_on_every_platform(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

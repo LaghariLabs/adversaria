@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { COPY } from "../lib/platform";
 import {
   openPrivacySettings,
   PERMISSION_ERROR_PREFIX,
@@ -50,7 +51,7 @@ export function ErrorBanner({ message, onDismiss }: ErrorBannerProps) {
               }}
               className="text-xs font-medium px-2 py-1 rounded bg-red-700 text-white hover:bg-red-800 transition-colors"
             >
-              Open System Settings
+              Open {COPY.systemSettings}
             </button>
             <button
               disabled={checking}
@@ -63,7 +64,7 @@ export function ErrorBanner({ message, onDismiss }: ErrorBannerProps) {
                       onDismiss();
                     } else {
                       setActionError(
-                        "The check still couldn't hear system audio. Unmute your Mac or enable Adversaria in System Settings, then check again.",
+                        `The check still couldn't hear system audio. Unmute your ${COPY.device} or enable Adversaria in ${COPY.systemSettings}, then check again.`,
                       );
                     }
                   })

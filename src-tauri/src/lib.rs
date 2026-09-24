@@ -9,27 +9,36 @@
 //! - `tray`         — system tray + global hotkeys (Task 9)
 //! - `commands`     — Tauri IPC command handlers (Task 10)
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub mod types;
 
 // Registered as tasks progress — uncomment each after implementation:
 pub mod addons;
+pub mod adversaria_doc;
 pub mod audio;
 pub mod autopilot;
 pub mod calendar;
 pub mod commands;
 pub mod config;
 pub mod context_index;
+pub mod copilot;
+pub mod copilot_facts;
+pub mod copilot_keys;
+mod copilot_live;
+pub mod copilot_provenance;
+pub mod copilot_session;
 pub mod demo;
 pub mod detection;
 pub mod diagnostics;
 pub mod embeddings;
+pub mod folder_sources;
 pub mod http_client;
 pub mod llama_engine;
 pub mod local_output;
 pub mod meeting_reminders;
 pub mod ollama_engine;
+pub mod os_shell;
 pub mod permissions;
 pub mod project_overview;
 pub mod recap;
@@ -37,6 +46,7 @@ pub mod recording_spool;
 pub mod registration;
 pub mod reminders;
 pub mod second_brain;
+pub mod secrets;
 pub mod setup;
 pub mod stats;
 pub mod storage;
@@ -47,7 +57,25 @@ pub mod workspace_runs;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let files: Vec<String> = args
+                .into_iter()
+                .filter(|a| a.ends_with(".adversaria"))
+                .collect();
+            if !files.is_empty() {
+                let state = app.state::<commands::AppState>();
+                if state
+                    .frontend_ready
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = app.emit(
+                        "open-adversaria-file",
+                        serde_json::json!({ "paths": files }),
+                    );
+                } else if let Ok(mut pending) = state.pending_open_files.lock() {
+                    pending.extend(files);
+                }
+            }
             if let Some(window) = app.get_webview_window("main") {
                 match window.is_visible() {
                     Ok(false) => {
@@ -100,6 +128,16 @@ pub fn run() {
         })
         .manage(commands::AppState::new())
         .setup(|app| {
+            let cli_files: Vec<String> = std::env::args()
+                .skip(1)
+                .filter(|a| a.ends_with(".adversaria"))
+                .collect();
+            if !cli_files.is_empty() {
+                if let Ok(mut pending) = app.state::<commands::AppState>().pending_open_files.lock()
+                {
+                    pending.extend(cli_files);
+                }
+            }
             config::ensure_config_dir().expect("Failed to create config directory");
             if let Err(error) = diagnostics::init(app.handle()) {
                 eprintln!("[diagnostics] initialization failed: {error}");
@@ -270,6 +308,28 @@ pub fn run() {
                 });
             }
 
+            // `tauri dev` is launched as a bare executable on macOS, so it has
+            // no app bundle for Finder/Dock to reopen after the main window was
+            // closed. Keep the development build directly testable by restoring
+            // the configured main window when needed and bringing it forward.
+            #[cfg(debug_assertions)]
+            {
+                let window = if let Some(window) = app.get_webview_window("main") {
+                    window
+                } else {
+                    tauri::WebviewWindowBuilder::new(
+                        app,
+                        "main",
+                        tauri::WebviewUrl::App("index.html".into()),
+                    )
+                    .title("Adversaria")
+                    .inner_size(1024.0, 720.0)
+                    .build()?
+                };
+                window.show()?;
+                window.set_focus()?;
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -278,6 +338,13 @@ pub fn run() {
             commands::focus_main_window,
             commands::bubble_stop_recording,
             commands::bubble_start_drag,
+            commands::show_copilot_hud,
+            commands::hide_copilot_hud,
+            commands::toggle_copilot_hud,
+            commands::copilot_hud_start_drag,
+            commands::copilot_hud_save_position,
+            commands::copilot_hud_save_size,
+            commands::copilot_hud_is_open,
             commands::get_audio_level,
             commands::get_audio_levels,
             commands::set_recording_bubble_expanded,
@@ -300,6 +367,7 @@ pub fn run() {
             commands::clear_chat,
             commands::update_attendees,
             commands::update_meeting_tags,
+            commands::update_meeting_title,
             commands::update_meeting_notes,
             commands::update_meeting_summary,
             commands::create_note,
@@ -311,6 +379,9 @@ pub fn run() {
             commands::export_html,
             commands::export_meeting_bundle,
             commands::import_meeting_bundle,
+            commands::export_adversaria,
+            commands::import_adversaria,
+            commands::take_pending_open_files,
             commands::export_all_meetings,
             commands::export_redacted_diagnostics,
             commands::import_all_meetings,
@@ -387,6 +458,15 @@ pub fn run() {
             commands::list_folders,
             commands::rename_folder,
             commands::set_folder_instructions,
+            commands::get_folder_copilot_brief,
+            commands::set_folder_copilot_mode,
+            commands::list_folder_sources,
+            commands::add_folder_source,
+            commands::remove_folder_source,
+            commands::refresh_folder_profile,
+            commands::set_folder_copilot_fields,
+            commands::set_folder_profile,
+            commands::pick_folder_path,
             commands::set_folder_color,
             commands::delete_folder,
             commands::set_meeting_folder,
@@ -438,13 +518,83 @@ pub fn run() {
             commands::suggest_workspace_for_meeting,
             commands::get_project_overview,
             commands::related_meetings,
+            commands::copilot_set_live_context,
+            commands::copilot_ask_last,
+            commands::copilot_force_card,
+            commands::copilot_cancel,
+            commands::copilot_retry,
+            commands::copilot_set_mode,
+            commands::copilot_get_mode,
+            commands::copilot_folder_readiness,
+            commands::copilot_set_mic_questions,
+            commands::set_copilot_api_key,
+            commands::clear_copilot_api_key,
+            commands::has_copilot_api_key,
+            commands::set_deepseek_copilot_api_key,
+            commands::clear_deepseek_copilot_api_key,
+            commands::has_deepseek_copilot_api_key,
+            commands::get_copilot_receipt,
+            commands::copilot_cards_for_meeting,
+            commands::copilot_card_review,
+            commands::copilot_live_state,
+            commands::copilot_live_configure,
+            commands::copilot_live_review,
+            commands::set_folder_copilot_web,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // Kill the bundled sidecar when the app exits so it doesn't linger.
-            if let tauri::RunEvent::Exit = event {
-                commands::shutdown_sidecar(&app_handle.state::<commands::AppState>());
+            match event {
+                // Apple-only event: Finder "Open With" / double-click. Windows
+                // passes the file on the command line instead, which setup()
+                // and the single-instance callback above already handle. Left
+                // ungated, this arm stopped the app compiling on Windows.
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                tauri::RunEvent::Opened { urls } => {
+                    let paths: Vec<String> = urls
+                        .into_iter()
+                        .filter_map(|u| {
+                            if let Ok(p) = u.to_file_path() {
+                                let s = p.to_string_lossy().to_string();
+                                if s.ends_with(".adversaria") {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                let s = u.as_str().to_string();
+                                if s.ends_with(".adversaria") {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+                    if !paths.is_empty() {
+                        let state = app_handle.state::<commands::AppState>();
+                        if state
+                            .frontend_ready
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            let _ = app_handle.emit(
+                                "open-adversaria-file",
+                                serde_json::json!({ "paths": paths }),
+                            );
+                        } else if let Ok(mut pending) = state.pending_open_files.lock() {
+                            pending.extend(paths);
+                        }
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    // Kill the bundled sidecar when the app exits so it doesn't linger.
+                    commands::shutdown_sidecar(&app_handle.state::<commands::AppState>());
+                }
+                _ => {}
             }
         });
 }

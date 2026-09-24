@@ -3,6 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
+import { COPY } from "../lib/platform";
 import { PERMISSION_ERROR_PREFIX } from "../lib/tauri";
 import { ErrorBanner } from "./ErrorBanner";
 
@@ -26,7 +27,7 @@ describe("ErrorBanner permission recovery", () => {
     );
 
     expect(screen.getByText("Adversaria can't hear your Mac's system audio yet.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Open System Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Open ${COPY.systemSettings}` })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Check again" }));
 
     await waitFor(() => expect(dismiss).toHaveBeenCalledOnce());

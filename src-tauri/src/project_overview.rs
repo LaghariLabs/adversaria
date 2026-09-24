@@ -150,6 +150,7 @@ mod tests {
     fn meeting_with(id: i64, title: &str, summary: &str, attendees: Vec<&str>) -> Meeting {
         Meeting {
             id,
+            uid: String::new(),
             title: title.to_string(),
             recorded_at: "2026-08-20T10:00:00Z".to_string(),
             duration_seconds: 0.0,

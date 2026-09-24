@@ -1,0 +1,38 @@
+{
+  "name": "clarification_uses_latest_relevant_card",
+  "note": "Guards card 366: 'What do you mean?' must restate the most recent relevant card, not an older unrelated one.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What do you mean?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": [],
+    "recent_cards": [
+      {
+        "card_ref": "fixture:1",
+        "question": "What is Vortelquin?",
+        "say": "I'm not familiar with Vortelquin; which product do you mean?"
+      },
+      {
+        "card_ref": "fixture:2",
+        "question": "How would you check retrieval accuracy and response speed?",
+        "say": "I would compare retrieved documents with relevant examples and measure response time under load.",
+        "points": [
+          "Evaluate relevance against labelled examples.",
+          "Measure response time with concurrent requests."
+        ]
+      }
+    ]
+  },
+  "expect": {
+    "say_count": [1, 2],
+    "specific_count": [0, 0],
+    "say_must_match": [
+      "\\b(?:relevan\\w*|correct|accur\\w*|right)\\b",
+      "\\b(?:speed|time|fast|latency|long)\\b"
+    ],
+    "must_not_match": ["Vortelquin|not familiar"]
+  }
+}

@@ -91,6 +91,7 @@ fn seed_demo_meeting_on(conn: &Connection) -> anyhow::Result<bool> {
 fn demo_meeting() -> Meeting {
     Meeting {
         id: 0, // assigned by SQLite
+        uid: String::new(),
         title: DEMO_MEETING_TITLE.to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
         duration_seconds: 132.0,
@@ -123,6 +124,7 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE meetings (
                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 uid         TEXT    NOT NULL DEFAULT '',
                  title       TEXT    NOT NULL,
                  recorded_at TEXT    NOT NULL,
                  duration_seconds REAL NOT NULL DEFAULT 0,

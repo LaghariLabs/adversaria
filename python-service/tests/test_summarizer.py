@@ -20,10 +20,11 @@ sys.modules["ollama"] = _fake_ollama
 # Reload src.summarizer to pick up the mock (addresses ordering issues when
 # test_server.py also mocks ollama at the module level)
 import src.summarizer  # noqa: E402
+
 importlib.reload(src.summarizer)
 
 from src.summarizer import DRAFT_SYSTEM_PROMPT, OllamaSummarizer  # noqa: E402
-from src.models import SummarizeResponse, TemplateInfo  # noqa: E402
+from src.models import PriorMeeting, SummarizeResponse, TemplateInfo  # noqa: E402
 
 
 # Path to the real prompts directory for template-loading tests
@@ -40,7 +41,9 @@ def summarizer() -> OllamaSummarizer:
 def mock_chat_response() -> MagicMock:
     """Create a mock chat response from Ollama."""
     response = MagicMock()
-    response.__getitem__ = MagicMock(return_value={"content": "**Summary:** This is a test summary."})
+    response.__getitem__ = MagicMock(
+        return_value={"content": "**Summary:** This is a test summary."}
+    )
     return response
 
 
@@ -119,12 +122,12 @@ class TestListTemplates:
 class TestSummarize:
     """Tests for the summarize method."""
 
-    def test_summarize_returns_correct_type(
-        self, summarizer: OllamaSummarizer
-    ) -> None:
+    def test_summarize_returns_correct_type(self, summarizer: OllamaSummarizer) -> None:
         """Test summarize returns a SummarizeResponse."""
         mock_message = MagicMock()
-        mock_message.__getitem__ = MagicMock(return_value={"content": "This is a summary of the meeting."})
+        mock_message.__getitem__ = MagicMock(
+            return_value={"content": "This is a summary of the meeting."}
+        )
         summarizer.client.chat.return_value = mock_message
 
         result = summarizer.summarize(
@@ -163,9 +166,7 @@ class TestSummarize:
         with pytest.raises(ValueError):
             summarizer.summarize(transcript="   \n  \t  ", template_name="general")
 
-    def test_summarize_calls_ollama_chat(
-        self, summarizer: OllamaSummarizer
-    ) -> None:
+    def test_summarize_calls_ollama_chat(self, summarizer: OllamaSummarizer) -> None:
         """Test summarize calls the ollama client chat method."""
         summarizer.client.chat.reset_mock()
         mock_message = MagicMock()
@@ -262,7 +263,9 @@ class TestSummarize:
             ],
         }
         mock_message = MagicMock()
-        mock_message.__getitem__ = MagicMock(return_value={"content": json.dumps(notes)})
+        mock_message.__getitem__ = MagicMock(
+            return_value={"content": json.dumps(notes)}
+        )
         summarizer.client.chat.return_value = mock_message
 
         result = summarizer.summarize(
@@ -289,10 +292,14 @@ class TestSummarize:
             ],
         }
         mock_message = MagicMock()
-        mock_message.__getitem__ = MagicMock(return_value={"content": json.dumps(notes)})
+        mock_message.__getitem__ = MagicMock(
+            return_value={"content": json.dumps(notes)}
+        )
         summarizer.client.chat.return_value = mock_message
 
-        result = summarizer.summarize(transcript="Me: ship friday.", template_name="general")
+        result = summarizer.summarize(
+            transcript="Me: ship friday.", template_name="general"
+        )
         assert result.title == "Planning sync"
         assert "**Decisions Made**" in result.summary
         assert "Ship Friday" in result.summary
@@ -313,10 +320,14 @@ class TestSummarize:
             }
         }
         mock_message = MagicMock()
-        mock_message.__getitem__ = MagicMock(return_value={"content": json.dumps(notes)})
+        mock_message.__getitem__ = MagicMock(
+            return_value={"content": json.dumps(notes)}
+        )
         summarizer.client.chat.return_value = mock_message
 
-        result = summarizer.summarize(transcript="Me: ship friday.", template_name="general")
+        result = summarizer.summarize(
+            transcript="Me: ship friday.", template_name="general"
+        )
         assert result.title == "Planning sync"
         # 'Me' is a generic speaker label, not a real attendee → filtered out.
         assert "Me" not in result.attendees
@@ -405,9 +416,7 @@ class TestSummarize:
         # the only thing that ever states a date.
         assert "Today is" not in system_prompt
 
-    def test_summarize_uses_model_override(
-        self, summarizer: OllamaSummarizer
-    ) -> None:
+    def test_summarize_uses_model_override(self, summarizer: OllamaSummarizer) -> None:
         """Test the per-request model override is passed to ollama."""
         mock_message = MagicMock()
         mock_message.__getitem__ = MagicMock(return_value={"content": "{}"})
@@ -423,7 +432,9 @@ class TestSummarize:
     ) -> None:
         """Test summarize degrades to raw text if the model returns non-schema output."""
         mock_message = MagicMock()
-        mock_message.__getitem__ = MagicMock(return_value={"content": "not json at all"})
+        mock_message.__getitem__ = MagicMock(
+            return_value={"content": "not json at all"}
+        )
         summarizer.client.chat.return_value = mock_message
 
         result = summarizer.summarize(transcript="Me: hi.", template_name="general")
@@ -504,7 +515,10 @@ class TestUserNotesMerge:
                         {
                             "title": "Pricing sync",
                             "sections": [
-                                {"heading": "Overview", "bullets": ["Discussed pricing"]}
+                                {
+                                    "heading": "Overview",
+                                    "bullets": ["Discussed pricing"],
+                                }
                             ],
                         }
                     )
@@ -566,6 +580,453 @@ class TestAttachedContextPrompt:
         assert "ATTACHED CONTEXT" not in system_msg
 
 
+class TestPriorMeetingFollowup:
+    """Prior meeting open action items get a grounded follow-up check in the notes."""
+
+    def test_prior_meetings_appear_in_prompt(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        captured = {}
+
+        def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return {"message": {"content": '{"title": "T", "sections": []}'}}
+
+        summarizer.client.chat = MagicMock(side_effect=fake_chat)
+        summarizer.summarize(
+            "Them: we discussed the follow-up.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    date="2026-07-18",
+                    open_items=[
+                        "Jena: share the profile",
+                        "Hamza: send the deck",
+                    ],
+                )
+            ],
+        )
+
+        user_msg = captured["messages"][-1]["content"]
+        system_msg = captured["messages"][0]["content"]
+        assert "PRIOR MEETING FOLLOW-UP" in system_msg
+        assert "Follow-up from previous meeting" in system_msg
+        assert "<prior_open_items>" in user_msg
+        assert "Meeting: Council Meeting (2026-07-18)" in user_msg
+        assert "[P1] Jena: share the profile" in user_msg
+        assert "[P2] Hamza: send the deck" in user_msg
+
+    def test_no_prior_meetings_leaves_prompt_clean(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        captured = {}
+
+        def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return {"message": {"content": '{"title": "T", "sections": []}'}}
+
+        summarizer.client.chat = MagicMock(side_effect=fake_chat)
+        summarizer.summarize("Them: hello.")
+
+        user_msg = captured["messages"][-1]["content"]
+        system_msg = captured["messages"][0]["content"]
+        assert "<prior_open_items>" not in user_msg
+        assert "PRIOR MEETING FOLLOW-UP" not in system_msg
+
+    def test_missing_section_falls_back_to_still_open(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {"heading": "Overview", "bullets": ["Project status"]}
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: project is on track.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=[
+                        "Jena: share the profile",
+                        "Hamza: send the deck",
+                    ],
+                )
+            ],
+        )
+
+        assert "**Follow-up from Council Meeting**" in result.summary
+        assert "- Still open — Jena: share the profile" in result.summary
+        assert "- Still open — Hamza: send the deck" in result.summary
+        idx_p1 = result.summary.find("- Still open — Jena: share the profile")
+        idx_p2 = result.summary.find("- Still open — Hamza: send the deck")
+        assert 0 <= idx_p1 < idx_p2
+
+    def test_grounded_done_survives(self, summarizer: OllamaSummarizer) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        '[P1] Done — Jena: share the profile: "shared your profile with Shadyfah"'
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Jena: I already shared your profile with Shadyfah yesterday.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=["Jena: share the profile"],
+                )
+            ],
+        )
+
+        assert (
+            '- Done — Jena: share the profile: "shared your profile with Shadyfah"'
+            in result.summary
+        )
+
+    def test_unquoted_or_fabricated_done_is_downgraded(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        "[P1] Done — Jena: share the profile",
+                                        '[P2] Discussed — Hamza: send the deck: "we finalised the deck on Monday"',
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: we talked about other topics.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=[
+                        "Jena: share the profile",
+                        "Hamza: send the deck",
+                    ],
+                )
+            ],
+        )
+
+        assert "- Still open — Jena: share the profile" in result.summary
+        assert "- Still open — Hamza: send the deck" in result.summary
+        assert "Done" not in result.summary
+        assert "Discussed" not in result.summary
+
+    def test_out_of_order_and_missing_bullets_are_reconciled(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        '[P2] Discussed — Hamza: send the deck: "agreed on the deck"'
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Hamza: we agreed on the deck yesterday.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=[
+                        "Jena: share the profile",
+                        "Hamza: send the deck",
+                    ],
+                )
+            ],
+        )
+
+        assert "- Still open — Jena: share the profile" in result.summary
+        assert (
+            '- Discussed — Hamza: send the deck: "agreed on the deck"' in result.summary
+        )
+        idx_p1 = result.summary.find("- Still open — Jena: share the profile")
+        idx_p2 = result.summary.find(
+            '- Discussed — Hamza: send the deck: "agreed on the deck"'
+        )
+        assert 0 <= idx_p1 < idx_p2
+
+    def test_section_precedes_from_your_notes(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {"heading": "Overview", "bullets": ["General updates"]}
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: we talked about general updates.",
+            user_notes="ask about visa",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=["Jena: share the profile"],
+                )
+            ],
+        )
+
+        assert "**Follow-up from Council Meeting**" in result.summary
+        assert "**From Your Notes**" in result.summary
+        idx_followup = result.summary.find("**Follow-up from Council Meeting**")
+        idx_notes = result.summary.find("**From Your Notes**")
+        assert 0 <= idx_followup < idx_notes
+
+    def test_meeting_without_open_items_gets_honest_bullet(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {"heading": "Overview", "bullets": ["Everything clear"]}
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: quick sync.",
+            prior_meetings=[PriorMeeting(title="Tidy Sync", open_items=[])],
+        )
+
+        assert (
+            "- No open action items from Tidy Sync to follow up on." in result.summary
+        )
+
+    def test_heading_avoids_actionable_words(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {"heading": "Overview", "bullets": ["Task kickoff"]}
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: task kickoff today.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Task force kickoff",
+                    open_items=["Write the doc"],
+                )
+            ],
+        )
+
+        assert "**Follow-up from previous meetings**" in result.summary
+        assert "**Follow-up from Task force kickoff**" not in result.summary
+
+    def test_status_after_item_text_is_recognised(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        '[P1] Jena: share the profile — Done — "I shared your profile with Shadyfah"'
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Jena: I shared your profile with Shadyfah and the hiring managers for review.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=["Jena: share the profile"],
+                )
+            ],
+        )
+
+        assert (
+            '- Done — Jena: share the profile: "I shared your profile with Shadyfah"'
+            in result.summary
+        )
+
+    def test_elided_quote_is_grounded_per_fragment(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        transcript = (
+            "Jena: I shared your profile with Shadyfah, who also goes by "
+            "Sharif, and the hiring managers for review."
+        )
+        prior = [
+            PriorMeeting(
+                title="Council Meeting",
+                open_items=["Jena: share the profile"],
+            )
+        ]
+
+        # Grounded case: all fragments are in transcript
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        '[P1] Done — Jena: share the profile: "I shared your profile with Shadyfah... and the hiring managers for review."'
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+        result = summarizer.summarize(transcript, prior_meetings=prior)
+        assert (
+            '- Done — Jena: share the profile: "I shared your profile with Shadyfah... and the hiring managers for review."'
+            in result.summary
+        )
+
+        # Ungrounded case: second fragment is fabricated
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        '[P1] Done — Jena: share the profile: "I shared your profile with Shadyfah...and the whole board approved it"'
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+        result_bad = summarizer.summarize(transcript, prior_meetings=prior)
+        assert "- Still open — Jena: share the profile" in result_bad.summary
+        assert "Done" not in result_bad.summary
+
+    def test_item_text_containing_open_is_not_misread(
+        self, summarizer: OllamaSummarizer
+    ) -> None:
+        summarizer.client.chat = MagicMock(
+            return_value={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "title": "Weekly Sync",
+                            "sections": [
+                                {
+                                    "heading": "Follow-up from previous meeting",
+                                    "bullets": [
+                                        "[P1] Still open — Book an open slot with Shadyfah"
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        )
+
+        result = summarizer.summarize(
+            "Them: we did not get to scheduling.",
+            prior_meetings=[
+                PriorMeeting(
+                    title="Council Meeting",
+                    open_items=["Book an open slot with Shadyfah"],
+                )
+            ],
+        )
+
+        assert "- Still open — Book an open slot with Shadyfah" in result.summary
+        assert "Done" not in result.summary
+
+
 class TestChat:
     """Tests for the grounded chat method."""
 
@@ -608,9 +1069,7 @@ class TestChat:
 
     def test_chat_empty_answer_raises(self, summarizer: OllamaSummarizer) -> None:
         """An empty (or think-only) model answer must surface as a RuntimeError."""
-        summarizer.client.chat = MagicMock(
-            return_value={"message": {"content": ""}}
-        )
+        summarizer.client.chat = MagicMock(return_value={"message": {"content": ""}})
         with pytest.raises(RuntimeError, match="empty answer"):
             summarizer.chat("Them: hello.", "What was said?")
 
@@ -631,7 +1090,10 @@ class TestOpenAIBackend:
 
         class FakeResp:
             status_code = 200
-            def raise_for_status(self): pass
+
+            def raise_for_status(self):
+                pass
+
             def json(self):
                 return {"choices": [{"message": {"content": "Budget is 50k."}}]}
 
@@ -654,9 +1116,16 @@ class TestOpenAIBackend:
 
         class FakeResp:
             status_code = 200
-            def raise_for_status(self): pass
+
+            def raise_for_status(self):
+                pass
+
             def json(self):
-                return {"choices": [{"message": {"content": '{"title": "T", "sections": []}'}}]}
+                return {
+                    "choices": [
+                        {"message": {"content": '{"title": "T", "sections": []}'}}
+                    ]
+                }
 
         def fake_post(url, json=None, headers=None, timeout=None):
             captured["body"] = json
@@ -689,7 +1158,14 @@ class TestThinkStripping:
         from src.summarizer import _strip_think_stream
 
         # the think block is split across several deltas, then the answer streams
-        deltas = ["<thi", "nk>\nlet me reason", " about it</thi", "nk>\nThe ", "answer", "."]
+        deltas = [
+            "<thi",
+            "nk>\nlet me reason",
+            " about it</thi",
+            "nk>\nThe ",
+            "answer",
+            ".",
+        ]
         assert "".join(_strip_think_stream(deltas)) == "The answer."
 
     def test_strip_think_stream_passes_through_when_no_block(self) -> None:
@@ -938,7 +1414,9 @@ class TestOpenAIJsonSchemaFallback:
         smod._NO_CHAT_TEMPLATE_KWARGS.clear()
 
         def fake_post(url, json=None, headers=None, timeout=None):
-            r = self._resp(400, text='{"error":{"message":"model `bogus` does not exist"}}')
+            r = self._resp(
+                400, text='{"error":{"message":"model `bogus` does not exist"}}'
+            )
             r.raise_for_status = MagicMock(
                 side_effect=httpx.HTTPStatusError("400", request=None, response=None)
             )
@@ -1122,14 +1600,18 @@ class TestSummarizeAutoTemplate:
         return OllamaSummarizer(model="llama3.1:8b")
 
     def _valid_json_reply(self) -> str:
-        return json.dumps({
-            "title": "Test",
-            "category": "meeting",
-            "attendees": [],
-            "sections": [{"heading": "Notes", "bullets": ["Point 1"]}],
-        })
+        return json.dumps(
+            {
+                "title": "Test",
+                "category": "meeting",
+                "attendees": [],
+                "sections": [{"heading": "Notes", "bullets": ["Point 1"]}],
+            }
+        )
 
-    def test_hint_routes_to_youtube_without_classify_call(self, s: OllamaSummarizer) -> None:
+    def test_hint_routes_to_youtube_without_classify_call(
+        self, s: OllamaSummarizer
+    ) -> None:
         """category_hint="youtube" routes without calling the classify LLM."""
         s._chat = MagicMock(return_value=self._valid_json_reply())
         result = s.summarize(
@@ -1147,8 +1629,8 @@ class TestSummarizeAutoTemplate:
         """No hint; classify LLM returns 'interview' → template_used == 'interview'."""
         s._chat = MagicMock()
         s._chat.side_effect = [
-            "interview",                # _classify_category_llm
-            self._valid_json_reply(),   # main summarize
+            "interview",  # _classify_category_llm
+            self._valid_json_reply(),  # main summarize
         ]
         result = s.summarize(
             transcript="Them: tell me about your experience with Python.",
@@ -1162,8 +1644,8 @@ class TestSummarizeAutoTemplate:
         """Classify LLM raises → falls back to heuristic (brainstorm here)."""
         s._chat = MagicMock()
         s._chat.side_effect = [
-            RuntimeError("LLM down"),   # _classify_category_llm raises
-            self._valid_json_reply(),   # main summarize
+            RuntimeError("LLM down"),  # _classify_category_llm raises
+            self._valid_json_reply(),  # main summarize
         ]
         # A mostly-Me transcript triggers heuristic → brainstorm.
         brainstorm_transcript = "\n".join(["Me: " + f"idea {i}" for i in range(20)])
@@ -1206,8 +1688,8 @@ class TestSummarizeAutoTemplate:
         """Template file missing → fail-open, template stays general."""
         s._chat = MagicMock()
         s._chat.side_effect = [
-            "interview",                # _classify_category_llm
-            self._valid_json_reply(),   # main summarize
+            "interview",  # _classify_category_llm
+            self._valid_json_reply(),  # main summarize
         ]
         # Monkeypatch _load_template to fail for "interview" only.
         original_load = s._load_template
@@ -1316,14 +1798,18 @@ class TestSummarizeViewerLabel:
         return OllamaSummarizer(model="llama3.1:8b")
 
     def _valid_json_reply(self) -> str:
-        return json.dumps({
-            "title": "Test",
-            "category": "youtube",
-            "attendees": [],
-            "sections": [{"heading": "Notes", "bullets": ["Point 1"]}],
-        })
+        return json.dumps(
+            {
+                "title": "Test",
+                "category": "youtube",
+                "attendees": [],
+                "sections": [{"heading": "Notes", "bullets": ["Point 1"]}],
+            }
+        )
 
-    def test_youtube_template_neutralizes_viewer_label(self, s: OllamaSummarizer) -> None:
+    def test_youtube_template_neutralizes_viewer_label(
+        self, s: OllamaSummarizer
+    ) -> None:
         """When template_name='youtube' and viewer_label='Hamza', the transcript
         passed to the LLM has 'Hamza:' replaced with 'Viewer mic (not the presenter):'."""
         s._chat = MagicMock(return_value=self._valid_json_reply())
@@ -1577,7 +2063,9 @@ class TestGenerateTemplate:
         s, _ = self._summarizer(monkeypatch, "```markdown\n# Template\nBody.\n```")
         assert s.generate_template(description="anything") == "# Template\nBody."
 
-    def test_empty_description_is_rejected_before_calling_the_model(self, monkeypatch) -> None:
+    def test_empty_description_is_rejected_before_calling_the_model(
+        self, monkeypatch
+    ) -> None:
         s, captured = self._summarizer(monkeypatch, "unused")
         with pytest.raises(ValueError):
             s.generate_template(description="   ")
@@ -1596,4 +2084,7 @@ class TestGenerateTemplate:
         makes the saved template look broken to the person reading it.
         """
         s, _ = self._summarizer(monkeypatch, "---\nYou are an expert note taker.\n---")
-        assert s.generate_template(description="1:1 notes") == "You are an expert note taker."
+        assert (
+            s.generate_template(description="1:1 notes")
+            == "You are an expert note taker."
+        )

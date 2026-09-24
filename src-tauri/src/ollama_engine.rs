@@ -660,7 +660,7 @@ pub fn install_plan(app: &AppHandle, memory_gb: u64, disk_gb: u64) -> OllamaInst
 }
 
 fn binary_version(path: &Path) -> Option<String> {
-    let output = std::process::Command::new(path)
+    let output = crate::os_shell::hide_console(&mut std::process::Command::new(path))
         .arg("--version")
         .output()
         .ok()?;

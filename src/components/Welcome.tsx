@@ -30,6 +30,7 @@ import type { CapturePermissions } from "../lib/tauri";
 import { beginModelDownload, whisperModelId } from "../lib/modelDownloads";
 import { useTranscriptionSetup } from "../hooks/useTranscriptionSetup";
 import type { TranscriptionSetup } from "../hooks/useTranscriptionSetup";
+import { IS_WINDOWS } from "../lib/platform";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const STEP_ORDER = ["registration", "permissions", "ready"] as const;
@@ -596,7 +597,7 @@ export function Welcome({ onOpenModelSettings, transcriptionSetup }: WelcomeProp
                 {remoteVerified
                   ? " handles it, so there's nothing to download here."
                   : " — nothing downloads here. Adversaria hasn't reached that address" +
-                    " yet; if it doesn't answer, fix it in Settings › AI Model."}
+                    " yet; if it doesn't answer, fix it in Settings › Transcription."}
               </p>
             ) : transcriptionReady === true ? (
               <p className="welcome-ready-line" role="status">
@@ -778,7 +779,7 @@ function TranscriptionDownloadCard({
       if (status?.state === "ready") {
         setStartNote(
           `${selected.label} is already on this ${deviceLabel}, so there is nothing to re-download. ` +
-            "Pick a different model here, or remove and re-download this one in Settings › AI Model.",
+            "Pick a different model here, or remove and re-download this one in Settings › Transcription.",
         );
       }
     } catch (error) {
@@ -838,7 +839,7 @@ function TranscriptionDownloadCard({
           setUnreachableAck(url);
           setEndpointError(
             `Couldn't reach that server: ${String(error)} — check the address, or press ` +
-              '"Use this server" again to save it anyway and fix it later in Settings › AI Model.',
+              '"Use this server" again to save it anyway and fix it later in Settings › Transcription.',
           );
           return;
         }
@@ -921,7 +922,10 @@ function TranscriptionDownloadCard({
           {models.length === 0 ? (
             <p className="welcome-guide-copy">
               {catalogueOffline
-                ? "The on-device service isn't responding, so the model list can't load. Recording still works — you can set this up later in Settings › AI Model."
+                ? "The on-device service isn't responding, so the model list can't load. Recording still works — you can set this up later in Settings › Transcription." +
+                  (IS_WINDOWS
+                    ? " If Adversaria was just installed, Windows Security may have quarantined its service — check Protection history and allow adversaria-service.exe."
+                    : "")
                 : "The list of models isn't available yet — it appears once the on-device service is running."}
             </p>
           ) : (

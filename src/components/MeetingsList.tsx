@@ -26,6 +26,7 @@ import { TAG_COLORS } from "../lib/tags";
 import { suggestFolderForMeeting, updateMeetingTags } from "../lib/tauri";
 import { cleanMeetingTitle } from "../lib/summary";
 import { DateHeatmap } from "./DateHeatmap";
+import { COPY } from "../lib/platform";
 
 function isGenericParticipant(name: string): boolean {
   const lower = name.trim().toLowerCase();
@@ -1574,7 +1575,7 @@ export function MeetingsList({
                   >
                     <p style={{ fontWeight: 500, marginBottom: 4 }}>No meetings yet</p>
                     <p>
-                      Press Record or use {navigator.userAgent.includes("Mac") ? "⌘⇧M" : "Ctrl+Shift+M"} to start
+                      Press Record or use {COPY.recordShortcut} to start
                     </p>
                   </div>
                 );

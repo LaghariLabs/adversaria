@@ -1,0 +1,19 @@
+{
+  "name": "greeting_no_invented_meeting",
+  "note": "Guards card 361: a vague greeting must get a short clarification, never an invented meeting agenda.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "Hey, what's happening?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": []
+  },
+  "expect": {
+    "say_count": [1, 1],
+    "specific_count": [0, 0],
+    "say_must_match": ["\\b(?:clarify|which|what|unclear|sure)\\b"],
+    "must_not_match": ["Q3|marketing metrics|budget allocation|campaign launch"]
+  }
+}

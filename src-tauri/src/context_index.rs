@@ -531,23 +531,37 @@ pub async fn search(
         return Vec::new();
     }
 
-    let vault_fts = if vault_enabled {
-        crate::storage::search_context_doc_ids(text, Some("vault"), 10).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let project_fts = if projects_enabled {
-        crate::storage::search_context_doc_ids(text, Some("project"), 10).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let fts_text = text.to_string();
+    let (vault_fts, project_fts) = tokio::task::spawn_blocking(move || {
+        let vault = if vault_enabled {
+            crate::storage::search_context_doc_ids(&fts_text, Some("vault"), 10).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let projects = if projects_enabled {
+            crate::storage::search_context_doc_ids(&fts_text, Some("project"), 10)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (vault, projects)
+    })
+    .await
+    .unwrap_or_default();
     let input = [text.to_string()];
     let semantic =
         match tokio::time::timeout(std::time::Duration::from_secs(8), client.embed(&input)).await {
-            Ok(Ok((vectors, model))) if !vectors.is_empty() => best_cosine_per_doc(
-                &crate::storage::get_context_chunks_for_model(&model).unwrap_or_default(),
-                &vectors[0],
-            ),
+            Ok(Ok((vectors, model))) if !vectors.is_empty() => {
+                let query_vector = vectors[0].clone();
+                tokio::task::spawn_blocking(move || {
+                    best_cosine_per_doc(
+                        &crate::storage::get_context_chunks_for_model(&model).unwrap_or_default(),
+                        &query_vector,
+                    )
+                })
+                .await
+                .unwrap_or_default()
+            }
             Ok(Ok(_)) => Vec::new(),
             Ok(Err(error)) => {
                 eprintln!("[retrieval] embed skipped: {error}");
@@ -559,27 +573,27 @@ pub async fn search(
             }
         };
     let semantic_ids = semantic.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
-    let source_by_id = crate::storage::get_context_docs(&semantic_ids)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|doc| (doc.id, doc.source))
-        .collect::<HashMap<_, _>>();
+    let source_by_id = tokio::task::spawn_blocking(move || {
+        crate::storage::get_context_docs(&semantic_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|doc| (doc.id, doc.source))
+            .collect::<HashMap<_, _>>()
+    })
+    .await
+    .unwrap_or_default();
 
-    let mut hits = Vec::new();
-    if vault_enabled {
+    let vault_matches = if vault_enabled {
         let candidates = semantic
             .iter()
             .filter(|(id, _, _)| source_by_id.get(id).is_some_and(|source| source == "vault"))
             .cloned()
             .collect::<Vec<_>>();
-        hits.extend(materialize_hits(merge_context_matches(
-            &vault_fts,
-            &candidates,
-            min_cosine,
-            vault_limit,
-        )));
-    }
-    if projects_enabled {
+        merge_context_matches(&vault_fts, &candidates, min_cosine, vault_limit)
+    } else {
+        Vec::new()
+    };
+    let project_matches = if projects_enabled {
         let candidates = semantic
             .iter()
             .filter(|(id, _, _)| {
@@ -589,14 +603,18 @@ pub async fn search(
             })
             .cloned()
             .collect::<Vec<_>>();
-        hits.extend(materialize_hits(merge_context_matches(
-            &project_fts,
-            &candidates,
-            min_cosine,
-            project_limit,
-        )));
-    }
-    hits
+        merge_context_matches(&project_fts, &candidates, min_cosine, project_limit)
+    } else {
+        Vec::new()
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut hits = materialize_hits(vault_matches);
+        hits.extend(materialize_hits(project_matches));
+        hits
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn upsert_collected(

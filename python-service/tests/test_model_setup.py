@@ -474,7 +474,9 @@ def test_force_reset_ready_profile_deletes_only_its_cached_weights(
         result = model_setup.reset_model_download(profile_id, force=True)
 
         assert not target_weight.exists()
-        assert target_config.exists(), "non-weight files are not part of the cached check"
+        assert target_config.exists(), (
+            "non-weight files are not part of the cached check"
+        )
         assert sibling_weight.exists(), "another profile's snapshot must survive"
         assert result["state"] == "pending"
         assert result["verified"] is False
@@ -535,11 +537,7 @@ def test_force_reset_non_ready_profile_matches_regular_reset(
 ) -> None:
     profile_id = "qwen-4b-light"
     pin = model_setup.MODEL_PINS[profile_id]
-    blobs = (
-        tmp_path
-        / f"models--{pin.repo_id.replace('/', '--')}"
-        / "blobs"
-    )
+    blobs = tmp_path / f"models--{pin.repo_id.replace('/', '--')}" / "blobs"
     blobs.mkdir(parents=True)
     incomplete = blobs / f"{'a' * 64}.incomplete"
     incomplete.write_bytes(b"partial")
@@ -571,7 +569,6 @@ def test_reset_unknown_profile_is_rejected() -> None:
         model_setup.reset_model_download("user-controlled-repository")
 
 
-
 def test_every_picker_model_has_a_download_pin(monkeypatch):
     """The Settings picker's Download button routes through the pinned
     pipeline — a registry entry without a pin 400s as an unknown profile
@@ -587,7 +584,6 @@ def test_every_picker_model_has_a_download_pin(monkeypatch):
             assert f"{model_setup.WHISPER_MODEL_PROFILE_PREFIX}{key}" in pins, (
                 f"picker model {key!r} (mlx={is_mlx}) has no download pin"
             )
-
 
 
 def test_manifest_accepts_onnx_weights():
@@ -613,8 +609,7 @@ def test_manifest_accepts_onnx_weights():
 def test_live_captions_pin_is_platform_neutral():
     pin = model_setup.MODEL_PINS["live-captions-en"]
     assert (
-        pin.repo_id
-        == "csukuangfj2/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"
+        pin.repo_id == "csukuangfj2/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"
     )
     assert pin.revision == "d1e6c30921780b8508d04b492dfb3ce8a51605d4"
     assert pin.allow_patterns is not None

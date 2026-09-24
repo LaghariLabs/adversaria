@@ -61,8 +61,11 @@ def test_transcribe_cloud_merges_channels(monkeypatch, tmp_path):
     monkeypatch.setattr(httpx, "post", fake_post)
 
     res = transcribe_cloud(
-        str(sys_wav), str(mic_wav),
-        "https://api.groq.com/openai/v1/", "gsk_test", "whisper-large-v3",
+        str(sys_wav),
+        str(mic_wav),
+        "https://api.groq.com/openai/v1/",
+        "gsk_test",
+        "whisper-large-v3",
     )
 
     # endpoint, model, and bearer auth are built correctly (trailing slash handled)
@@ -102,9 +105,7 @@ def test_write_wav_chunks_splits_under_limit(tmp_path):
         with wave.open(path, "rb") as w:
             assert w.getnchannels() == 1
             assert w.getframerate() == 16000
-            rebuilt.append(
-                np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-            )
+            rebuilt.append(np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16))
         # offset of chunk i = (samples before it) / rate
         expected_offset = sum(len(b) for b in rebuilt[:-1]) / 16000
         assert offset == pytest.approx(expected_offset)

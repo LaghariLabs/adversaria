@@ -120,5 +120,34 @@ pub fn setup_hotkeys<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // notes hide, 2026-07-18 — a global shortcut that steals focus with no
     // handler would be worse than none. Restore alongside NewNoteButton.
 
+    // Floating copilot HUD toggle: **Cmd+Shift+K** on macOS, **Ctrl+Shift+K**
+    // elsewhere. Same one-call pattern as above: on_shortcut registers the
+    // accelerator AND attaches the handler in one call. Do not call
+    // register() first: the OS rejects a same-process duplicate registration
+    // (macOS eventHotKeyExistsErr), so on_shortcut would fail and the handler
+    // would silently never be attached.
+    // The handler fires on both key-down and key-up; only act on the press.
+    #[cfg(target_os = "macos")]
+    let (hud_modifiers, hud_label) = (Modifiers::SUPER | Modifiers::SHIFT, "Cmd+Shift+K");
+    #[cfg(not(target_os = "macos"))]
+    let (hud_modifiers, hud_label) = (Modifiers::CONTROL | Modifiers::SHIFT, "Ctrl+Shift+K");
+
+    let hud_shortcut = Shortcut::new(Some(hud_modifiers), Code::KeyK);
+
+    let hud_handle = app.clone();
+    if let Err(e) =
+        app.global_shortcut()
+            .on_shortcut(hud_shortcut, move |_app, _shortcut, event| {
+                if event.state() == ShortcutState::Pressed {
+                    crate::commands::toggle_copilot_hud_window(&hud_handle);
+                }
+            })
+    {
+        eprintln!(
+            "[hotkey] Could not register {hud_label}. \
+             Use the tray menu to toggle the copilot HUD. ({e:?})"
+        );
+    }
+
     Ok(())
 }

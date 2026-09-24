@@ -9,6 +9,7 @@ downloaded once to a local cache and run fully offline (no HuggingFace gating).
 from __future__ import annotations
 
 import logging
+import os
 import tarfile
 import urllib.request
 from pathlib import Path
@@ -91,8 +92,7 @@ def merge_minor_speakers(
         )[2]
 
     return [
-        t if t[2] in majors else (t[0], t[1], nearest_major(t[0], t[1]))
-        for t in turns
+        t if t[2] in majors else (t[0], t[1], nearest_major(t[0], t[1])) for t in turns
     ]
 
 
@@ -165,9 +165,7 @@ def merge_similar_speakers(
                 ra, rb = find(a), find(b)
                 if ra != rb:
                     # Longest-speaking speaker of the pair wins the label.
-                    winner, loser = (
-                        (ra, rb) if totals[ra] >= totals[rb] else (rb, ra)
-                    )
+                    winner, loser = (ra, rb) if totals[ra] >= totals[rb] else (rb, ra)
                     parent[loser] = winner
     if all(find(s) == s for s in totals):
         return turns
@@ -232,7 +230,10 @@ def _download(url: str, dest: Path) -> None:
     tmp = dest.with_name(dest.name + ".part")
     logger.info("Downloading diarization model → %s", dest.name)
     urllib.request.urlretrieve(url, tmp)
-    tmp.rename(dest)
+    # os.replace, not Path.rename: on Windows rename refuses to overwrite, so a
+    # leftover archive from an interrupted extract made every later download
+    # raise FileExistsError and diarization silently stayed off.
+    os.replace(tmp, dest)
 
 
 def _ensure_models() -> tuple[Path, Path]:
@@ -296,7 +297,9 @@ def diarize(wav_path: str, voiced_starts: list[float] | None = None) -> list[Tur
 
     sd = _get_diarizer()
     audio = decode_audio(wav_path, sampling_rate=sd.sample_rate)  # 16k mono float32
-    turns = [(t.start, t.end, t.speaker) for t in sd.process(audio).sort_by_start_time()]
+    turns = [
+        (t.start, t.end, t.speaker) for t in sd.process(audio).sort_by_start_time()
+    ]
     if voiced_starts is not None:
         turns = drop_unvoiced_turns(turns, voiced_starts)
     turns = merge_minor_speakers(turns)

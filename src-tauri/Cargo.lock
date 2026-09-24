@@ -2830,7 +2830,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "meeting-note-taker"
-version = "0.3.83"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2870,7 +2870,9 @@ dependencies = [
  "tauri-plugin-wdio",
  "tauri-plugin-wdio-webdriver",
  "tokio",
+ "tokio-util",
  "url",
+ "uuid",
  "windows 0.58.0",
  "winreg 0.52.0",
 ]

@@ -69,9 +69,13 @@ def _seed_bundled_prompts(target: Path, bundled: Path) -> None:
             try:
                 backup.write_text(existing, encoding="utf-8")
             except OSError as exc:
-                logger.warning("Could not back up %s (%s) — leaving it alone.", name, exc)
+                logger.warning(
+                    "Could not back up %s (%s) — leaving it alone.", name, exc
+                )
                 continue
-            logger.info("Updating bundled template %s (previous copy → %s).", name, backup.name)
+            logger.info(
+                "Updating bundled template %s (previous copy → %s).", name, backup.name
+            )
         dest.write_text(current, encoding="utf-8")
 
 
@@ -132,7 +136,9 @@ def _resolve_prompts_dir() -> Path:
             except OSError as exc:
                 # The directory exists and is usable for reads; a failed refresh
                 # must not take the service down at import.
-                logger.error("Could not refresh bundled templates in %s: %s", target, exc)
+                logger.error(
+                    "Could not refresh bundled templates in %s: %s", target, exc
+                )
         return target
     return Path(__file__).parent.parent / "prompts"
 
@@ -145,9 +151,7 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}$")
 def _safe_name(name: str) -> str:
     """Validate a template name to a safe slug (prevents path traversal)."""
     if not _NAME_RE.match(name):
-        raise ValueError(
-            "Template name must be lowercase letters, digits, or hyphens."
-        )
+        raise ValueError("Template name must be lowercase letters, digits, or hyphens.")
     return name
 
 
@@ -180,9 +184,7 @@ def list_template_files() -> list[str]:
     Returns:
         Sorted list of template names.
     """
-    return sorted(
-        p.stem for p in PROMPTS_DIR.glob("*.md") if _NAME_RE.match(p.stem)
-    )
+    return sorted(p.stem for p in PROMPTS_DIR.glob("*.md") if _NAME_RE.match(p.stem))
 
 
 def save_prompt(name: str, content: str) -> None:

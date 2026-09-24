@@ -148,7 +148,9 @@ class TestProseEmbeddedJson:
 
     def test_brace_inside_a_string_does_not_close_the_object(self) -> None:
         raw = 'Notes: {"title": "Pricing {tiers} review", "sections": []} done'
-        assert json.loads(normalize_model_output(raw))["title"] == "Pricing {tiers} review"
+        assert (
+            json.loads(normalize_model_output(raw))["title"] == "Pricing {tiers} review"
+        )
 
     def test_prose_mentioning_braces_stays_prose(self) -> None:
         raw = "We agreed to use {placeholder} syntax in the docs."
@@ -281,7 +283,9 @@ class TestTruncationRetry:
 
     @staticmethod
     def _ollama() -> OllamaSummarizer:
-        s = OllamaSummarizer(model="muse-glimmer:30b-mlx", host="http://localhost:11434")
+        s = OllamaSummarizer(
+            model="muse-glimmer:30b-mlx", host="http://localhost:11434"
+        )
         s.client.chat.reset_mock()
         s.client.chat.side_effect = None
         return s
@@ -369,7 +373,10 @@ class TestTruncationRetry:
             def json(self) -> dict:
                 return {
                     "choices": [
-                        {"message": {"content": '{"title": "Q3 Pla'}, "finish_reason": "length"}
+                        {
+                            "message": {"content": '{"title": "Q3 Pla'},
+                            "finish_reason": "length",
+                        }
                     ]
                 }
 
@@ -390,9 +397,9 @@ class TestTruncationRetry:
     "reply",
     [
         LIVE_INCIDENT_REPLY,
-        '<think>reasoning</think>' + LIVE_INCIDENT_REPLY,
-        '```json\n' + LIVE_INCIDENT_REPLY,
-        'Here you go:\n' + LIVE_INCIDENT_REPLY,
+        "<think>reasoning</think>" + LIVE_INCIDENT_REPLY,
+        "```json\n" + LIVE_INCIDENT_REPLY,
+        "Here you go:\n" + LIVE_INCIDENT_REPLY,
     ],
 )
 def test_every_wrapper_around_the_truncated_incident_recovers(reply: str) -> None:
@@ -445,7 +452,14 @@ class TestAdaptiveNumCtx:
 
     def test_ram_tiers(self, monkeypatch) -> None:
         """<16 GB → 16384, <32 → 24576, <64 → 32768, ≥64 → 65536."""
-        for gib, expected in ((8, 16384), (16, 24576), (18, 24576), (36, 32768), (64, 65536), (128, 65536)):
+        for gib, expected in (
+            (8, 16384),
+            (16, 24576),
+            (18, 24576),
+            (36, 32768),
+            (64, 65536),
+            (128, 65536),
+        ):
             monkeypatch.setattr(src.summarizer, "_hardware_cap_cache", None)
             monkeypatch.setattr(
                 src.summarizer, "_total_ram_bytes", lambda gib=gib: gib * 1024**3
@@ -492,7 +506,9 @@ class TestAdaptiveNumCtx:
 
     def test_a_long_meeting_is_sized_right_on_the_first_attempt(self) -> None:
         """The regression the whole change exists for: no retry, no repair."""
-        s = OllamaSummarizer(model="muse-glimmer:30b-mlx", host="http://localhost:11434")
+        s = OllamaSummarizer(
+            model="muse-glimmer:30b-mlx", host="http://localhost:11434"
+        )
         s.client.chat.reset_mock()
         s.client.chat.side_effect = None
         s.client.show.return_value = _show_response("muse-glimmer:30b-mlx")

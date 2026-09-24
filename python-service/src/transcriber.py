@@ -303,8 +303,14 @@ def build_labeled_turns(
         if not cleaned:
             continue
         same = speaker == current_speaker
-        split_gap = same and current_parts and (start - current_end) > TURN_SPLIT_GAP_SECONDS
-        split_len = same and current_parts and len(" ".join(current_parts)) >= TURN_SPLIT_MAX_CHARS
+        split_gap = (
+            same and current_parts and (start - current_end) > TURN_SPLIT_GAP_SECONDS
+        )
+        split_len = (
+            same
+            and current_parts
+            and len(" ".join(current_parts)) >= TURN_SPLIT_MAX_CHARS
+        )
         if not same or split_gap or split_len:
             if current_parts:
                 turns.append(
@@ -473,7 +479,9 @@ def strip_mic_bleed(
     from difflib import SequenceMatcher
 
     def norm(text: str) -> str:
-        return " ".join("".join(c for c in text.lower() if c.isalnum() or c.isspace()).split())
+        return " ".join(
+            "".join(c for c in text.lower() if c.isalnum() or c.isspace()).split()
+        )
 
     normalized_system = [(start, norm(text)) for start, _end, text in system_segments]
 
@@ -502,7 +510,8 @@ def strip_mic_bleed(
                 SequenceMatcher(None, candidate, sys_text).ratio() >= _BLEED_SIMILARITY
                 or (
                     num_words >= 4
-                    and _token_containment(candidate_tokens, sys_text.split()) >= _BLEED_CONTAINMENT
+                    and _token_containment(candidate_tokens, sys_text.split())
+                    >= _BLEED_CONTAINMENT
                 )
                 or (
                     num_words == 3
@@ -575,9 +584,7 @@ def strip_glossary_echo(
 
         glossary_count = sum(1 for t in tokens if t in glossary_tokens)
         fraction = glossary_count / len(tokens)
-        distinct_terms = sum(
-            1 for tl in term_token_lists if _term_present(tokens, tl)
-        )
+        distinct_terms = sum(1 for tl in term_token_lists if _term_present(tokens, tl))
 
         # Drop rule: mostly glossary tokens, with multiple distinct terms.
         if (
@@ -598,9 +605,7 @@ def strip_glossary_echo(
 
         if leading_run >= _ECHO_PREFIX_RUN:
             leading_tokens = tokens[:leading_run]
-            if any(
-                _term_present(leading_tokens, tl) for tl in term_token_lists
-            ):
+            if any(_term_present(leading_tokens, tl) for tl in term_token_lists):
                 words = text.split()
                 trimmed_text = " ".join(words[leading_run:]).lstrip()
                 if not trimmed_text:
@@ -783,7 +788,9 @@ def apply_vocabulary_corrections(
 # VAD marks where the mic ACTUALLY carries voice; we drop mic segments that don't
 # overlap real speech. (Genuine bleed of others' clean speech IS voice, so it
 # survives this gate — strip_mic_bleed handles that separately.)
-_MIC_VOICE_MIN_OVERLAP_S = 0.5  # a real utterance carries at least this much voiced audio
+_MIC_VOICE_MIN_OVERLAP_S = (
+    0.5  # a real utterance carries at least this much voiced audio
+)
 
 
 def _voiced_regions(audio_path: str) -> list[tuple[float, float]] | None:
@@ -1054,7 +1061,10 @@ def transcribe_cloud(
             for cpath, offset in _write_wav_chunks(
                 samples, stem, td, _CLOUD_MAX_UPLOAD_BYTES
             ):
-                segs.extend((start + offset, end + offset, txt) for start, end, txt in _upload(cpath))
+                segs.extend(
+                    (start + offset, end + offset, txt)
+                    for start, end, txt in _upload(cpath)
+                )
         return segs, len(samples) / _CLOUD_TARGET_RATE
 
     system_segments: list[Segment] = []
@@ -1073,7 +1083,9 @@ def transcribe_cloud(
                 if audio_path is None:
                     raise
                 # The mic is best-effort when system audio remains available.
-                logger.warning("Cloud mic transcription failed (%s); system audio only.", exc)
+                logger.warning(
+                    "Cloud mic transcription failed (%s); system audio only.", exc
+                )
 
     turns = build_labeled_turns(system_segments, mic_segments)
     text = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
@@ -1130,7 +1142,9 @@ def relabel_me(text: str, me_label: str | None) -> str:
     return re.sub(r"(?m)^Me:", lambda _: label, text)
 
 
-def relabel_turns(turns: list[TranscriptTurn], me_label: str | None) -> list[TranscriptTurn]:
+def relabel_turns(
+    turns: list[TranscriptTurn], me_label: str | None
+) -> list[TranscriptTurn]:
     """Rewrite ``speaker="Me"`` to the user's display name.
 
     Kept in sync with :func:`relabel_me` so turn speakers and flat text never
@@ -1148,6 +1162,53 @@ def relabel_turns(turns: list[TranscriptTurn], me_label: str | None) -> list[Tra
         )
         for t in turns
     ]
+
+
+#: Handles returned by os.add_dll_directory; a handle that is closed removes
+#: its directory from the DLL search path again, so they are kept for the life
+#: of the process.
+_DLL_DIRECTORY_HANDLES: list[object] = []
+
+
+def _system_cuda_dll_dirs(program_files: Path, cuda_path: str | None) -> list[Path]:
+    """CUDA runtime and cuDNN DLL folders installed by NVIDIA's own installers.
+
+    Order: the toolkit named by CUDA_PATH (set by the toolkit installer), else
+    the newest toolkit under Program Files; then the newest standalone cuDNN,
+    whose DLLs live one level deeper in a per-CUDA-major folder
+    (``NVIDIA/CUDNN/v9.x/bin/12.x``). Without the cuDNN folder, a machine with
+    the toolkit installed still fell back to CPU at the first cuDNN load.
+    """
+    dirs: list[Path] = []
+
+    def newest_first(root: Path) -> list[Path]:
+        if not root.is_dir():
+            return []
+        return sorted((p for p in root.iterdir() if p.is_dir()), reverse=True)
+
+    toolkit_bin: Path | None = None
+    if cuda_path:
+        candidate = Path(cuda_path) / "bin"
+        if candidate.is_dir():
+            toolkit_bin = candidate
+    if toolkit_bin is None:
+        for version_dir in newest_first(program_files / "NVIDIA GPU Computing Toolkit" / "CUDA"):
+            if (version_dir / "bin").is_dir():
+                toolkit_bin = version_dir / "bin"
+                break
+    if toolkit_bin is not None:
+        dirs.append(toolkit_bin)
+
+    for version_dir in newest_first(program_files / "NVIDIA" / "CUDNN"):
+        bin_dir = version_dir / "bin"
+        if not bin_dir.is_dir():
+            continue
+        candidates = [bin_dir, *newest_first(bin_dir)]
+        with_dlls = [d for d in candidates if any(d.glob("cudnn*.dll"))]
+        if with_dlls:
+            dirs.append(with_dlls[0])
+            break
+    return dirs
 
 
 class WhisperTranscriber:
@@ -1175,7 +1236,12 @@ class WhisperTranscriber:
             compute_type: Quantization type ('int8_float16', 'int8', 'float16').
         """
         self._patch_cuda_path()
-        raw_model = model_size or os.environ.get("WHISPER_MODEL") or default_whisper_key()
+        #: Beam width for decoding. Meeting transcripts use 5; the live-caption
+        #: view (GreedyLiveTranscriber) decodes with 1.
+        self.beam_size = 5
+        raw_model = (
+            model_size or os.environ.get("WHISPER_MODEL") or default_whisper_key()
+        )
         # Resolve a friendly registry key ("large-v3") to this backend's repo id
         # so it compares equal to what the Settings picker sends and
         # `ensure_model_repo` doesn't reload an already-loaded model. Anything
@@ -1224,10 +1290,13 @@ class WhisperTranscriber:
         except AttributeError:
             pass
         # conda / miniconda envs: CONDA_PREFIX, CONDA_ROOT, or common install paths
-        for conda_env in filter(None, [
-            os.environ.get("CONDA_PREFIX"),
-            os.environ.get("CONDA_ROOT"),
-        ]):
+        for conda_env in filter(
+            None,
+            [
+                os.environ.get("CONDA_PREFIX"),
+                os.environ.get("CONDA_ROOT"),
+            ],
+        ):
             site_dirs.append(str(Path(conda_env) / "Lib" / "site-packages"))
         # Miniconda default install locations
         home = Path.home()
@@ -1255,19 +1324,28 @@ class WhisperTranscriber:
                     additions.append(str(bin_dir))
                     existing.add(str(bin_dir).lower())
 
-        # CUDA Toolkit (installed via nvidia installer, not pip)
-        cuda_root = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
-        if cuda_root.is_dir():
-            for version_dir in sorted(cuda_root.iterdir(), reverse=True):
-                bin_dir = version_dir / "bin"
-                if bin_dir.is_dir() and str(bin_dir).lower() not in existing:
-                    additions.append(str(bin_dir))
-                    existing.add(str(bin_dir).lower())
-                    break  # newest version only
+        # CUDA Toolkit and standalone cuDNN (NVIDIA installers, not pip).
+        program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+        for bin_dir in _system_cuda_dll_dirs(program_files, os.environ.get("CUDA_PATH")):
+            if str(bin_dir).lower() not in existing:
+                additions.append(str(bin_dir))
+                existing.add(str(bin_dir).lower())
 
         if additions:
-            os.environ["PATH"] = os.pathsep.join(additions) + os.pathsep + os.environ.get("PATH", "")
-            logger.info("Prepended CUDA DLL paths to PATH: %s", additions)
+            os.environ["PATH"] = (
+                os.pathsep.join(additions) + os.pathsep + os.environ.get("PATH", "")
+            )
+            # PATH alone is not consulted for DLLs that a Python extension
+            # (ctranslate2) loads on Python 3.8+; register the directories
+            # with the loader too. Keep the handles so they stay registered.
+            add_dll_directory = getattr(os, "add_dll_directory", None)
+            if add_dll_directory is not None:
+                for directory in additions:
+                    try:
+                        _DLL_DIRECTORY_HANDLES.append(add_dll_directory(directory))
+                    except OSError:
+                        logger.debug("add_dll_directory failed for %s", directory)
+            logger.info("Added CUDA DLL paths: %s", additions)
 
     def _load_model(self) -> None:
         """Load the faster-whisper model into memory.
@@ -1375,7 +1453,9 @@ class WhisperTranscriber:
         logger.info("Transcribing audio file: %s", audio_path)
         return self._transcribe_with_fallback(str(audio_path_obj))
 
-    def transcribe_dual(self, audio_path: str, mic_audio_path: str, diarize: bool = True) -> TranscribeResponse:
+    def transcribe_dual(
+        self, audio_path: str, mic_audio_path: str, diarize: bool = True
+    ) -> TranscribeResponse:
         """Transcribe a system-audio file and a mic file of the same meeting.
 
         Returns a speaker-labeled transcript ("Me" = mic, "Them" = system).
@@ -1409,13 +1489,17 @@ class WhisperTranscriber:
         mic_segments = drop_unvoiced_segments(mic_segments, mic_audio_path, "mic")
         system_segments = strip_glossary_echo(system_segments, self.initial_prompt)
         mic_segments = strip_glossary_echo(mic_segments, self.initial_prompt)
-        system_segments = apply_vocabulary_corrections(system_segments, self.initial_prompt)
+        system_segments = apply_vocabulary_corrections(
+            system_segments, self.initial_prompt
+        )
         mic_segments = apply_vocabulary_corrections(mic_segments, self.initial_prompt)
         mic_segments = strip_mic_bleed(system_segments, mic_segments)
         sys_labels = (
             None  # playback: TTS/media voices must not become "Speaker N"
             if hint == "youtube"
-            else diarize_system_labels(audio_path, system_segments, diarize, mic_segments)
+            else diarize_system_labels(
+                audio_path, system_segments, diarize, mic_segments
+            )
         )
         turns = build_labeled_turns(system_segments, mic_segments, sys_labels)
         text = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
@@ -1445,9 +1529,12 @@ class WhisperTranscriber:
             return self._collect_segments(audio_path)
         except Exception as exc:
             msg = str(exc).lower()
-            if self.device == "cuda" and any(f in msg for f in _CUDA_DLL_ERROR_FRAGMENTS):
+            if self.device == "cuda" and any(
+                f in msg for f in _CUDA_DLL_ERROR_FRAGMENTS
+            ):
                 logger.warning(
-                    "CUDA inference failed (%s) — falling back to CPU for this run.", exc
+                    "CUDA inference failed (%s) — falling back to CPU for this run.",
+                    exc,
                 )
                 self.device = "cpu"
                 self.compute_type = "int8"
@@ -1465,7 +1552,7 @@ class WhisperTranscriber:
         assert self.model is not None
         segments, info = self.model.transcribe(
             audio_path,
-            beam_size=5,
+            beam_size=self.beam_size,
             vad_filter=True,
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
@@ -1516,6 +1603,37 @@ class WhisperTranscriber:
         return result
 
 
+class GreedyLiveTranscriber:
+    """Live-caption view of a faster-whisper transcriber: same loaded model,
+    greedy decoding.
+
+    Apple Silicon gets a dedicated small MLX model for live captions. On
+    CTranslate2 machines (Windows) live captions used to share the meeting
+    model's beam-5 decoding, usually on CPU, so confirmations lagged well
+    behind speech. Greedy decoding on the already-loaded model is several
+    times faster, needs no extra download or memory, and only ever feeds the
+    live preview; the saved transcript is still decoded with the full beam.
+
+    Callers hold ``_WHISPER_LOCK`` (the server's live feed does), which is
+    what makes flipping the shared model's beam width safe.
+    """
+
+    def __init__(self, main: WhisperTranscriber) -> None:
+        self.main = main
+
+    @property
+    def model_size(self) -> str:
+        return self.main.model_size
+
+    def transcribe(self, audio_path: str) -> TranscribeResponse:
+        previous = self.main.beam_size
+        self.main.beam_size = 1
+        try:
+            return self.main.transcribe(audio_path)
+        finally:
+            self.main.beam_size = previous
+
+
 @dataclass
 class _TranscriptInfo:
     """Minimal stand-in for faster-whisper's `info` object."""
@@ -1539,7 +1657,13 @@ def drop_no_speech_raw_segments(raw_segments: list[dict]) -> list[dict]:
     ]
 
 
-def _merge_dual(collect, audio_path: str, mic_audio_path: str, diarize: bool = True, initial_prompt: str | None = None) -> TranscribeResponse:
+def _merge_dual(
+    collect,
+    audio_path: str,
+    mic_audio_path: str,
+    diarize: bool = True,
+    initial_prompt: str | None = None,
+) -> TranscribeResponse:
     """Shared dual-file orchestration for any backend.
 
     `collect(path)` returns `(segments, info)` where `segments` is a list of
@@ -1622,7 +1746,9 @@ class MlxWhisperTranscriber:
         self.drop_no_speech = drop_no_speech
         logger.info("MLX whisper backend ready (model=%s).", self.model_repo)
 
-    def _collect_segments(self, audio_path: str) -> tuple[list[Segment], _TranscriptInfo]:
+    def _collect_segments(
+        self, audio_path: str
+    ) -> tuple[list[Segment], _TranscriptInfo]:
         """Run mlx-whisper on one file, returning `([(start, end, text), ...], info)`."""
         import mlx_whisper
         import numpy as np
@@ -1661,7 +1787,9 @@ class MlxWhisperTranscriber:
         ]
         # mlx-whisper omits duration; the last segment's end is close enough for
         # the meeting's duration display (trailing silence is irrelevant).
-        duration = max((float(seg["end"]) for seg in result.get("segments", [])), default=0.0)
+        duration = max(
+            (float(seg["end"]) for seg in result.get("segments", [])), default=0.0
+        )
         info = _TranscriptInfo(language=result.get("language", ""), duration=duration)
         logger.info(
             "MLX transcription complete: language=%s duration=%.1fs segments=%d",
@@ -1680,15 +1808,28 @@ class MlxWhisperTranscriber:
         text = " ".join(t for _, _, t in segments).strip()
         turns = build_single_file_turns(segments)
         return TranscribeResponse(
-            text=text, language=info.language, duration_seconds=info.duration, turns=turns
+            text=text,
+            language=info.language,
+            duration_seconds=info.duration,
+            turns=turns,
         )
 
-    def transcribe_dual(self, audio_path: str, mic_audio_path: str, diarize: bool = True) -> TranscribeResponse:
+    def transcribe_dual(
+        self, audio_path: str, mic_audio_path: str, diarize: bool = True
+    ) -> TranscribeResponse:
         """Transcribe a system-audio file and a mic file into a labeled transcript."""
         logger.info(
-            "Transcribing dual audio (MLX): system=%s mic=%s", audio_path, mic_audio_path
+            "Transcribing dual audio (MLX): system=%s mic=%s",
+            audio_path,
+            mic_audio_path,
         )
-        return _merge_dual(self._collect_segments, audio_path, mic_audio_path, diarize, initial_prompt=self.initial_prompt)
+        return _merge_dual(
+            self._collect_segments,
+            audio_path,
+            mic_audio_path,
+            diarize,
+            initial_prompt=self.initial_prompt,
+        )
 
 
 # Qwen3-ASR emits no segment timestamps in the MLX runtime (spike 2026-08-12),
@@ -1743,7 +1884,9 @@ class Qwen3AsrTranscriber:
             self._model = Qwen3ASR.from_pretrained(self.model_repo)
         return self._model
 
-    def _collect_segments(self, audio_path: str) -> tuple[list[Segment], _TranscriptInfo]:
+    def _collect_segments(
+        self, audio_path: str
+    ) -> tuple[list[Segment], _TranscriptInfo]:
         """Transcribe fixed windows and derive coarse timestamps from offsets."""
         import numpy as np
 
@@ -1800,7 +1943,10 @@ class Qwen3AsrTranscriber:
         text = " ".join(t for _, _, t in segments).strip()
         turns = build_single_file_turns(segments)
         return TranscribeResponse(
-            text=text, language=info.language, duration_seconds=info.duration, turns=turns
+            text=text,
+            language=info.language,
+            duration_seconds=info.duration,
+            turns=turns,
         )
 
     def transcribe_dual(
@@ -1886,7 +2032,9 @@ class CohereTranscriber:
             _COHERE_RECOGNIZERS[key] = recognizer
         return recognizer
 
-    def _collect_segments(self, audio_path: str) -> tuple[list[Segment], _TranscriptInfo]:
+    def _collect_segments(
+        self, audio_path: str
+    ) -> tuple[list[Segment], _TranscriptInfo]:
         """Transcribe fixed windows and derive coarse timestamps from offsets."""
         import numpy as np
 

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, Manager, State, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalPosition, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder,
 };
 
 use crate::audio::AudioCapture;
@@ -18,12 +18,12 @@ use crate::http_client::{HttpClient, SummarizeParams, TranscribeParams};
 use crate::types::{
     ActionItem, AppConfig, AskMessage, AskResponse, AttachmentDraft, CalendarAccount,
     CalendarConfig, CalendarEvent, ChatMessage, ChatTurn, ContextIndexStatus, ContextSources,
-    Folder, FolderOverview, FolderSuggestion, FolderSummary, HealthResponse, Meeting,
-    MeetingAttachment, MeetingFolder, MeetingRef, MeetingWorkspaceBinding, ProjectOverview,
-    RelatedMeetingRef, SummarizeResponse, Tag, TaskGroundingPreview, TaskStaffing, TemplateInfo,
-    WeeklyBriefing, WeeklyOpenLoop, Workspace, WorkspaceAddon, WorkspaceContextItem,
-    WorkspaceDetail, WorkspaceEngine, WorkspaceRun, WorkspaceSuggestion, WorkspaceSummary,
-    WorkspaceTask,
+    CopilotCommandAck, CopilotLiveContext, Folder, FolderCopilotBrief, FolderOverview,
+    FolderSuggestion, FolderSummary, HealthResponse, Meeting, MeetingAttachment, MeetingFolder,
+    MeetingRef, MeetingWorkspaceBinding, ProjectOverview, RelatedMeetingRef, SummarizeResponse,
+    Tag, TaskGroundingPreview, TaskStaffing, TemplateInfo, WeeklyBriefing, WeeklyOpenLoop,
+    Workspace, WorkspaceAddon, WorkspaceContextItem, WorkspaceDetail, WorkspaceEngine,
+    WorkspaceRun, WorkspaceSuggestion, WorkspaceSummary, WorkspaceTask,
 };
 
 /// Poll cadence for the live-caption feed, in milliseconds. 500 ms: the
@@ -65,6 +65,9 @@ pub struct AppState {
     /// When the current recording started — polled by the floating bubble to
     /// show elapsed time. `None` while not recording.
     pub recording_started: Mutex<Option<std::time::Instant>>,
+    /// Serialises the complete start/stop transition so two Tauri commands
+    /// cannot create, replace, or retire recording/Copilot sessions at once.
+    recording_transition: tokio::sync::Mutex<()>,
     /// The bundled Python ML service child process (packaged builds only); kept
     /// so it can be killed on app exit. `None` in dev (manual uvicorn).
     pub sidecar: Mutex<Option<std::process::Child>>,
@@ -90,6 +93,12 @@ pub struct AppState {
     pub workspace_run_children: Arc<Mutex<HashMap<i64, std::process::Child>>>,
     /// Serialises "pick a task and mark it running" so two kicks can't start two runs in one workspace.
     pub autopilot_gate: Mutex<()>,
+    /// Live Copilot state (question detection, rate limiting, and passage retrieval).
+    pub copilot: Mutex<crate::copilot_session::CopilotState>,
+    /// Pending `.adversaria` file paths opened from OS before frontend is ready.
+    pub pending_open_files: Mutex<Vec<String>>,
+    /// Whether the frontend webview has mounted and requested pending open files.
+    pub frontend_ready: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -105,6 +114,7 @@ impl AppState {
             auto_detect: Arc::new(AtomicBool::new(config.auto_detect_meetings)),
             recording: Arc::new(AtomicBool::new(false)),
             recording_started: Mutex::new(None),
+            recording_transition: tokio::sync::Mutex::new(()),
             sidecar: Mutex::new(None),
             shutting_down: Arc::new(AtomicBool::new(false)),
             sidecar_watchdog_running: Arc::new(AtomicBool::new(false)),
@@ -113,6 +123,9 @@ impl AppState {
             ollama: Mutex::new(None),
             workspace_run_children: Arc::new(Mutex::new(HashMap::new())),
             autopilot_gate: Mutex::new(()),
+            copilot: Mutex::new(crate::copilot_session::CopilotState::default()),
+            pending_open_files: Mutex::new(Vec::new()),
+            frontend_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -626,12 +639,30 @@ pub(crate) fn append_to_sidecar_log(line: &str) {
 /// in `src/lib/tauri.ts`.
 pub const PERMISSION_ERROR_PREFIX: &str = "PERMISSION_REQUIRED:";
 
+#[derive(serde::Serialize)]
+pub struct StartRecordingResult {
+    pub copilot_session_id: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct StopRecordingResult {
+    pub system_path: String,
+    pub mic_path: Option<String>,
+    pub warning: Option<String>,
+    pub copilot_session_id: String,
+}
+
 /// Begin WASAPI loopback audio capture.  Audio is written to a
 /// timestamped WAV file under the app-data `recordings/` directory so a
 /// recording kept for later transcription (ML service down at stop time)
 /// survives a restart. Files are deleted once transcription succeeds.
 #[tauri::command]
-pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn start_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    copilot_folder_id: Option<i64>,
+) -> Result<StartRecordingResult, String> {
+    let _transition = state.recording_transition.lock().await;
     if state.capture.is_recording() {
         return Err("Already recording".to_string());
     }
@@ -649,12 +680,24 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
     }
     let dir = crate::config::recordings_dir()
         .map_err(|e| format!("Could not prepare recordings directory: {e}"))?;
-    let spool_path = state.capture.start(&dir.to_string_lossy())?;
+    let epoch = LIVE_CAPTION_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    let copilot_session_id = crate::copilot_session::start_session(&app, epoch, copilot_folder_id)?;
+    let spool_path = match state.capture.start(&dir.to_string_lossy()) {
+        Ok(path) => path,
+        Err(error) => {
+            crate::copilot_session::retire_session_if_current(&app, &copilot_session_id);
+            return Err(error);
+        }
+    };
     let root = std::path::Path::new(&spool_path);
-    let (session_id, metadata, last_chunk) = crate::recording_spool::asset_snapshot(root)
-        .inspect_err(|_| {
+    let (session_id, metadata, last_chunk) = match crate::recording_spool::asset_snapshot(root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::copilot_session::retire_session_if_current(&app, &copilot_session_id);
             let _ = state.capture.stop();
-        })?;
+            return Err(error);
+        }
+    };
     if let Err(error) = crate::storage::create_recording_asset(
         &spool_path,
         &session_id,
@@ -662,6 +705,7 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
         &metadata,
         last_chunk,
     ) {
+        crate::copilot_session::retire_session_if_current(&app, &copilot_session_id);
         let _ = state.capture.stop();
         return Err(format!(
             "Could not register the encrypted recording before capture: {error}"
@@ -669,32 +713,46 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
     }
     state.recording.store(true, Ordering::SeqCst);
     *state.recording_started.lock().unwrap() = Some(std::time::Instant::now());
-    spawn_live_caption(app);
-    Ok(())
+    spawn_live_caption(app, epoch);
+    Ok(StartRecordingResult { copilot_session_id })
 }
 
-/// Stop the current recording and return the absolute path to the
-/// captured system-audio WAV file.  The mic WAV path (if any) is kept
-/// in state and picked up by `transcribe_and_summarize`.
+/// Stop the current recording and return its audio paths plus the durable
+/// Copilot session id that the save/enqueue command must attach.
 #[tauri::command]
 pub async fn stop_recording(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<crate::audio::RecordingPaths, String> {
+) -> Result<StopRecordingResult, String> {
+    let _transition = state.recording_transition.lock().await;
+    // Invalidate an in-flight `/live_feed` request before retiring the durable
+    // session. Its response is discarded by the post-await epoch check below.
+    LIVE_CAPTION_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let copilot_session_id = crate::copilot_session::retire_current_session(&app, "session_ended")
+        .ok_or_else(|| "No active Copilot session".to_string())?;
     let result = state.capture.stop();
     state.recording.store(false, Ordering::SeqCst);
     *state.recording_started.lock().unwrap() = None;
     hide_recording_bubble(&app);
+    hide_copilot_hud_window(&app);
     let paths = result?;
     *state.recording_path.lock().unwrap() = Some(paths.system_path.clone());
     *state.mic_recording_path.lock().unwrap() = paths.mic_path.clone();
     update_asset_state(&paths.system_path, "pending", paths.warning.as_deref())?;
-    Ok(paths)
+    Ok(StopRecordingResult {
+        system_path: paths.system_path,
+        mic_path: paths.mic_path,
+        warning: paths.warning,
+        copilot_session_id,
+    })
 }
 
 /// Wing = content area on each side of the physical notch when docked.
 #[cfg(target_os = "macos")]
 const NOTCH_WING: f64 = 108.0;
+/// Wing width while expanded, so the island is ~600 pt on a 200 pt notch.
+#[cfg(target_os = "macos")]
+const NOTCH_EXPANDED_WING: f64 = 188.0;
 /// Rounded lip below the notch in the collapsed docked strip.
 #[cfg(target_os = "macos")]
 const NOTCH_LIP: f64 = 8.0;
@@ -704,7 +762,18 @@ const NOTCH_LIP: f64 = 8.0;
 const NOTCH_FILLET: f64 = 12.0;
 /// Expanded expressive-island content height below the notch line.
 #[cfg(target_os = "macos")]
-const NOTCH_EXPANDED_BODY: f64 = 96.0;
+const NOTCH_EXPANDED_BODY: f64 = 158.0;
+
+/// Docked island window width for a given physical notch width.
+#[cfg(target_os = "macos")]
+fn docked_island_width(notch_w: f64, expanded: bool) -> f64 {
+    let (wing, floor) = if expanded {
+        (NOTCH_EXPANDED_WING, 520.0)
+    } else {
+        (NOTCH_WING, 360.0)
+    };
+    (notch_w + 2.0 * wing + 2.0 * NOTCH_FILLET).max(floor)
+}
 
 /// Geometry of the physical notch on the built-in display, in AppKit points:
 /// (screen_frame, notch_width, top_inset). None on non-notched displays, so the
@@ -762,8 +831,14 @@ pub fn show_recording_bubble(app: &AppHandle) {
     let expressive = style == "expressive";
     let inner = app.clone();
     let _ = app.run_on_main_thread(move || {
-        /// Floating margin below the menu bar when NOT docked (macOS & Windows).
+        /// Floating margin below the menu bar when NOT docked (macOS).
+        #[cfg(target_os = "macos")]
         const MARGIN: f64 = 38.0;
+        /// Gap between the top of the work area and the pill on Windows, where
+        /// there is no menu bar to clear. The work area already excludes a
+        /// taskbar docked to the top edge.
+        #[cfg(not(target_os = "macos"))]
+        const FLOAT_TOP: f64 = 8.0;
 
         #[cfg(target_os = "macos")]
         let notch = notch_geometry();
@@ -778,7 +853,7 @@ pub fn show_recording_bubble(app: &AppHandle) {
                     // Starts COLLAPSED (a slim strip hugging the notch, so it
                     // never covers app content like browser tabs); hovering the
                     // strip expands it via `set_recording_bubble_expanded`.
-                    w = (notch_w + 2.0 * NOTCH_WING + 2.0 * NOTCH_FILLET).max(360.0);
+                    w = docked_island_width(notch_w, false);
                     h = top_inset + NOTCH_LIP;
                     url = WebviewUrl::App(
                         format!(
@@ -788,7 +863,7 @@ pub fn show_recording_bubble(app: &AppHandle) {
                         .into(),
                     );
                 } else {
-                    w = notch_w + 2.0 * NOTCH_WING + 2.0 * NOTCH_FILLET;
+                    w = docked_island_width(notch_w, false);
                     h = top_inset + NOTCH_LIP;
                     url = WebviewUrl::App(
                         format!(
@@ -870,13 +945,27 @@ pub fn show_recording_bubble(app: &AppHandle) {
                         }
                     }
                 }
-            } else {
-                if let Ok(Some(monitor)) = win.primary_monitor() {
+            } else if let Ok(Some(monitor)) = win.primary_monitor() {
+                #[cfg(target_os = "macos")]
+                {
                     let size = monitor.size();
                     let scale = monitor.scale_factor();
                     let mw = size.width as f64 / scale;
                     let x = (mw - w) / 2.0; // top-center
-                    let _ = win.set_position(LogicalPosition::new(x, MARGIN));
+                    let _ = win.set_position(tauri::LogicalPosition::new(x, MARGIN));
+                }
+                // Top-center of the work area, in physical pixels: correct on
+                // a secondary-left layout (negative origin), with a top-docked
+                // taskbar, and at any display scaling.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (x, y) = crate::os_shell::place_in_work_area(
+                        monitor.work_area(),
+                        monitor.scale_factor(),
+                        (w, h),
+                        crate::os_shell::Anchor::TopCenter { top: FLOAT_TOP },
+                    );
+                    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
                 }
             }
         }
@@ -906,7 +995,7 @@ pub fn set_recording_bubble_expanded(app: AppHandle, expanded: bool) {
             let Some((screen_frame, notch_w, top_inset)) = notch_geometry() else {
                 return;
             };
-            let w = (notch_w + 2.0 * NOTCH_WING + 2.0 * NOTCH_FILLET).max(360.0);
+            let w = docked_island_width(notch_w, expanded);
             let h = if expanded {
                 top_inset + NOTCH_EXPANDED_BODY
             } else {
@@ -958,6 +1047,330 @@ pub async fn bubble_start_drag(app: AppHandle) -> Result<(), String> {
         win.start_dragging().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Floating copilot HUD (label "copilot-hud", Contract H)
+// ---------------------------------------------------------------------------
+
+/// Logical size of the floating copilot HUD window (a wide see-through oval
+/// showing the latest copilot answer so the main app can stay closed).
+pub const COPILOT_HUD_W: f64 = 720.0;
+/// Logical height of the floating copilot HUD window.
+pub const COPILOT_HUD_H: f64 = 180.0;
+/// Minimum logical width of the floating copilot HUD window. The window is
+/// user-resizable down to this size; smaller sizes are rejected by
+/// `copilot_hud_save_size` and clamped on show.
+pub const COPILOT_HUD_MIN_W: f64 = 320.0;
+/// Minimum logical height of the floating copilot HUD window.
+pub const COPILOT_HUD_MIN_H: f64 = 110.0;
+/// Default distance from the top of the primary monitor when no saved HUD
+/// position exists (or the saved one is no longer on any monitor).
+const COPILOT_HUD_TOP_MARGIN: f64 = 96.0;
+
+/// Resolve the HUD's logical top-left position: the saved position when its
+/// top-left corner lies on a known monitor, otherwise the default
+/// (horizontally centred on the first monitor, 96 logical px from the top).
+/// `monitors` are (x, y, w, h) in logical pixels; the first entry is treated
+/// as the primary monitor. Pure so it can be unit tested.
+pub fn hud_position(
+    saved: Option<(f64, f64)>,
+    monitors: &[(f64, f64, f64, f64)],
+    hud_w: f64,
+    hud_h: f64,
+) -> (f64, f64) {
+    let _ = hud_h;
+    let default = match monitors.first() {
+        Some((mx, my, mw, _)) => (mx + (mw - hud_w) / 2.0, my + COPILOT_HUD_TOP_MARGIN),
+        None => (0.0, COPILOT_HUD_TOP_MARGIN),
+    };
+    let Some((x, y)) = saved else {
+        return default;
+    };
+    let on_screen = monitors
+        .iter()
+        .any(|(mx, my, mw, mh)| x >= *mx && x < mx + mw && y >= *my && y < my + mh);
+    if on_screen {
+        (x, y)
+    } else {
+        default
+    }
+}
+
+/// Resolve the HUD's effective logical size: each saved dimension is used when
+/// finite, clamped up to the minimum; an absent or non-finite dimension falls
+/// back to the default. There is no maximum. Pure so it can be unit tested.
+pub fn hud_size(saved_w: Option<f64>, saved_h: Option<f64>) -> (f64, f64) {
+    let w = saved_w
+        .filter(|w| w.is_finite())
+        .map(|w| w.max(COPILOT_HUD_MIN_W))
+        .unwrap_or(COPILOT_HUD_W);
+    let h = saved_h
+        .filter(|h| h.is_finite())
+        .map(|h| h.max(COPILOT_HUD_MIN_H))
+        .unwrap_or(COPILOT_HUD_H);
+    (w, h)
+}
+
+/// Validate a HUD size before persisting it: both dimensions must be finite
+/// and at least the minimum. Pure so it can be unit tested.
+fn validate_hud_size(w: f64, h: f64) -> Result<(), String> {
+    if !w.is_finite() || !h.is_finite() {
+        return Err(format!(
+            "Copilot HUD size must be finite numbers (got {w} x {h})"
+        ));
+    }
+    if w < COPILOT_HUD_MIN_W || h < COPILOT_HUD_MIN_H {
+        return Err(format!(
+            "Copilot HUD size must be at least {COPILOT_HUD_MIN_W} x {COPILOT_HUD_MIN_H} \
+             logical pixels (got {w} x {h})"
+        ));
+    }
+    Ok(())
+}
+
+/// Show the floating copilot HUD — a separate, see-through, wide-oval window
+/// (label "copilot-hud") showing the latest copilot answer. Frameless,
+/// transparent, always on top, on all workspaces, created unfocused, and
+/// content-protected (out of screen capture where the OS honours it).
+/// No-op when already open.
+///
+/// NOTE: like the recording bubble, this window must stay a plain
+/// `WebviewWindowBuilder` window. Converting it to a non-activating NSPanel
+/// (or any objc window-level call) aborted the app with SIGABRT for the pill;
+/// see docs/NOTCH_PILL_SCOPE.md. Do not repeat that here.
+pub fn show_copilot_hud_window<R: Runtime>(app: &AppHandle<R>) {
+    // Shipped dark in 0.4.0: nothing opens the pop-out until the flag is on.
+    if !crate::config::load_config().copilot_hud_enabled {
+        return;
+    }
+    if app.get_webview_window("copilot-hud").is_some() {
+        return;
+    }
+    let inner = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let (saved, saved_size) = {
+            let config = crate::config::load_config();
+            let position = match (config.copilot_hud_x, config.copilot_hud_y) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            };
+            (
+                position,
+                hud_size(config.copilot_hud_w, config.copilot_hud_h),
+            )
+        };
+        let monitors: Vec<(f64, f64, f64, f64)> = inner
+            .available_monitors()
+            .unwrap_or_default()
+            .iter()
+            .map(|monitor| {
+                let scale = monitor.scale_factor();
+                let pos = monitor.position().to_logical::<f64>(scale);
+                let size = monitor.size().to_logical::<f64>(scale);
+                (pos.x, pos.y, size.width, size.height)
+            })
+            .collect();
+        let (x, y) = hud_position(saved, &monitors, saved_size.0, saved_size.1);
+        let built = WebviewWindowBuilder::new(
+            &inner,
+            "copilot-hud",
+            WebviewUrl::App("index.html?widget=copilot-hud".into()),
+        )
+        .title("Copilot HUD")
+        .inner_size(saved_size.0, saved_size.1)
+        .resizable(true)
+        .min_inner_size(COPILOT_HUD_MIN_W, COPILOT_HUD_MIN_H)
+        .decorations(false)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .transparent(true)
+        .content_protected(true)
+        .focused(false)
+        .build();
+        if let Ok(window) = built {
+            let _ = window.set_position(LogicalPosition::new(x, y));
+        }
+    });
+}
+
+/// Close the floating copilot HUD window if present.
+pub fn hide_copilot_hud_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("copilot-hud") {
+        let _ = window.close();
+    }
+}
+
+/// Toggle the floating copilot HUD: close it when open, show it when closed.
+pub fn toggle_copilot_hud_window<R: Runtime>(app: &AppHandle<R>) {
+    if app.get_webview_window("copilot-hud").is_some() {
+        hide_copilot_hud_window(app);
+    } else {
+        show_copilot_hud_window(app);
+    }
+}
+
+/// Show the floating copilot HUD (no-op when already open).
+#[tauri::command]
+pub fn show_copilot_hud(app: AppHandle) -> Result<(), String> {
+    show_copilot_hud_window(&app);
+    Ok(())
+}
+
+/// Close the floating copilot HUD window if present.
+#[tauri::command]
+pub fn hide_copilot_hud(app: AppHandle) -> Result<(), String> {
+    hide_copilot_hud_window(&app);
+    Ok(())
+}
+
+/// Toggle the floating copilot HUD.
+#[tauri::command]
+pub fn toggle_copilot_hud(app: AppHandle) -> Result<(), String> {
+    toggle_copilot_hud_window(&app);
+    Ok(())
+}
+
+/// Drag the floating copilot HUD. Same focus-then-drag approach as
+/// `bubble_start_drag`: the HUD is created unfocused so it never steals focus
+/// when it appears, and an unfocused window won't move under Tauri's drag.
+#[tauri::command]
+pub async fn copilot_hud_start_drag(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("copilot-hud") {
+        let _ = window.set_focus();
+        window.start_dragging().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Persist the HUD's logical top-left position. The ONLY writer of the
+/// `copilot_hud_x` / `copilot_hud_y` config fields (via `update_config_with`,
+/// never the whole-config path).
+#[tauri::command]
+pub fn copilot_hud_save_position(x: f64, y: f64) -> Result<(), String> {
+    crate::config::update_config_with(|config| {
+        config.copilot_hud_x = Some(x);
+        config.copilot_hud_y = Some(y);
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Persist the HUD's logical size. The ONLY writer of the
+/// `copilot_hud_w` / `copilot_hud_h` config fields (via `update_config_with`,
+/// never the whole-config path).
+#[tauri::command]
+pub fn copilot_hud_save_size(w: f64, h: f64) -> Result<(), String> {
+    validate_hud_size(w, h)?;
+    crate::config::update_config_with(|config| {
+        config.copilot_hud_w = Some(w);
+        config.copilot_hud_h = Some(h);
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether the floating copilot HUD window is currently open.
+#[tauri::command]
+pub fn copilot_hud_is_open(app: AppHandle) -> bool {
+    app.get_webview_window("copilot-hud").is_some()
+}
+
+#[cfg(test)]
+mod copilot_hud_tests {
+    use super::*;
+
+    const MONO: [(f64, f64, f64, f64); 1] = [(0.0, 0.0, 1920.0, 1080.0)];
+    const DUAL: [(f64, f64, f64, f64); 2] =
+        [(0.0, 0.0, 1920.0, 1080.0), (1920.0, 0.0, 1920.0, 1080.0)];
+
+    #[test]
+    fn unset_position_centres_on_primary_96_from_top() {
+        assert_eq!(
+            hud_position(None, &MONO, COPILOT_HUD_W, COPILOT_HUD_H),
+            (600.0, 96.0)
+        );
+    }
+
+    #[test]
+    fn saved_on_screen_position_is_kept() {
+        assert_eq!(
+            hud_position(Some((100.0, 200.0)), &MONO, COPILOT_HUD_W, COPILOT_HUD_H),
+            (100.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn saved_off_every_monitor_falls_back_to_default() {
+        assert_eq!(
+            hud_position(Some((5000.0, 5000.0)), &MONO, COPILOT_HUD_W, COPILOT_HUD_H),
+            (600.0, 96.0)
+        );
+    }
+
+    #[test]
+    fn saved_on_second_monitor_is_kept() {
+        assert_eq!(
+            hud_position(Some((2000.0, 200.0)), &DUAL, COPILOT_HUD_W, COPILOT_HUD_H),
+            (2000.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn off_primary_but_on_second_monitor_is_kept() {
+        // A position that misses the primary must still be kept when it lies
+        // on another monitor (not collapsed to the default).
+        assert_eq!(
+            hud_position(Some((3000.0, 500.0)), &DUAL, COPILOT_HUD_W, COPILOT_HUD_H),
+            (3000.0, 500.0)
+        );
+    }
+
+    #[test]
+    fn unset_size_falls_back_to_default() {
+        assert_eq!(hud_size(None, None), (COPILOT_HUD_W, COPILOT_HUD_H));
+        assert_eq!(hud_size(Some(900.0), None), (900.0, COPILOT_HUD_H));
+        assert_eq!(hud_size(None, Some(240.0)), (COPILOT_HUD_W, 240.0));
+    }
+
+    #[test]
+    fn saved_size_is_used_and_clamped_to_the_minimum() {
+        assert_eq!(hud_size(Some(900.0), Some(240.0)), (900.0, 240.0));
+        assert_eq!(
+            hud_size(Some(100.0), Some(50.0)),
+            (COPILOT_HUD_MIN_W, COPILOT_HUD_MIN_H)
+        );
+        // No maximum: a large saved size is kept as-is.
+        assert_eq!(hud_size(Some(2000.0), Some(800.0)), (2000.0, 800.0));
+        // Non-finite dimensions fall back to the default per dimension.
+        assert_eq!(
+            hud_size(Some(f64::NAN), Some(240.0)),
+            (COPILOT_HUD_W, 240.0)
+        );
+        assert_eq!(
+            hud_size(Some(900.0), Some(f64::INFINITY)),
+            (900.0, COPILOT_HUD_H)
+        );
+    }
+
+    #[test]
+    fn save_size_rejects_non_finite_or_below_minimum() {
+        assert!(validate_hud_size(720.0, 180.0).is_ok());
+        assert!(validate_hud_size(320.0, 110.0).is_ok());
+        for (w, h) in [
+            (f64::NAN, 180.0),
+            (720.0, f64::NAN),
+            (f64::INFINITY, 180.0),
+            (720.0, f64::NEG_INFINITY),
+            (319.9, 180.0),
+            (720.0, 109.9),
+            (-10.0, -10.0),
+        ] {
+            assert!(validate_hud_size(w, h).is_err(), "w={w} h={h}");
+        }
+    }
 }
 
 /// Current recording loudness (0.0..1.0) for the live waveform. Cheap (RMS of the
@@ -1064,6 +1477,7 @@ pub async fn transcribe_and_summarize(
     audio_path: String,
     template: String,
     user_notes: Option<String>,
+    copilot_session_id: Option<String>,
 ) -> Result<Option<Meeting>, String> {
     let prepared = crate::recording_spool::prepare_for_transcription(&audio_path)?;
     let processing_audio_path = prepared.system_path.clone();
@@ -1108,6 +1522,7 @@ pub async fn transcribe_and_summarize(
             let title = notes_only_title(&notes);
             let meeting = Meeting {
                 id: 0,
+                uid: String::new(),
                 title,
                 recorded_at: chrono::Utc::now().to_rfc3339(),
                 duration_seconds: transcribe_resp.duration_seconds,
@@ -1124,8 +1539,12 @@ pub async fn transcribe_and_summarize(
                 archived: false,
                 transcript_turns: Vec::new(),
             };
-            let new_id = crate::storage::insert_meeting(&meeting)
-                .map_err(|e| format!("Failed to save meeting: {e}"))?;
+            let new_id = crate::storage::insert_meeting_with_copilot_session(
+                &meeting,
+                copilot_session_id.as_deref(),
+            )
+            .map_err(|e| format!("Failed to save meeting: {e}"))?;
+            transcript_saved.store(true, Ordering::SeqCst);
             crate::second_brain::sync_async();
             return Ok(Some(Meeting {
                 id: new_id,
@@ -1144,6 +1563,7 @@ pub async fn transcribe_and_summarize(
         };
         let mut meeting = Meeting {
             id: 0, // auto-assigned by SQLite
+            uid: String::new(),
             // Replaced by the model's structured title in step 4, if it runs.
             title: transcript_only_title(PENDING_MEETING_TITLE, &transcript_text),
             recorded_at: chrono::Utc::now().to_rfc3339(),
@@ -1161,14 +1581,18 @@ pub async fn transcribe_and_summarize(
             archived: false,
             transcript_turns: turns,
         };
-        let new_id = crate::storage::insert_meeting(&meeting)
-            .map_err(|e| format!("Failed to save meeting: {e}"))?;
-        meeting.id = new_id;
+        let new_id = crate::storage::insert_meeting_with_copilot_session(
+            &meeting,
+            copilot_session_id.as_deref(),
+        )
+        .map_err(|e| format!("Failed to save meeting: {e}"))?;
         transcript_saved.store(true, Ordering::SeqCst);
+        meeting.id = new_id;
 
         // 3. Summarise with the user's configured model + default language. A
         // failure leaves the meeting with its transcript and no notes;
         // `spawn_notes_drain` fills them in once an engine exists.
+        let viewer_label = configured_viewer_label();
         let summarize_resp = match state
             .client
             .summarize(SummarizeParams {
@@ -1178,12 +1602,25 @@ pub async fn transcribe_and_summarize(
                 output_language: configured_language(),
                 user_notes: Some(notes.clone()),
                 attached_context: attached_context_for(new_id),
+                prior_meetings: prior_meetings_for(new_id),
+                accepted_live_items: accepted_live_items_for_viewer(
+                    copilot_session_id
+                        .as_deref()
+                        .map(crate::storage::accepted_live_items_for_session)
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("[copilot] accepted items unavailable: {e}");
+                            None
+                        })
+                        .unwrap_or_default(),
+                    viewer_label.as_deref(),
+                ),
                 llm_base_url: configured_llm_base_url(),
                 llm_api_key: configured_llm_api_key(),
                 known_attendees: None, // TODO: calendar roster
                 category_hint: transcribe_resp.category_hint.clone(),
                 auto_template: template == "general",
-                viewer_label: configured_viewer_label(),
+                viewer_label,
                 meeting_date: meeting_date_local(&meeting.recorded_at),
             })
             .await
@@ -1241,7 +1678,12 @@ pub async fn transcribe_and_summarize(
         // recording isn't lost; the user retries later with the Transcribe
         // button, and the transcription drain retries it automatically.
         Err(err) if !transcript_saved.load(Ordering::SeqCst) => {
-            match save_pending_meeting(&audio_path, &template, &notes) {
+            match save_pending_meeting(
+                &audio_path,
+                &template,
+                &notes,
+                copilot_session_id.as_deref(),
+            ) {
                 Ok(pending) => Ok(Some(pending)),
                 Err(save_err) => Err(format!(
                     "{err} (and the recording could not be saved for retry: {save_err})"
@@ -1267,9 +1709,15 @@ pub async fn transcribe_and_summarize(
 /// Transcribe button later calls `transcribe_meeting` to fill it in. This is
 /// the deliberate, narrow exception to "audio deleted after transcription" —
 /// audio lives on disk only while a recording is waiting to be transcribed.
-fn save_pending_meeting(audio_path: &str, template: &str, notes: &str) -> Result<Meeting, String> {
+fn save_pending_meeting(
+    audio_path: &str,
+    template: &str,
+    notes: &str,
+    copilot_session_id: Option<&str>,
+) -> Result<Meeting, String> {
     let meeting = Meeting {
         id: 0,
+        uid: String::new(),
         title: PENDING_MEETING_TITLE.to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
         // The spool knows how long it recorded before a single word is
@@ -1293,7 +1741,7 @@ fn save_pending_meeting(audio_path: &str, template: &str, notes: &str) -> Result
         archived: false,
         transcript_turns: Vec::new(),
     };
-    let new_id = crate::storage::insert_meeting(&meeting)
+    let new_id = crate::storage::insert_meeting_with_copilot_session(&meeting, copilot_session_id)
         .map_err(|e| format!("Failed to save the recording for later transcription: {e}"))?;
     if std::path::Path::new(audio_path).is_dir() {
         update_asset_state(audio_path, "pending", None)?;
@@ -1319,9 +1767,11 @@ pub async fn enqueue_recording(
     audio_path: String,
     template: String,
     user_notes: Option<String>,
+    copilot_session_id: String,
 ) -> Result<Meeting, String> {
+    let copilot_session_id = validate_live_copilot_session_id(&copilot_session_id)?;
     let notes = user_notes.unwrap_or_default();
-    let meeting = save_pending_meeting(&audio_path, &template, &notes)?;
+    let meeting = save_pending_meeting(&audio_path, &template, &notes, Some(copilot_session_id))?;
     // These single-valued path slots have served their purpose. The queue
     // transcribes from the DB row (via `transcribe_meeting`), NOT from these
     // shared slots — clearing them avoids a race where the next recording's
@@ -1329,6 +1779,14 @@ pub async fn enqueue_recording(
     *state.recording_path.lock().unwrap() = None;
     *state.mic_recording_path.lock().unwrap() = None;
     Ok(meeting)
+}
+
+fn validate_live_copilot_session_id(copilot_session_id: &str) -> Result<&str, String> {
+    let copilot_session_id = copilot_session_id.trim();
+    if copilot_session_id.is_empty() {
+        return Err("Copilot session id is required for a live recording".to_string());
+    }
+    Ok(copilot_session_id)
 }
 
 /// The mic WAV name paired with a system-audio WAV (`X.wav` → `X_mic.wav`), or
@@ -1545,7 +2003,7 @@ pub fn recover_recordings() -> Result<Vec<i64>, String> {
             continue;
         }
 
-        let meeting = save_pending_meeting(&path, "general", "")?;
+        let meeting = save_pending_meeting(&path, "general", "", None)?;
         recovered.push(meeting.id);
     }
     Ok(recovered)
@@ -1747,6 +2205,7 @@ pub async fn transcribe_meeting(
     // A failure here is survivable: the transcript is saved, NoteViewer offers
     // "Generate notes", and `spawn_notes_drain` retries every note-less meeting
     // as soon as an engine is configured. The error still reaches the caller.
+    let viewer_label = configured_viewer_label();
     let summarize_resp = match state
         .client
         .summarize(SummarizeParams {
@@ -1756,12 +2215,20 @@ pub async fn transcribe_meeting(
             output_language: configured_language(),
             user_notes: Some(meeting.user_notes.clone()),
             attached_context: attached_context_for(id),
+            prior_meetings: prior_meetings_for(id),
+            accepted_live_items: accepted_live_items_for_viewer(
+                crate::storage::accepted_live_items_for_meeting(id).unwrap_or_else(|e| {
+                    eprintln!("[copilot] accepted items unavailable: {e}");
+                    Vec::new()
+                }),
+                viewer_label.as_deref(),
+            ),
             llm_base_url: configured_llm_base_url(),
             llm_api_key: configured_llm_api_key(),
             known_attendees: None, // TODO: calendar roster
             category_hint: transcribe_resp.category_hint.clone(),
             auto_template: meeting.template_used == "general",
-            viewer_label: configured_viewer_label(),
+            viewer_label,
             meeting_date: meeting_date_local(&meeting.recorded_at),
         })
         .await
@@ -1851,6 +2318,7 @@ async fn write_missing_notes(app: &AppHandle, client: &HttpClient, id: i64) -> R
     if meeting.transcript.trim().is_empty() || !meeting.summary.trim().is_empty() {
         return Ok(());
     }
+    let viewer_label = configured_viewer_label();
     let summarize_resp = client
         .summarize(SummarizeParams {
             transcript: meeting.transcript.clone(),
@@ -1859,12 +2327,20 @@ async fn write_missing_notes(app: &AppHandle, client: &HttpClient, id: i64) -> R
             output_language: configured_language(),
             user_notes: Some(meeting.user_notes.clone()),
             attached_context: attached_context_for(id),
+            prior_meetings: prior_meetings_for(id),
+            accepted_live_items: accepted_live_items_for_viewer(
+                crate::storage::accepted_live_items_for_meeting(id).unwrap_or_else(|e| {
+                    eprintln!("[copilot] accepted items unavailable: {e}");
+                    Vec::new()
+                }),
+                viewer_label.as_deref(),
+            ),
             llm_base_url: configured_llm_base_url(),
             llm_api_key: configured_llm_api_key(),
             known_attendees: (!meeting.attendees.is_empty()).then(|| meeting.attendees.clone()),
             category_hint: None,  // the stored transcript is post-bleed-strip
             auto_template: false, // keep the template the meeting was recorded with
-            viewer_label: configured_viewer_label(),
+            viewer_label,
             meeting_date: meeting_date_local(&meeting.recorded_at),
         })
         .await?;
@@ -2060,6 +2536,8 @@ pub async fn import_audio(
                 user_notes: None,
                 // The imported meeting row is created only after this summary.
                 attached_context: None,
+                prior_meetings: Vec::new(),
+                accepted_live_items: Vec::new(),
                 llm_base_url,
                 llm_api_key,
                 known_attendees: None,
@@ -2082,6 +2560,7 @@ pub async fn import_audio(
         };
         let meeting = Meeting {
             id: 0,
+            uid: String::new(),
             title,
             recorded_at: chrono::Utc::now().to_rfc3339(),
             duration_seconds: transcribe_resp.duration_seconds,
@@ -2132,7 +2611,7 @@ pub async fn import_audio(
         // Failure: DON'T delete the audio. Save a "pending" meeting pointing at
         // the kept copy so the user can retry via transcribe_meeting — same
         // data-safety guarantee as live recordings.
-        Err(err) => match save_pending_meeting(&dest_path, &template, "") {
+        Err(err) => match save_pending_meeting(&dest_path, &template, "", None) {
             Ok(pending) => Ok(pending),
             Err(save_err) => Err(format!(
                 "{err} (and the imported audio could not be saved for retry: {save_err})"
@@ -2242,9 +2721,100 @@ fn attached_context_for(meeting_id: i64) -> Option<String> {
     (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
+/// The attached previous meetings with their OPEN action items, in attachment
+/// order. Up to 3 meetings, 8 items each; item text is capped at 200 chars.
+fn prior_meetings_for(meeting_id: i64) -> Vec<crate::types::PriorMeeting> {
+    let Ok(conn) = crate::storage::connect_for_sync() else {
+        return Vec::new();
+    };
+    prior_meetings_for_on(&conn, meeting_id)
+}
+
+fn prior_meetings_for_on(
+    conn: &rusqlite::Connection,
+    meeting_id: i64,
+) -> Vec<crate::types::PriorMeeting> {
+    const MEETING_LIMIT: usize = 3;
+    const ITEM_LIMIT: usize = 8;
+    const ITEM_CHAR_LIMIT: usize = 200;
+
+    let Ok(attachments) = crate::storage::list_meeting_attachments_on(conn, meeting_id) else {
+        return Vec::new();
+    };
+
+    let mut prior_meetings = Vec::new();
+    for attachment in attachments {
+        if attachment.kind != "meeting" {
+            continue;
+        }
+        let Ok(prior_id) = attachment.value.parse::<i64>() else {
+            continue;
+        };
+        let Ok(Some(meeting)) = crate::storage::get_meeting_on(conn, prior_id) else {
+            continue;
+        };
+        let title = if meeting.title.trim().is_empty() {
+            attachment.label
+        } else {
+            meeting.title
+        };
+
+        let chars: Vec<char> = meeting.recorded_at.chars().take(10).collect();
+        let date = if chars.len() == 10 && chars[4] == '-' && chars[7] == '-' {
+            chars.into_iter().collect::<String>()
+        } else {
+            String::new()
+        };
+
+        let action_items =
+            crate::storage::get_action_items_on(conn, Some(prior_id)).unwrap_or_default();
+        let open_items = action_items
+            .into_iter()
+            .filter(|item| !item.done)
+            .map(|item| {
+                let assignee = item.assignee.trim();
+                let text = item.text.trim();
+                let mut formatted = if !assignee.is_empty() {
+                    format!("{assignee}: {text}")
+                } else {
+                    text.to_string()
+                };
+                let due = item.due.trim();
+                if !due.is_empty() {
+                    formatted.push_str(&format!(" (due {due})"));
+                }
+                let trimmed = formatted.trim();
+                if trimmed.chars().count() <= ITEM_CHAR_LIMIT {
+                    trimmed.to_string()
+                } else {
+                    let mut s: String = trimmed
+                        .chars()
+                        .take(ITEM_CHAR_LIMIT.saturating_sub(1))
+                        .collect();
+                    s.push('…');
+                    s
+                }
+            })
+            .take(ITEM_LIMIT)
+            .collect::<Vec<String>>();
+
+        prior_meetings.push(crate::types::PriorMeeting {
+            title,
+            date,
+            open_items,
+        });
+
+        if prior_meetings.len() == MEETING_LIMIT {
+            break;
+        }
+    }
+
+    prior_meetings
+}
+
 /// The Ollama model configured by the user, or `None` to let the service
 /// use its default. Read fresh so a Settings change takes effect next run.
-fn configured_model() -> Option<String> {
+pub fn configured_model() -> Option<String> {
     let config = crate::config::load_config();
     if config.llm_provider == "local" {
         if let Some(selected) = selected_ollama_tier() {
@@ -2317,6 +2887,26 @@ fn configured_viewer_label() -> Option<String> {
     configured_user_name()
 }
 
+/// Resolve the live speaker label only in the outgoing summary payload.
+/// Stored live items keep their original owners for the recording/history UI.
+fn accepted_live_items_for_viewer(
+    mut items: Vec<crate::types::AcceptedLiveItem>,
+    viewer_label: Option<&str>,
+) -> Vec<crate::types::AcceptedLiveItem> {
+    if let Some(name) = viewer_label.filter(|name| !name.trim().is_empty()) {
+        for item in &mut items {
+            if item
+                .owner
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case("me"))
+            {
+                item.owner = Some(name.to_string());
+            }
+        }
+    }
+    items
+}
+
 /// The default summary output language ("en" | "ar" | "auto"), read fresh so a
 /// Settings change takes effect on the next summary. `None` lets the service
 /// default to English.
@@ -2325,28 +2915,46 @@ fn configured_language() -> Option<String> {
     (!lang.trim().is_empty()).then_some(lang)
 }
 
-/// The cloud LLM base URL from config, or `None` when the provider is local or
-/// the URL is blank. Read fresh so a Settings change takes effect next request.
-fn configured_llm_base_url() -> Option<String> {
+/// The base URL for the local LLM engine (managed Ollama or Rapid-MLX),
+/// independent of the user's notes LLM provider setting.
+pub fn local_llm_base_url() -> Option<String> {
     let config = crate::config::load_config();
-    if config.llm_provider == "local" && selected_ollama_tier().is_some() {
+    if selected_ollama_tier().is_some() {
         return crate::setup::managed_ollama_host();
     }
-    // An Ollama tag can NEVER be served by Rapid-MLX, so it has to be routed
-    // to Ollama before the managed-credentials branch below. macOS made
-    // Ollama models selectable (setup_status lists what the user already
-    // pulled) but the Python summarizer hardcodes the openai backend on Apple
-    // Silicon — so the tag went to Rapid-MLX and 404'd with "The model
-    // `qwen3.6:35b` does not exist". Ollama's own OpenAI-compatible endpoint
-    // keeps that one code path and needs no key.
-    if config.llm_provider == "local" && is_ollama_tag(&config.ollama_model) {
+    if is_ollama_tag(&config.ollama_model) {
         return Some(OLLAMA_OPENAI_BASE_URL.to_string());
     }
     if let Some((base_url, _)) = crate::setup::managed_credentials() {
         return Some(base_url);
     }
+    None
+}
+
+pub fn local_llm_model() -> Option<String> {
+    let config = crate::config::load_config();
+    if let Some(selected) = selected_ollama_tier() {
+        let memory_gb = sysinfo::System::new_all().total_memory() / 1_000_000_000;
+        let version = crate::ollama_engine::current_version().unwrap_or_default();
+        return Some(
+            crate::ollama_engine::effective_tag(selected, memory_gb, &version).to_string(),
+        );
+    }
+    if is_ollama_tag(&config.ollama_model) {
+        return Some(config.ollama_model);
+    }
+    None
+}
+
+/// The cloud LLM base URL from config, or `None` when the provider is local or
+/// the URL is blank. Read fresh so a Settings change takes effect next request.
+fn configured_llm_base_url() -> Option<String> {
+    let config = crate::config::load_config();
     if config.llm_provider == "local" {
-        return None;
+        return local_llm_base_url();
+    }
+    if let Some((base_url, _)) = crate::setup::managed_credentials() {
+        return Some(base_url);
     }
     let url = config.llm_base_url.trim().to_string();
     (!url.is_empty()).then_some(url)
@@ -3468,6 +4076,7 @@ pub async fn resummarize_meeting(
         .or_else(configured_language);
     let llm_base_url = configured_llm_base_url();
     let llm_api_key = configured_llm_api_key();
+    let viewer_label = configured_viewer_label();
     let summarize_resp = state
         .client
         .summarize(SummarizeParams {
@@ -3477,12 +4086,20 @@ pub async fn resummarize_meeting(
             output_language: language,
             user_notes: Some(meeting.user_notes.clone()),
             attached_context: attached_context_for(id),
+            prior_meetings: prior_meetings_for(id),
+            accepted_live_items: accepted_live_items_for_viewer(
+                crate::storage::accepted_live_items_for_meeting(id).unwrap_or_else(|e| {
+                    eprintln!("[copilot] accepted items unavailable: {e}");
+                    Vec::new()
+                }),
+                viewer_label.as_deref(),
+            ),
             llm_base_url,
             llm_api_key,
             known_attendees: (!meeting.attendees.is_empty()).then(|| meeting.attendees.clone()),
             category_hint: None,  // stored transcript is already post-bleed-strip
             auto_template: false, // explicit user choice — never route
-            viewer_label: configured_viewer_label(),
+            viewer_label,
             meeting_date: meeting_date_local(&meeting.recorded_at),
         })
         .await?;
@@ -3581,6 +4198,8 @@ pub async fn structure_note(
             output_language: configured_language(),
             user_notes: None,
             attached_context: attached_context_for(id),
+            prior_meetings: prior_meetings_for(id),
+            accepted_live_items: Vec::new(),
             llm_base_url: configured_llm_base_url(),
             llm_api_key: configured_llm_api_key(),
             known_attendees: None,
@@ -3641,6 +4260,22 @@ pub async fn update_meeting_tags(id: i64, tags: Vec<Tag>) -> Result<(), String> 
     Ok(())
 }
 
+/// Rename a meeting (user edit in the note view). Returns the saved title.
+#[tauri::command]
+pub async fn update_meeting_title(id: i64, title: String) -> Result<String, String> {
+    let trimmed = title.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Title can't be empty.".to_string());
+    }
+    if trimmed.chars().count() > 200 {
+        return Err("Title is too long (200 characters max).".to_string());
+    }
+    crate::storage::update_meeting_title(id, &trimmed)
+        .map_err(|e| format!("Failed to update title: {e}"))?;
+    crate::second_brain::sync_async();
+    Ok(trimmed)
+}
+
 /// Replace a meeting's user notes with an edited version.
 #[tauri::command]
 pub async fn update_meeting_notes(id: i64, notes: String) -> Result<(), String> {
@@ -3662,6 +4297,7 @@ pub async fn create_note(app: AppHandle, title: String, body: String) -> Result<
     };
     let meeting = Meeting {
         id: 0,
+        uid: String::new(),
         title: final_title.to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
         duration_seconds: 0.0,
@@ -3797,19 +4433,12 @@ pub async fn export_html(default_name: String, contents: String) -> Result<Optio
 // Meeting bundle export / import (*.adversaria.json)
 // ---------------------------------------------------------------------------
 
-const BUNDLE_SCHEMA_VERSION: i64 = 1;
-
-/// One action item parsed from a bundle, ready to insert.
-struct BundleActionItem {
-    ord: i64,
-    text: String,
-    assignee: String,
-    due: String,
-    done: bool,
-}
+pub use crate::adversaria_doc::{
+    check_schema_version, meeting_to_bundle_json, parse_bundle_meeting, BundleActionItem,
+};
 
 /// Sanitize a meeting title into a filesystem-safe file stem.
-fn safe_file_stem(title: &str) -> String {
+pub fn safe_file_stem(title: &str) -> String {
     let s: String = title
         .chars()
         .map(|c| {
@@ -3827,207 +4456,124 @@ fn safe_file_stem(title: &str) -> String {
     }
 }
 
-/// Reject bundles whose schema version this build doesn't understand.
-fn check_schema_version(bundle: &serde_json::Value) -> Result<(), String> {
-    let v = bundle
-        .get("schema_version")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0);
-    if v != BUNDLE_SCHEMA_VERSION {
-        return Err(format!(
-            "This bundle needs a different version of Adversaria (schema v{v}; this version supports v{BUNDLE_SCHEMA_VERSION})."
-        ));
-    }
-    Ok(())
-}
+/// Export meetings or a folder to a `.adversaria` document via a native save dialog.
+///
+/// When `folder_id` is given, all meetings filed in that folder (+ the folder record)
+/// are exported. Otherwise, the listed `meeting_ids` are exported.
+/// Returns `Ok(Some(path))` on success, or `Ok(None)` if cancelled.
+#[tauri::command]
+pub async fn export_adversaria(
+    meeting_ids: Vec<i64>,
+    folder_id: Option<i64>,
+) -> Result<Option<String>, String> {
+    let conn = crate::storage::connect_for_sync().map_err(|e| e.to_string())?;
+    let doc = crate::adversaria_doc::build_document(&conn, &meeting_ids, folder_id)
+        .map_err(|e| format!("Failed to build document: {e}"))?;
 
-fn bundle_string(obj: &serde_json::Value, key: &str) -> Result<String, String> {
-    obj.get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("Bundle is missing the required field: {key}"))
-}
-
-fn bundle_string_or(obj: &serde_json::Value, key: &str, default: &str) -> String {
-    obj.get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn bundle_string_array(obj: &serde_json::Value, key: &str) -> Vec<String> {
-    obj.get(key)
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn bundle_tags(obj: &serde_json::Value) -> Vec<Tag> {
-    obj.get("tags")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| {
-                    Some(Tag {
-                        label: v.get("label")?.as_str()?.to_string(),
-                        color: v.get("color")?.as_str()?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn bundle_transcript_turns(obj: &serde_json::Value) -> Vec<crate::types::TranscriptTurn> {
-    obj.get("transcript_turns")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| {
-                    Some(crate::types::TranscriptTurn {
-                        speaker: v.get("speaker")?.as_str()?.to_string(),
-                        text: v.get("text")?.as_str()?.to_string(),
-                        start: v.get("start").and_then(|s| s.as_f64()),
-                        end: v.get("end").and_then(|s| s.as_f64()),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Serialize a meeting + its action items into the per-meeting bundle object
-/// (the value stored under the "meeting" key). Pure — no I/O.
-/// `id`, `audio_file_path`, `pinned`, `locked` are intentionally NOT exported.
-fn meeting_to_bundle_json(meeting: &Meeting, action_items: &[ActionItem]) -> serde_json::Value {
-    serde_json::json!({
-        "title": meeting.title,
-        "recorded_at": meeting.recorded_at,
-        "duration_seconds": meeting.duration_seconds,
-        "template_used": meeting.template_used,
-        "transcript": meeting.transcript,
-        "transcript_turns": meeting.transcript_turns,
-        "summary": meeting.summary,
-        "attendees": meeting.attendees,
-        "user_notes": meeting.user_notes,
-        "link": meeting.link,
-        "tags": meeting.tags,
-        "action_items": action_items.iter().map(|a| serde_json::json!({
-            "ord": a.ord,
-            "text": a.text,
-            "assignee": a.assignee,
-            "due": a.due,
-            "done": a.done,
-        })).collect::<Vec<_>>(),
-    })
-}
-
-/// Parse the "meeting" object of a bundle into a fresh `Meeting` (id=0) plus its
-/// action items. Pure — no I/O. Only `title` and `recorded_at` are required;
-/// everything else falls back to a sensible default.
-fn parse_bundle_meeting(m: &serde_json::Value) -> Result<(Meeting, Vec<BundleActionItem>), String> {
-    let meeting = Meeting {
-        id: 0,
-        title: bundle_string(m, "title")?,
-        // Normalize to UTC: the meetings list sorts recorded_at LEXICOGRAPHICALLY
-        // (live recordings are always +00:00), so an imported "+05:00" timestamp
-        // would sort by its local hour digits, not its actual instant.
-        recorded_at: {
-            let raw = bundle_string(m, "recorded_at")?;
-            chrono::DateTime::parse_from_rfc3339(&raw)
-                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
-                .unwrap_or(raw)
-        },
-        duration_seconds: m
-            .get("duration_seconds")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
-        transcript: bundle_string_or(m, "transcript", ""),
-        summary: bundle_string_or(m, "summary", ""),
-        template_used: bundle_string_or(m, "template_used", "general"),
-        audio_file_path: None,
-        attendees: bundle_string_array(m, "attendees"),
-        user_notes: bundle_string_or(m, "user_notes", ""),
-        link: bundle_string_or(m, "link", ""),
-        tags: bundle_tags(m),
-        pinned: false,
-        locked: false,
-        archived: false,
-        transcript_turns: bundle_transcript_turns(m),
+    let default_name = if let Some(fid) = folder_id {
+        let folder = crate::storage::get_folder_on(&conn, fid)
+            .map_err(|e| format!("Failed to load folder: {e}"))?
+            .ok_or_else(|| format!("Folder not found: {fid}"))?;
+        format!("{}.adversaria", safe_file_stem(&folder.name))
+    } else if meeting_ids.len() == 1 {
+        let m = crate::storage::get_meeting_on(&conn, meeting_ids[0])
+            .map_err(|e| format!("Failed to load meeting: {e}"))?
+            .ok_or_else(|| format!("Meeting not found: {}", meeting_ids[0]))?;
+        format!("{}.adversaria", safe_file_stem(&m.title))
+    } else {
+        "meetings.adversaria".to_string()
     };
-    let action_items = m
-        .get("action_items")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|item| BundleActionItem {
-                    ord: item.get("ord").and_then(|v| v.as_i64()).unwrap_or(0),
-                    text: item
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    assignee: item
-                        .get("assignee")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    due: item
-                        .get("due")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    done: item.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok((meeting, action_items))
+
+    let path = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("Export Adversaria document")
+            .set_file_name(&default_name)
+            .add_filter("Adversaria document", &["adversaria"])
+            .save_file()
+    })
+    .await
+    .map_err(|e| format!("File dialog failed: {e}"))?;
+
+    match path {
+        Some(p) => {
+            crate::adversaria_doc::write_document(&p, &doc)
+                .map_err(|e| format!("Failed to write document: {e}"))?;
+            Ok(Some(p.to_string_lossy().into_owned()))
+        }
+        None => Ok(None),
+    }
 }
 
-/// Insert a parsed bundle "meeting" object (meeting + action items) under a
-/// fresh id. Returns the new meeting id.
-fn insert_bundle_meeting(m: &serde_json::Value) -> Result<i64, String> {
-    let (meeting, action_items) = parse_bundle_meeting(m)?;
-    let new_id = crate::storage::insert_meeting(&meeting)
-        .map_err(|e| format!("Failed to save imported meeting: {e}"))?;
-    if !action_items.is_empty() {
-        let conn = crate::storage::connect_for_sync().map_err(|e| e.to_string())?;
-        for item in &action_items {
-            conn.execute(
-                "INSERT INTO action_items (meeting_id, ord, text, assignee, due, done)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    new_id,
-                    item.ord,
-                    item.text,
-                    item.assignee,
-                    item.due,
-                    item.done as i32
-                ],
-            )
-            .map_err(|e| format!("Failed to insert action item: {e}"))?;
+/// Import an `.adversaria` document or legacy bundle.
+///
+/// If `path` is `None`, opens a native file picker filtered to `.adversaria`
+/// and legacy `.json`. Returns `Ok(Some(report))` or `Ok(None)` if cancelled.
+#[tauri::command]
+pub async fn import_adversaria(
+    path: Option<String>,
+) -> Result<Option<crate::types::ImportReport>, String> {
+    let file_path = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let picked = tokio::task::spawn_blocking(|| {
+                rfd::FileDialog::new()
+                    .set_title("Import Adversaria document")
+                    .add_filter("Adversaria document", &["adversaria"])
+                    .add_filter("Adversaria Bundle (legacy)", &["json"])
+                    .pick_file()
+            })
+            .await
+            .map_err(|e| format!("File dialog failed: {e}"))?;
+            match picked {
+                Some(p) => p,
+                None => return Ok(None),
+            }
         }
-    }
-    Ok(new_id)
+    };
+
+    let raw =
+        std::fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {e}"))?;
+    let parsed = crate::adversaria_doc::parse_document(&raw)
+        .map_err(|e| format!("Failed to parse document: {e}"))?;
+
+    let conn = crate::storage::connect_for_sync().map_err(|e| e.to_string())?;
+    let mut report = crate::adversaria_doc::import_document_on(&conn, parsed)
+        .map_err(|e| format!("Import failed: {e}"))?;
+    report.path = file_path.to_string_lossy().into_owned();
+
+    crate::second_brain::sync_async();
+    Ok(Some(report))
+}
+
+/// Retrieve and drain pending file paths opened before the frontend mounted.
+#[tauri::command]
+pub async fn take_pending_open_files(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state
+        .frontend_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut pending = state
+        .pending_open_files
+        .lock()
+        .map_err(|e| format!("Failed to lock pending open files: {e}"))?;
+    let files = std::mem::take(&mut *pending);
+    Ok(files)
 }
 
 /// Export a single meeting to a self-contained `*.adversaria.json` bundle via a
 /// native save dialog. Resolves to the saved path, or `None` if cancelled.
 #[tauri::command]
 pub async fn export_meeting_bundle(id: i64) -> Result<Option<String>, String> {
-    let meeting = crate::storage::get_meeting(id)
+    let conn = crate::storage::connect_for_sync().map_err(|e| e.to_string())?;
+    let meeting = crate::storage::get_meeting_on(&conn, id)
         .map_err(|e| format!("Failed to load meeting: {e}"))?
         .ok_or_else(|| format!("Meeting not found: {id}"))?;
-    let action_items = crate::storage::get_action_items(Some(id))
+    let action_items = crate::storage::get_action_items_on(&conn, Some(id))
         .map_err(|e| format!("Failed to load action items: {e}"))?;
 
     let bundle = serde_json::json!({
-        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "schema_version": crate::adversaria_doc::LEGACY_BUNDLE_SCHEMA_VERSION,
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "app_version": env!("CARGO_PKG_VERSION"),
         "meeting": meeting_to_bundle_json(&meeting, &action_items),
@@ -4058,31 +4604,48 @@ pub async fn export_meeting_bundle(id: i64) -> Result<Option<String>, String> {
 /// Inserts under a fresh id and returns the new Meeting, or `None` if cancelled.
 #[tauri::command]
 pub async fn import_meeting_bundle() -> Result<Option<Meeting>, String> {
-    let path = tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .add_filter("Adversaria Bundle", &["json"])
-            .pick_file()
-    })
-    .await
-    .map_err(|e| format!("File dialog failed: {e}"))?;
-    let path = match path {
-        Some(p) => p,
-        None => return Ok(None),
-    };
+    let report = import_adversaria(None).await?;
+    match report {
+        Some(rep) => {
+            if let Some(&m_id) = rep.meeting_ids.first() {
+                let conn = crate::storage::connect_for_sync().map_err(|e| e.to_string())?;
+                let meeting = crate::storage::get_meeting_on(&conn, m_id)
+                    .map_err(|e| format!("Failed to reload imported meeting: {e}"))?
+                    .ok_or_else(|| "Meeting not found after import.".to_string())?;
+                Ok(Some(meeting))
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
+    }
+}
 
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read bundle: {e}"))?;
-    let bundle: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|_| "The selected file is not a valid Adversaria bundle.".to_string())?;
-    check_schema_version(&bundle)?;
-    let m = bundle
-        .get("meeting")
-        .ok_or_else(|| "Bundle is missing the 'meeting' key.".to_string())?;
-    let new_id = insert_bundle_meeting(m)?;
-    let meeting = crate::storage::get_meeting(new_id)
-        .map_err(|e| format!("Failed to reload imported meeting: {e}"))?
-        .ok_or_else(|| "Meeting not found after import.".to_string())?;
-    crate::second_brain::sync_async();
-    Ok(Some(meeting))
+/// Insert a parsed bundle "meeting" object (meeting + action items) under a
+/// fresh id. Returns the new meeting id.
+fn insert_bundle_meeting(m: &serde_json::Value) -> Result<i64, String> {
+    let (meeting, action_items) = parse_bundle_meeting(m)?;
+    let new_id = crate::storage::insert_meeting(&meeting)
+        .map_err(|e| format!("Failed to save imported meeting: {e}"))?;
+    if !action_items.is_empty() {
+        let conn = crate::storage::connect_for_sync().map_err(|e| e.to_string())?;
+        for item in &action_items {
+            conn.execute(
+                "INSERT INTO action_items (meeting_id, ord, text, assignee, due, done)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    new_id,
+                    item.ord,
+                    item.text,
+                    item.assignee,
+                    item.due,
+                    item.done as i32
+                ],
+            )
+            .map_err(|e| format!("Failed to insert action item: {e}"))?;
+        }
+    }
+    Ok(new_id)
 }
 
 /// Back up ALL meetings (+ action items + Ask conversation) to one JSON file via
@@ -4111,7 +4674,7 @@ pub async fn export_all_meetings() -> Result<Option<String>, String> {
         .collect::<Vec<_>>();
 
     let bundle = serde_json::json!({
-        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "schema_version": crate::adversaria_doc::LEGACY_BUNDLE_SCHEMA_VERSION,
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "app_version": env!("CARGO_PKG_VERSION"),
         "type": "full_backup",
@@ -4697,14 +5260,20 @@ pub async fn update_config(
 /// Ping the Python ML service and return its health status.
 #[tauri::command]
 pub async fn check_service_health(state: State<'_, AppState>) -> Result<HealthResponse, String> {
-    if let Some(ollama_host) = crate::setup::managed_ollama_host() {
+    let ollama_host = crate::setup::managed_ollama_host();
+    let local_openai_base_url = crate::setup::managed_credentials()
+        .and_then(|(base_url, key)| (!key.trim().is_empty()).then_some(base_url));
+    if ollama_host.is_some() || local_openai_base_url.is_some() {
         let _ = reqwest::Client::new()
             .post(format!(
                 "{}/setup/llm_host",
                 state.client.current_base_url()
             ))
             .timeout(std::time::Duration::from_secs(2))
-            .json(&serde_json::json!({ "ollama_host": ollama_host }))
+            .json(&serde_json::json!({
+                "ollama_host": ollama_host,
+                "local_openai_base_url": local_openai_base_url,
+            }))
             .send()
             .await;
     }
@@ -5176,6 +5745,8 @@ pub async fn test_local_setup(state: State<'_, AppState>) -> Result<String, Stri
             output_language: Some("en".to_string()),
             user_notes: None,
             attached_context: None, // connectivity smoke test; no meeting exists
+            prior_meetings: Vec::new(),
+            accepted_live_items: Vec::new(),
             llm_base_url: base_url,
             llm_api_key: api_key,
             known_attendees: Some(vec!["Amina".to_string(), "Omar".to_string()]),
@@ -5216,6 +5787,8 @@ pub async fn test_cloud_setup(
             output_language: Some("en".to_string()),
             user_notes: None,
             attached_context: None, // connectivity smoke test; no meeting exists
+            prior_meetings: Vec::new(),
+            accepted_live_items: Vec::new(),
             llm_base_url: Some(base_url),
             llm_api_key: Some(api_key),
             known_attendees: Some(vec!["Amina".to_string(), "Omar".to_string()]),
@@ -5382,17 +5955,10 @@ pub async fn calendar_connect(
             |url| {
                 // Open the authorize URL in the system browser.
                 // We use platform commands rather than tauri-plugin-shell
-                // because we're inside spawn_blocking (no async).
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("open").arg(url).spawn();
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/c", "start", url])
-                        .spawn();
-                }
+                // because we're inside spawn_blocking (no async). On Windows
+                // this must not go through `cmd /c start`, which cut the URL
+                // at its first `&` (see os_shell).
+                let _ = crate::os_shell::open_default(url);
             },
         )
     })
@@ -5574,25 +6140,15 @@ pub async fn probe_system_audio(
     Ok(crate::permissions::check())
 }
 
-/// Open the exact System Settings pane for a permission.
+/// Open the exact settings pane for a permission: System Settings › Privacy on
+/// macOS, Settings › Privacy › Microphone (or Sound) on Windows.
 #[tauri::command]
-pub async fn open_privacy_settings(app: AppHandle, which: String) -> Result<(), String> {
-    let _ = app;
-    let _ = &which;
-    // `open` handles the x-apple.systempreferences: scheme; the shell plugin's
-    // scope would need a matching allowlist entry for a URL this exotic.
-    // Windows has no equivalent deep link (permissions::check() reports
-    // everything granted there), so the whole body is macOS-only — including
-    // resolving the URL, which is otherwise an unused-variable error under the
-    // `-D warnings` clippy gate.
-    #[cfg(target_os = "macos")]
-    {
-        let url = crate::permissions::settings_url(&which);
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("Couldn't open System Settings: {e}"))?;
-    }
+pub async fn open_privacy_settings(which: String) -> Result<(), String> {
+    // `open` / rundll32 handle the x-apple.systempreferences: and ms-settings:
+    // schemes; the shell plugin's scope would need an allowlist entry for
+    // URLs this exotic.
+    let url = crate::permissions::settings_url(&which);
+    crate::os_shell::open_default(url).map_err(|e| format!("Couldn't open settings: {e}"))?;
     Ok(())
 }
 
@@ -5723,7 +6279,13 @@ async fn feed_live_source(
             let path_str = path.to_string_lossy().to_string();
             match client.live_feed(&path_str, epoch, source).await {
                 Ok(result) => {
-                    for text in result.captions {
+                    if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
+                        return from_byte;
+                    }
+                    for (caption_index, text) in result.captions.into_iter().enumerate() {
+                        if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
+                            return from_byte;
+                        }
                         if text.trim().is_empty() {
                             continue;
                         }
@@ -5735,16 +6297,40 @@ async fn feed_live_source(
                         if recent.len() > 8 {
                             recent.remove(0);
                         }
+                        if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
+                            return from_byte;
+                        }
                         let _ = app.emit(
                             "live-transcript",
                             LiveTranscript {
-                                text,
+                                text: text.clone(),
                                 source: source.to_string(),
                             },
                         );
+                        if source == "them" {
+                            let boundary = result
+                                .caption_boundaries
+                                .get(caption_index)
+                                .map(String::as_str)
+                                .unwrap_or("silence");
+                            crate::copilot_session::on_them_caption(app, epoch, &text, boundary);
+                        } else if source == "me" {
+                            let boundary = result
+                                .caption_boundaries
+                                .get(caption_index)
+                                .map(String::as_str)
+                                .unwrap_or("silence");
+                            crate::copilot_session::on_me_caption(app, epoch, &text, boundary);
+                        }
                     }
                     if result.partial != *last_partial {
+                        if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
+                            return from_byte;
+                        }
                         *last_partial = result.partial.clone();
+                        if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
+                            return from_byte;
+                        }
                         let _ = app.emit(
                             "live-partial",
                             LivePartial {
@@ -5766,9 +6352,7 @@ async fn feed_live_source(
     }
 }
 
-fn spawn_live_caption(app: AppHandle) {
-    use std::sync::atomic::Ordering;
-    let epoch = LIVE_CAPTION_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+fn spawn_live_caption(app: AppHandle, epoch: u64) {
     tokio::spawn(async move {
         // Per-epoch files: even a not-yet-exited stale loop can't corrupt ours.
         // System audio ("them") and the mic ("me") are separate append-only
@@ -5809,6 +6393,9 @@ fn spawn_live_caption(app: AppHandle) {
                 &mut partial_sys,
             )
             .await;
+            if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) != epoch {
+                break;
+            }
             let mic_snap = state.capture.snapshot_mic_since(&mic_path, from_mic);
             from_mic = feed_live_source(
                 &app,
@@ -5823,15 +6410,17 @@ fn spawn_live_caption(app: AppHandle) {
             )
             .await;
         }
-        for (source, last) in [("them", &partial_sys), ("me", &partial_mic)] {
-            if !last.is_empty() {
-                let _ = app.emit(
-                    "live-partial",
-                    LivePartial {
-                        text: String::new(),
-                        source: source.to_string(),
-                    },
-                );
+        if LIVE_CAPTION_EPOCH.load(Ordering::SeqCst) == epoch {
+            for (source, last) in [("them", &partial_sys), ("me", &partial_mic)] {
+                if !last.is_empty() {
+                    let _ = app.emit(
+                        "live-partial",
+                        LivePartial {
+                            text: String::new(),
+                            source: source.to_string(),
+                        },
+                    );
+                }
             }
         }
         // Best-effort cleanup of this loop's delta temp files.
@@ -6025,6 +6614,125 @@ pub async fn rename_folder(id: i64, name: String) -> Result<(), String> {
 pub async fn set_folder_instructions(id: i64, instructions: String) -> Result<(), String> {
     crate::storage::set_folder_instructions(id, &instructions)
         .map_err(|e| format!("Failed to update folder instructions: {e}"))
+}
+
+/// Return a deterministic brief from the meetings explicitly filed in a folder.
+#[tauri::command]
+pub async fn get_folder_copilot_brief(folder_id: i64) -> Result<FolderCopilotBrief, String> {
+    crate::storage::get_folder_copilot_brief(folder_id)
+        .map_err(|e| format!("Failed to get folder copilot brief: {e}"))?
+        .ok_or_else(|| "Folder not found".to_string())
+}
+
+/// Update a folder's default copilot mode.
+#[tauri::command]
+pub async fn set_folder_copilot_mode(folder_id: i64, mode: String) -> Result<(), String> {
+    if !matches!(mode.as_str(), "no_ai" | "local" | "claude" | "deepseek") {
+        return Err(format!("Unknown copilot mode: {mode}"));
+    }
+    crate::storage::set_folder_copilot_mode(folder_id, &mode)
+        .map_err(|e| format!("Failed to update folder copilot mode: {e}"))
+}
+
+/// List the sources explicitly approved for this folder.
+#[tauri::command]
+pub async fn list_folder_sources(
+    folder_id: i64,
+) -> Result<Vec<crate::types::FolderSource>, String> {
+    tokio::task::spawn_blocking(move || crate::storage::list_folder_sources(folder_id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn add_folder_source(
+    folder_id: i64,
+    path: String,
+    kind: String,
+) -> Result<crate::types::FolderSource, String> {
+    tokio::task::spawn_blocking(move || {
+        if crate::storage::get_folder(folder_id)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err("Folder not found".to_string());
+        }
+        crate::folder_sources::validate_source(&path, &kind)?;
+        let path = std::fs::canonicalize(&path)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        let source = crate::storage::insert_folder_source(
+            folder_id,
+            &path,
+            &kind,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .map_err(|e| e.to_string())?;
+        crate::folder_sources::sync_folder_sources(folder_id).map_err(|e| e.to_string())?;
+        crate::storage::list_folder_sources(folder_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|row| row.id == source.id)
+            .ok_or_else(|| "Folder source not found".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn remove_folder_source(source_id: i64) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::storage::delete_folder_source(source_id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn refresh_folder_profile(
+    state: State<'_, AppState>,
+    folder_id: i64,
+) -> Result<String, String> {
+    crate::folder_sources::refresh_folder_profile(&state.client, folder_id).await
+}
+
+#[tauri::command]
+pub async fn set_folder_copilot_fields(
+    folder_id: i64,
+    purpose: String,
+    voice_1: String,
+    voice_2: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::storage::set_folder_copilot_fields(folder_id, &purpose, &voice_1, &voice_2)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_folder_profile(folder_id: i64, profile: String) -> Result<(), String> {
+    let profile = profile.trim().to_string();
+    if profile.chars().count() > 1_200 {
+        return Err("Profile exceeds 1200 characters".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::storage::set_folder_profile_manual(folder_id, &profile)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn pick_folder_path() -> Result<Option<String>, String> {
+    let path = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_folder())
+        .await
+        .map_err(|e| format!("File dialog failed: {e}"))?;
+    Ok(path.map(|p| p.to_string_lossy().into_owned()))
 }
 
 /// Update a folder's sidebar color.
@@ -6542,15 +7250,13 @@ pub async fn get_latest_workspace_run(task_id: i64) -> Result<Option<WorkspaceRu
         .map_err(|error| format!("Failed to load workspace run: {error}"))
 }
 
-/// Open an artifact with the macOS default application.
+/// Open an artifact with the platform's default application.
 #[tauri::command]
 pub async fn open_workspace_artifact(path: String) -> Result<(), String> {
     if !std::path::Path::new(&path).exists() {
         return Err(format!("Artifact file is missing: {path}"));
     }
-    std::process::Command::new("open")
-        .arg(&path)
-        .spawn()
+    crate::os_shell::open_default(&path)
         .map_err(|error| format!("Couldn't open workspace artifact: {error}"))?;
     Ok(())
 }
@@ -6585,19 +7291,8 @@ pub async fn reveal_workspace_artifact(path: String) -> Result<(), String> {
         return Err(format!("Artifact file is missing: {path}"));
     }
 
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open")
-        .arg("-R")
-        .arg(&path)
-        .spawn();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("explorer")
-        .arg(format!("/select,{path}"))
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return Err("Couldn't reveal workspace artifact: unsupported platform".to_string());
-
-    result.map_err(|error| format!("Couldn't reveal workspace artifact: {error}"))?;
+    crate::os_shell::reveal(&path)
+        .map_err(|error| format!("Couldn't reveal workspace artifact: {error}"))?;
     Ok(())
 }
 
@@ -6951,7 +7646,7 @@ async fn execute_workspace_run_inner(
     }
 
     let mut command = if engine == "claude" {
-        let mut command = std::process::Command::new("claude");
+        let mut command = std::process::Command::new(crate::os_shell::resolve_cli("claude"));
         command
             .arg("-p")
             .arg(&brief)
@@ -6967,7 +7662,7 @@ async fn execute_workspace_run_inner(
         }
         command
     } else {
-        let mut command = std::process::Command::new("codex");
+        let mut command = std::process::Command::new(crate::os_shell::resolve_cli("codex"));
         command
             .arg("exec")
             .arg("--skip-git-repo-check")
@@ -7691,9 +8386,237 @@ pub async fn get_project_overview(
     })
 }
 
+#[tauri::command]
+pub async fn copilot_set_live_context(
+    state: State<'_, AppState>,
+    session_id: String,
+    context: CopilotLiveContext,
+) -> Result<(), String> {
+    crate::copilot_session::set_live_context(&state, &session_id, context)
+}
+
+#[tauri::command]
+pub async fn copilot_set_mode(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    mode: String,
+) -> Result<String, String> {
+    crate::copilot_session::set_mode(&app, &mode)
+}
+
+#[tauri::command]
+pub async fn copilot_get_mode(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(crate::copilot_session::current_mode(&state))
+}
+
+#[tauri::command]
+pub async fn copilot_folder_readiness(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::types::CopilotFolderReadiness, String> {
+    crate::copilot_session::folder_readiness(state.inner(), &session_id)
+}
+
+/// Allow questions to be detected on the microphone channel as well as system audio.
+#[tauri::command]
+pub async fn copilot_set_mic_questions(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::copilot_session::set_mic_questions(state.inner(), enabled)
+}
+
+#[tauri::command]
+pub async fn set_copilot_api_key(key: String) -> Result<(), String> {
+    crate::copilot_keys::set_api_key(&key)
+}
+
+#[tauri::command]
+pub async fn clear_copilot_api_key() -> Result<(), String> {
+    crate::copilot_keys::clear_api_key()
+}
+
+#[tauri::command]
+pub async fn has_copilot_api_key() -> Result<bool, String> {
+    crate::copilot_keys::has_api_key()
+}
+
+#[tauri::command]
+pub async fn set_deepseek_copilot_api_key(key: String) -> Result<(), String> {
+    crate::copilot_keys::set_deepseek_api_key(&key)
+}
+
+#[tauri::command]
+pub async fn clear_deepseek_copilot_api_key() -> Result<(), String> {
+    crate::copilot_keys::clear_deepseek_api_key()
+}
+
+#[tauri::command]
+pub async fn has_deepseek_copilot_api_key() -> Result<bool, String> {
+    crate::copilot_keys::has_deepseek_api_key()
+}
+
+#[tauri::command]
+pub async fn get_copilot_receipt(meeting_id: i64) -> Result<crate::types::CopilotReceipt, String> {
+    crate::storage::copilot_receipt_v2(meeting_id)
+        .map_err(|e| format!("Failed to get copilot receipt: {e}"))
+}
+
+#[tauri::command]
+pub async fn copilot_cards_for_meeting(
+    meeting_id: i64,
+) -> Result<crate::types::MeetingCopilotHistory, String> {
+    crate::storage::copilot_cards_for_meeting(meeting_id)
+        .map_err(|e| format!("Failed to load copilot history: {e}"))
+}
+
+#[tauri::command]
+pub async fn copilot_card_review(
+    session_id: String,
+    card_id: i64,
+    action: String,
+) -> Result<crate::types::CopilotCardReviewState, String> {
+    crate::storage::copilot_card_review(&session_id, card_id, &action)
+        .map_err(|e| format!("Failed to update copilot card: {e}"))
+}
+
+#[tauri::command]
+pub async fn copilot_live_state(
+    app: AppHandle,
+    session_id: String,
+) -> Result<crate::types::LiveState, String> {
+    crate::copilot_session::live_state(&app, &session_id)
+}
+
+#[tauri::command]
+pub async fn copilot_live_configure(
+    app: AppHandle,
+    session_id: String,
+    enabled: bool,
+) -> Result<crate::types::LiveState, String> {
+    crate::copilot_session::live_configure(&app, &session_id, enabled)
+}
+
+#[tauri::command]
+pub async fn copilot_live_review(
+    app: AppHandle,
+    session_id: String,
+    item_id: String,
+    action: String,
+    text: Option<String>,
+    owner: Option<String>,
+    due: Option<String>,
+) -> Result<crate::types::LiveState, String> {
+    crate::copilot_session::live_review(
+        &app,
+        &session_id,
+        &item_id,
+        &action,
+        text.as_deref(),
+        owner.as_deref(),
+        due.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub async fn copilot_ask_last(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    use_me_fallback: bool,
+) -> Result<CopilotCommandAck, String> {
+    crate::copilot_session::ask_last(&app, use_me_fallback)
+}
+
+#[tauri::command]
+pub async fn copilot_force_card(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<CopilotCommandAck, String> {
+    crate::copilot_session::ask_last(&app, false)
+}
+
+#[tauri::command]
+pub async fn copilot_cancel(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    card_id: u64,
+) -> Result<(), String> {
+    crate::copilot_session::cancel_card(&app, card_id)
+}
+
+#[tauri::command]
+pub async fn copilot_retry(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    card_id: u64,
+) -> Result<CopilotCommandAck, String> {
+    crate::copilot_session::retry_card(&app, card_id)
+}
+
+#[tauri::command]
+pub async fn set_folder_copilot_web(
+    state: State<'_, AppState>,
+    copilot_session_id: String,
+    folder_id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::copilot_session::set_folder_web(state.inner(), &copilot_session_id, folder_id, enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+
+    #[tokio::test]
+    async fn set_folder_profile_rejects_overlong_input_before_opening_storage() {
+        assert_eq!(
+            super::set_folder_profile(999, "界".repeat(1_201)).await,
+            Err("Profile exceeds 1200 characters".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recording_transition_gate_prevents_overlapping_starts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+
+        let first = {
+            let gate = gate.clone();
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let first_entered = first_entered.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                first_entered.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            })
+        };
+
+        first_entered.notified().await;
+        let second = {
+            let gate = gate.clone();
+            let active = active.clone();
+            let maximum = maximum.clone();
+            tokio::spawn(async move {
+                let _guard = gate.lock().await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+            })
+        };
+
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn ollama_tags_are_told_apart_from_managed_aliases() {
@@ -7797,6 +8720,16 @@ mod tests {
     fn mic_path_for_rejects_non_wav() {
         assert_eq!(mic_path_for("/data/recordings/meeting_123"), None);
         assert_eq!(mic_path_for("notes.txt"), None);
+    }
+
+    #[test]
+    fn live_enqueue_requires_a_nonblank_copilot_session_id() {
+        assert!(validate_live_copilot_session_id("").is_err());
+        assert!(validate_live_copilot_session_id(" \t\n").is_err());
+        assert_eq!(
+            validate_live_copilot_session_id("  session-123  "),
+            Ok("session-123")
+        );
     }
 
     #[test]
@@ -8132,6 +9065,7 @@ mod tests {
     fn build_grounded_context_numbers_meetings() {
         let m = |id: i64, title: &str| Meeting {
             id,
+            uid: String::new(),
             title: title.to_string(),
             recorded_at: "2026-07-01T14:00:00Z".to_string(),
             duration_seconds: 0.0,
@@ -8328,6 +9262,7 @@ mod tests {
     fn export_import_bundle_roundtrip() {
         let meeting = Meeting {
             id: 42,
+            uid: String::new(),
             title: "Q3 Planning".to_string(),
             recorded_at: "2026-06-28T14:00:00Z".to_string(),
             duration_seconds: 1847.5,
@@ -8413,6 +9348,7 @@ mod tests {
     fn build_graph_links_shared_attendees_dedups_and_has_no_dangling_edges() {
         let mk = |id: i64, title: &str, attendees: Vec<&str>, tags: Vec<&str>| Meeting {
             id,
+            uid: String::new(),
             title: title.to_string(),
             recorded_at: "2026-06-28T14:00:00Z".to_string(),
             duration_seconds: 0.0,
@@ -8592,6 +9528,7 @@ mod tests {
     fn build_graph_filters_owner_vocab_roles_and_normalizes_variants() {
         let mk = |id: i64, title: &str, attendees: Vec<&str>| Meeting {
             id,
+            uid: String::new(),
             title: title.to_string(),
             recorded_at: "2026-07-01T14:00:00Z".to_string(),
             duration_seconds: 0.0,
@@ -8715,5 +9652,292 @@ mod tests {
             related_reason(&crate::embeddings::RelatedSignal::Semantic(0.55)),
             "Similar content (55% match)"
         );
+    }
+
+    fn test_meeting(title: &str, recorded_at: &str, summary: &str) -> Meeting {
+        Meeting {
+            id: 0,
+            uid: String::new(),
+            title: title.to_string(),
+            recorded_at: recorded_at.to_string(),
+            duration_seconds: 60.0,
+            transcript: String::new(),
+            summary: summary.to_string(),
+            template_used: "general".to_string(),
+            audio_file_path: None,
+            attendees: vec![],
+            user_notes: String::new(),
+            link: String::new(),
+            tags: vec![],
+            pinned: false,
+            locked: false,
+            archived: false,
+            transcript_turns: vec![],
+        }
+    }
+
+    #[test]
+    fn prior_meetings_for_lists_open_items_in_attachment_order() {
+        let conn = crate::storage::in_memory_db();
+        let summary_a = "**Action Items**\n- Jena: share the profile with Shadyfah — due 2026-09-05\n- Hamza: send the deck\n- Basim: review notes";
+        let a = test_meeting("Council Meeting", "2026-07-18T09:00:00Z", summary_a);
+        let a_id = crate::storage::insert_meeting_on(&conn, &a).unwrap();
+        crate::storage::sync_action_items(&conn, a_id, summary_a).unwrap();
+
+        let items = crate::storage::get_action_items_on(&conn, Some(a_id)).unwrap();
+        assert_eq!(items.len(), 3);
+        conn.execute(
+            "UPDATE action_items SET done = 1 WHERE id = ?1",
+            rusqlite::params![items[2].id],
+        )
+        .unwrap();
+
+        let b = test_meeting("Follow-up Meeting", "2026-07-19T09:00:00Z", "");
+        let b_id = crate::storage::insert_meeting_on(&conn, &b).unwrap();
+        crate::storage::add_meeting_attachments_on(
+            &conn,
+            b_id,
+            &[(
+                "meeting".to_string(),
+                a_id.to_string(),
+                "Council Meeting".to_string(),
+            )],
+        )
+        .unwrap();
+
+        let result = prior_meetings_for_on(&conn, b_id);
+        assert_eq!(
+            result,
+            vec![crate::types::PriorMeeting {
+                title: "Council Meeting".to_string(),
+                date: "2026-07-18".to_string(),
+                open_items: vec![
+                    "Jena: share the profile with Shadyfah (due 2026-09-05)".to_string(),
+                    "Hamza: send the deck".to_string(),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn prior_meetings_for_is_empty_without_meeting_attachments() {
+        let conn = crate::storage::in_memory_db();
+        let m1 = test_meeting("Meeting With File Attachment", "2026-07-18T09:00:00Z", "");
+        let m1_id = crate::storage::insert_meeting_on(&conn, &m1).unwrap();
+        crate::storage::add_meeting_attachments_on(
+            &conn,
+            m1_id,
+            &[(
+                "file".to_string(),
+                "/tmp/x.md".to_string(),
+                "x.md".to_string(),
+            )],
+        )
+        .unwrap();
+        assert!(prior_meetings_for_on(&conn, m1_id).is_empty());
+
+        let m2 = test_meeting("Meeting Without Attachments", "2026-07-18T09:00:00Z", "");
+        let m2_id = crate::storage::insert_meeting_on(&conn, &m2).unwrap();
+        assert!(prior_meetings_for_on(&conn, m2_id).is_empty());
+    }
+
+    #[test]
+    fn prior_meetings_for_caps_items_and_meetings() {
+        let conn = crate::storage::in_memory_db();
+
+        // Meeting 1 has 10 open action items
+        let mut items_markdown = String::from("**Action Items**\n");
+        for i in 1..=10 {
+            items_markdown.push_str(&format!("- Owner: item {i}\n"));
+        }
+        let m1 = test_meeting("Meeting 1", "2026-07-01T09:00:00Z", &items_markdown);
+        let m1_id = crate::storage::insert_meeting_on(&conn, &m1).unwrap();
+        crate::storage::sync_action_items(&conn, m1_id, &items_markdown).unwrap();
+
+        let m2 = test_meeting(
+            "Meeting 2",
+            "2026-07-02T09:00:00Z",
+            "**Action Items**\n- A: item a",
+        );
+        let m2_id = crate::storage::insert_meeting_on(&conn, &m2).unwrap();
+        crate::storage::sync_action_items(&conn, m2_id, &m2.summary).unwrap();
+
+        let m3 = test_meeting(
+            "Meeting 3",
+            "2026-07-03T09:00:00Z",
+            "**Action Items**\n- B: item b",
+        );
+        let m3_id = crate::storage::insert_meeting_on(&conn, &m3).unwrap();
+        crate::storage::sync_action_items(&conn, m3_id, &m3.summary).unwrap();
+
+        let m4 = test_meeting(
+            "Meeting 4",
+            "2026-07-04T09:00:00Z",
+            "**Action Items**\n- C: item c",
+        );
+        let m4_id = crate::storage::insert_meeting_on(&conn, &m4).unwrap();
+        crate::storage::sync_action_items(&conn, m4_id, &m4.summary).unwrap();
+
+        let host = test_meeting("Host Meeting", "2026-07-05T09:00:00Z", "");
+        let host_id = crate::storage::insert_meeting_on(&conn, &host).unwrap();
+        crate::storage::add_meeting_attachments_on(
+            &conn,
+            host_id,
+            &[
+                (
+                    "meeting".to_string(),
+                    m1_id.to_string(),
+                    "Meeting 1".to_string(),
+                ),
+                (
+                    "meeting".to_string(),
+                    m2_id.to_string(),
+                    "Meeting 2".to_string(),
+                ),
+                (
+                    "meeting".to_string(),
+                    m3_id.to_string(),
+                    "Meeting 3".to_string(),
+                ),
+                (
+                    "meeting".to_string(),
+                    m4_id.to_string(),
+                    "Meeting 4".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result = prior_meetings_for_on(&conn, host_id);
+        assert_eq!(result.len(), 3, "capped at 3 meetings");
+        assert_eq!(
+            result[0].open_items.len(),
+            8,
+            "capped at 8 items per meeting"
+        );
+        assert_eq!(result[0].title, "Meeting 1");
+        assert_eq!(result[1].title, "Meeting 2");
+        assert_eq!(result[2].title, "Meeting 3");
+    }
+
+    #[test]
+    fn accepted_live_items_resolve_me_to_the_viewer_name_only() {
+        for (owner, viewer_label, expected_owner) in [
+            (Some("Me"), Some("Amina"), Some("Amina")),
+            (Some("me"), Some("Amina"), Some("Amina")),
+            (Some("ME"), Some("Amina"), Some("Amina")),
+            (Some("Them"), Some("Amina"), Some("Them")),
+            (Some("Omar"), Some("Amina"), Some("Omar")),
+            (Some("Me"), Some(""), Some("Me")),
+            (Some("Me"), Some(" \t"), Some("Me")),
+            (Some("Me"), None, Some("Me")),
+            (None, Some("Amina"), None),
+        ] {
+            let item = crate::types::AcceptedLiveItem {
+                id: "li_action".into(),
+                kind: "action".into(),
+                text: "Prepare the demo".into(),
+                owner: owner.map(str::to_string),
+                due: Some("2026-09-18".into()),
+                evidence_turn_ids: vec!["t8".into()],
+                revision: 3,
+            };
+            let expected = crate::types::AcceptedLiveItem {
+                owner: expected_owner.map(str::to_string),
+                ..item.clone()
+            };
+            assert_eq!(
+                accepted_live_items_for_viewer(vec![item], viewer_label),
+                vec![expected],
+                "owner {owner:?}, viewer label {viewer_label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn summarize_params_omit_empty_prior_meetings() {
+        let empty_params = SummarizeParams {
+            transcript: "test transcript".to_string(),
+            template_name: "general".to_string(),
+            model: None,
+            output_language: None,
+            user_notes: None,
+            attached_context: None,
+            prior_meetings: Vec::new(),
+            accepted_live_items: Vec::new(),
+            llm_base_url: None,
+            llm_api_key: None,
+            known_attendees: None,
+            category_hint: None,
+            auto_template: false,
+            viewer_label: None,
+            meeting_date: None,
+        };
+        let val_empty = serde_json::to_value(&empty_params).unwrap();
+        assert!(
+            val_empty.get("prior_meetings").is_none(),
+            "empty prior_meetings must be skipped during serialization"
+        );
+
+        let non_empty_params = SummarizeParams {
+            transcript: "test transcript".to_string(),
+            template_name: "general".to_string(),
+            model: None,
+            output_language: None,
+            user_notes: None,
+            attached_context: None,
+            prior_meetings: vec![crate::types::PriorMeeting {
+                title: "Council Meeting".to_string(),
+                date: "2026-07-18".to_string(),
+                open_items: vec!["Jena: share profile".to_string()],
+            }],
+            accepted_live_items: Vec::new(),
+            llm_base_url: None,
+            llm_api_key: None,
+            known_attendees: None,
+            category_hint: None,
+            auto_template: false,
+            viewer_label: None,
+            meeting_date: None,
+        };
+        let val_non_empty = serde_json::to_value(&non_empty_params).unwrap();
+        assert!(
+            val_non_empty.get("prior_meetings").is_some(),
+            "non-empty prior_meetings must be present in serialized JSON"
+        );
+        let arr = val_non_empty["prior_meetings"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["title"], "Council Meeting");
+        assert_eq!(arr[0]["date"], "2026-07-18");
+        assert_eq!(arr[0]["open_items"][0], "Jena: share profile");
+    }
+
+    #[test]
+    fn prior_meetings_for_truncates_long_item_text() {
+        let conn = crate::storage::in_memory_db();
+        let long_action = "a".repeat(250);
+        let summary = format!("**Action Items**\n- Hamza: {long_action}");
+        let m = test_meeting("Long Meeting", "2026-07-18T09:00:00Z", &summary);
+        let m_id = crate::storage::insert_meeting_on(&conn, &m).unwrap();
+        crate::storage::sync_action_items(&conn, m_id, &summary).unwrap();
+
+        let host = test_meeting("Host", "2026-07-19T09:00:00Z", "");
+        let host_id = crate::storage::insert_meeting_on(&conn, &host).unwrap();
+        crate::storage::add_meeting_attachments_on(
+            &conn,
+            host_id,
+            &[(
+                "meeting".to_string(),
+                m_id.to_string(),
+                "Long Meeting".to_string(),
+            )],
+        )
+        .unwrap();
+
+        let result = prior_meetings_for_on(&conn, host_id);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].open_items.len(), 1);
+        assert_eq!(result[0].open_items[0].chars().count(), 200);
+        assert!(result[0].open_items[0].ends_with('…'));
     }
 }

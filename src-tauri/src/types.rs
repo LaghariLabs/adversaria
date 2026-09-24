@@ -139,6 +139,9 @@ pub struct ContextChunkRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meeting {
     pub id: i64,
+    /// Stable UUID v4 across machines and imports.
+    #[serde(default)]
+    pub uid: String,
     pub title: String,
     pub recorded_at: String,
     pub duration_seconds: f64,
@@ -182,11 +185,33 @@ pub struct MeetingAttachment {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttachmentDraft {
     pub kind: String,
     pub value: String,
     pub label: String,
+}
+
+/// Result report from importing an Adversaria document or legacy bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImportReport {
+    pub format: String, /* "adversaria-1" | "legacy-json-1" */
+    pub imported: i64,
+    pub skipped_existing: i64,
+    pub folders_created: i64,
+    pub meeting_ids: Vec<i64>,
+    pub folder_id: Option<i64>,
+    pub path: String,
+}
+
+/// An earlier meeting attached while recording, with its still-open action items,
+/// sent to the summarizer so the notes get a follow-up check on each item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorMeeting {
+    pub title: String,
+    /// `YYYY-MM-DD` of the earlier meeting, or empty when unknown.
+    pub date: String,
+    pub open_items: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,12 +486,40 @@ impl Default for OnboardingState {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecentCard {
+    pub card_ref: String,
+    pub question: String,
+    pub say: String,
+    /// The card's SPECIFIC lines (bullets or steps), oldest card first like the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<String>,
+    pub origin: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotFolderReadiness {
+    pub session_id: String,
+    pub folder_id: Option<i64>,
+    pub status: String,
+    pub count: usize,
+    pub pack_projects: u32,
+    pub pack_chars: usize,
+    pub pack_hash: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub python_service_url: String,
     pub default_prompt_template: String,
     pub auto_detect_meetings: bool,
     pub ollama_model: String,
+    #[serde(default)]
+    pub copilot_local_model: String,
+    #[serde(default = "crate::config::default_copilot_deepseek_model")]
+    pub copilot_deepseek_model: String,
     /// Default summary output language: "en", "ar", or "auto" (match spoken).
     #[serde(default = "default_summary_language")]
     pub summary_language: String,
@@ -633,6 +686,26 @@ pub struct AppConfig {
     /// Global Pause: when true no workspace task starts by itself.
     #[serde(default)]
     pub agents_paused: bool,
+    /// Copilot HUD floating-window position (logical top-left px). `None` =
+    /// default (horizontally centred on the primary monitor, 96 px from the
+    /// top). Written only via `config::update_config_with` from
+    /// `copilot_hud_save_position`.
+    #[serde(default)]
+    pub copilot_hud_x: Option<f64>,
+    #[serde(default)]
+    pub copilot_hud_y: Option<f64>,
+    /// Copilot HUD floating-window size (logical px). `None` = default
+    /// (720 x 180). Written only via `config::update_config_with` from
+    /// `copilot_hud_save_size`.
+    #[serde(default)]
+    pub copilot_hud_w: Option<f64>,
+    #[serde(default)]
+    pub copilot_hud_h: Option<f64>,
+    /// Floating copilot pop-out. Off by default in 0.4.0: the shortcut, the
+    /// menu item and the `show_copilot_hud` command are all no-ops until this
+    /// is true. Flip it in config.json to try the pop-out in a release build.
+    #[serde(default)]
+    pub copilot_hud_enabled: bool,
 }
 
 /// Default on-device Whisper model for a fresh config. Windows gets the turbo
@@ -821,11 +894,38 @@ pub struct ContextIndexStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Folder {
     pub id: i64,
+    /// Stable UUID v4 across machines and imports.
+    #[serde(default)]
+    pub uid: String,
     pub name: String,
     pub color: String,
     pub instructions: String,
+    pub copilot_mode: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub profile_hash: String,
+    #[serde(default)]
+    pub profile_at: String,
+    #[serde(default)]
+    pub voice_1: String,
+    #[serde(default)]
+    pub voice_2: String,
+}
+
+/// A file or directory explicitly approved as evidence for one folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderSource {
+    pub id: i64,
+    pub folder_id: i64,
+    pub path: String,
+    pub kind: String,
+    pub added_at: String,
+    pub doc_count: i64,
 }
 
 /// A folder plus its number of explicitly filed meetings.
@@ -833,6 +933,47 @@ pub struct Folder {
 pub struct FolderSummary {
     pub folder: Folder,
     pub meeting_count: i64,
+    pub copilot_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefMeetingRef {
+    pub id: i64,
+    pub title: String,
+    pub recorded_at: String,
+    pub attendees: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefOpenItem {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub meeting_title: String,
+    pub recorded_at: String,
+    pub ord: i64,
+    pub text: String,
+    pub assignee: String,
+    pub due: String,
+    pub meetings_ago: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefBullet {
+    pub meeting_id: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderCopilotBrief {
+    pub folder_id: i64,
+    pub folder_name: String,
+    pub copilot_mode: String,
+    pub copilot_web: bool,
+    pub meeting_count: i64,
+    pub last_meeting: Option<BriefMeetingRef>,
+    pub open_items: Vec<BriefOpenItem>,
+    pub decisions: Vec<BriefBullet>,
+    pub follow_ups: Vec<BriefBullet>,
 }
 
 /// Which folder contains a meeting. `folder_id == None` means explicitly unfiled;
@@ -1049,4 +1190,594 @@ pub struct RelatedMeetingRef {
     pub title: String,
     pub recorded_at: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotPassage {
+    pub source_kind: String,
+    pub source_id: String,
+    pub title: String,
+    pub text: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotCard {
+    pub id: u64,
+    pub session_id: String,
+    pub status: String,
+    pub provider_frozen: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<u64>,
+    pub question: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_question: Option<String>,
+    #[serde(default = "default_answer_shape")]
+    pub answer_shape: String,
+    #[serde(default = "default_copilot_question_source")]
+    pub question_source: String,
+    #[serde(default)]
+    pub context_turns: Vec<String>,
+    pub asked_at_ms: u64,
+    pub trigger: String,
+    pub passages: Vec<CopilotPassage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_ms: Option<u64>,
+}
+
+fn default_copilot_question_source() -> String {
+    "Them".to_string()
+}
+
+fn default_answer_shape() -> String {
+    "brief".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CopilotLiveContext {
+    pub folder_id: Option<i64>,
+    pub notes: String,
+    pub attachments: Vec<AttachmentDraft>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotAnswerEvent {
+    pub card_id: u64,
+    pub session_id: String,
+    pub provider: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<CopilotSections>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citation: Option<CopilotCitation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Vec<CopilotBullet>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_requested: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_performed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotCommandAck {
+    pub session_id: String,
+    pub card_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotCitation {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passage_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cited_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotBullet {
+    pub text: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passage_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CopilotNote {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passage_index: Option<usize>,
+    pub quote: String,
+    pub clause: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CopilotSections {
+    pub say: Vec<String>,
+    pub specifics: Vec<String>,
+    pub notes: Vec<CopilotNote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotHistoryCard {
+    pub row_id: i64,
+    pub session_id: String,
+    pub card_id: i64,
+    pub at: String,
+    pub finished_at: Option<String>,
+    pub question: String,
+    pub resolved_question: Option<String>,
+    #[serde(default = "default_answer_shape")]
+    pub answer_shape: String,
+    pub provider: String,
+    pub trigger: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub error: Option<String>,
+    pub retry_of: Option<i64>,
+    pub answer_md: Option<String>,
+    pub sections: Option<CopilotSections>,
+    pub passages: Vec<CopilotPassage>,
+    pub provenance: Vec<CopilotBullet>,
+    pub pinned_at: Option<String>,
+    pub dismissed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeetingCopilotHistory {
+    pub meeting_id: i64,
+    pub cards: Vec<CopilotHistoryCard>,
+    #[serde(default)]
+    pub live_items: Vec<LiveItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotCardReviewState {
+    pub row_id: i64,
+    pub pinned_at: Option<String>,
+    pub dismissed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveReviewEvent {
+    pub action: String,
+    pub at: String,
+    pub before_text: Option<String>,
+    pub after_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveItem {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub original_text: String,
+    pub owner: Option<String>,
+    pub due: Option<String>,
+    pub status: String,
+    pub revision: u64,
+    pub evidence_turn_ids: Vec<String>,
+    pub at_ms: u64,
+    pub review_events: Vec<LiveReviewEvent>,
+    #[serde(default)]
+    pub withdrawal_quote: Option<String>,
+    #[serde(default)]
+    pub withdrawn_at: Option<String>,
+}
+
+/// User-confirmed live facts carried into the final meeting summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct AcceptedLiveItem {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub owner: Option<String>,
+    pub due: Option<String>,
+    pub evidence_turn_ids: Vec<String>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LiveSummary {
+    #[serde(default)]
+    pub bullets: Vec<String>,
+    #[serde(default)]
+    pub evidence_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveState {
+    pub session_id: String,
+    pub revision: u64,
+    pub enabled: bool,
+    pub status: String,
+    pub reason: Option<String>,
+    pub through_ms: u64,
+    pub summary: LiveSummary,
+    pub items: Vec<LiveItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveTurn {
+    pub id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub source: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveItemIn {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub owner: Option<String>,
+    pub due: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub evidence_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveExtractRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub base_revision: u64,
+    pub model: String,
+    pub num_ctx: u64,
+    pub update_summary: bool,
+    #[serde(default)]
+    pub turns: Vec<LiveTurn>,
+    #[serde(default)]
+    pub items: Vec<LiveItemIn>,
+    #[serde(default)]
+    pub new_turn_ids: Vec<String>,
+    pub summary: LiveSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveUpsert {
+    pub id: Option<String>,
+    pub kind: String,
+    pub text: String,
+    pub owner: Option<String>,
+    pub due: Option<String>,
+    #[serde(default)]
+    pub evidence_turn_ids: Vec<String>,
+    pub supersedes_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveRetraction {
+    pub id: String,
+    #[serde(default)]
+    pub evidence_turn_ids: Vec<String>,
+    #[serde(default)]
+    pub reason_code: String,
+    #[serde(default)]
+    pub withdrawal_quote: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveExtractResponse {
+    pub request_id: String,
+    pub session_id: String,
+    pub base_revision: u64,
+    pub status: String,
+    pub reason: Option<String>,
+    pub through_ms: Option<u64>,
+    #[serde(default)]
+    pub upserts: Vec<LiveUpsert>,
+    #[serde(default)]
+    pub retractions: Vec<LiveRetraction>,
+    pub summary: Option<LiveSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CopilotReceipt {
+    pub questions: u32,
+    pub passages: u32,
+    pub claude_questions: u32,
+    pub deepseek_questions: u32,
+    pub local_questions: u32,
+    pub web_requested: u32,
+    pub web_performed: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotEgressPassage {
+    pub title: String,
+    pub text: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CopilotEgressPayload {
+    pub question: String,
+    pub context_turns: Vec<String>,
+    pub passages: Vec<CopilotEgressPassage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_folder_json_defaults_new_copilot_fields() {
+        let folder: Folder = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "Legacy", "color": "blue", "instructions": "",
+            "copilot_mode": "no_ai", "created_at": "now", "updated_at": "now"
+        }))
+        .unwrap();
+        let value = serde_json::to_value(folder).unwrap();
+        for key in [
+            "purpose",
+            "profile",
+            "profile_hash",
+            "profile_at",
+            "voice_1",
+            "voice_2",
+        ] {
+            assert_eq!(value[key], "");
+        }
+    }
+
+    #[test]
+    fn folder_source_wire_keys_round_trip() {
+        let value = serde_json::json!({"id": 1, "folder_id": 2, "path": "/me.md", "kind": "file", "added_at": "now", "doc_count": 1});
+        let source: FolderSource = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(source).unwrap(), value);
+    }
+
+    #[test]
+    fn copilot_hud_position_defaults_to_none_for_older_configs_and_round_trips() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        assert_eq!(value["copilot_hud_x"], serde_json::Value::Null);
+        assert_eq!(value["copilot_hud_y"], serde_json::Value::Null);
+        value.as_object_mut().unwrap().remove("copilot_hud_x");
+        value.as_object_mut().unwrap().remove("copilot_hud_y");
+        let mut config: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.copilot_hud_x, None);
+        assert_eq!(config.copilot_hud_y, None);
+        config.copilot_hud_x = Some(100.0);
+        config.copilot_hud_y = Some(200.0);
+        let round_tripped = serde_json::to_value(config).unwrap();
+        assert_eq!(round_tripped["copilot_hud_x"], 100.0);
+        assert_eq!(round_tripped["copilot_hud_y"], 200.0);
+    }
+
+    #[test]
+    fn copilot_hud_size_defaults_to_none_for_older_configs_and_round_trips() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        assert_eq!(value["copilot_hud_w"], serde_json::Value::Null);
+        assert_eq!(value["copilot_hud_h"], serde_json::Value::Null);
+        value.as_object_mut().unwrap().remove("copilot_hud_w");
+        value.as_object_mut().unwrap().remove("copilot_hud_h");
+        let mut config: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.copilot_hud_w, None);
+        assert_eq!(config.copilot_hud_h, None);
+        config.copilot_hud_w = Some(900.0);
+        config.copilot_hud_h = Some(240.0);
+        let round_tripped = serde_json::to_value(config).unwrap();
+        assert_eq!(round_tripped["copilot_hud_w"], 900.0);
+        assert_eq!(round_tripped["copilot_hud_h"], 240.0);
+    }
+
+    #[test]
+    fn copilot_local_model_defaults_for_legacy_config_and_round_trips() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        assert_eq!(value["copilot_local_model"], "");
+        value.as_object_mut().unwrap().remove("copilot_local_model");
+        let mut config: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.copilot_local_model, "");
+        config.copilot_local_model = "qwen3.6:35b".into();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["copilot_local_model"],
+            "qwen3.6:35b"
+        );
+    }
+
+    #[test]
+    fn copilot_sections_serialize_with_snake_case_and_omit_absent_next() {
+        let sections = CopilotSections {
+            say: vec!["I used a bounded queue.".into()],
+            specifics: vec!["Apply backpressure.".into()],
+            notes: vec![CopilotNote {
+                passage_index: Some(1),
+                quote: "bounded queue".into(),
+                clause: "bounds memory".into(),
+                text: "P2 | \"bounded queue\" | bounds memory".into(),
+            }],
+            next: None,
+        };
+        let value = serde_json::to_value(&sections).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "say": ["I used a bounded queue."],
+                "specifics": ["Apply backpressure."],
+                "notes": [{
+                    "passage_index": 1,
+                    "quote": "bounded queue",
+                    "clause": "bounds memory",
+                    "text": "P2 | \"bounded queue\" | bounds memory"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CopilotSections>(value).unwrap(),
+            sections
+        );
+        assert!(serde_json::to_value(CopilotNote::default())
+            .unwrap()
+            .get("passage_index")
+            .is_none());
+    }
+
+    #[test]
+    fn copilot_answer_event_serializes_with_snake_case_keys() {
+        let event = CopilotAnswerEvent {
+            card_id: 42,
+            session_id: "s1".to_string(),
+            provider: "claude".to_string(),
+            kind: "done".to_string(),
+            text: None,
+            section: None,
+            index: None,
+            drop: None,
+            sections: None,
+            citation: None,
+            provenance: Some(vec![CopilotBullet {
+                text: "First bullet".to_string(),
+                label: "notes".to_string(),
+                passage_index: Some(0),
+                url: None,
+            }]),
+            egress_bytes: Some(150),
+            web_requested: Some(true),
+            web_performed: Some(1),
+            error: None,
+            reason: Some("ok".to_string()),
+        };
+
+        let val = serde_json::to_value(&event).unwrap();
+        assert_eq!(val.get("card_id").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(val.get("session_id").and_then(|v| v.as_str()), Some("s1"));
+        assert_eq!(val.get("provider").and_then(|v| v.as_str()), Some("claude"));
+        assert_eq!(val.get("kind").and_then(|v| v.as_str()), Some("done"));
+        assert_eq!(val.get("egress_bytes").and_then(|v| v.as_u64()), Some(150));
+        assert_eq!(
+            val.get("web_requested").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(val.get("web_performed").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(val.get("reason").and_then(|v| v.as_str()), Some("ok"));
+        assert!(val.get("text").is_none());
+        assert!(val.get("drop").is_none());
+        assert!(val.get("citation").is_none());
+        assert!(val.get("error").is_none());
+        let prov = val.get("provenance").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(prov.len(), 1);
+        assert_eq!(
+            prov[0].get("passage_index").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(prov[0].get("url").is_none());
+    }
+
+    #[test]
+    fn copilot_command_ack_serializes() {
+        let ack = CopilotCommandAck {
+            session_id: "s2".to_string(),
+            card_id: 123,
+        };
+        let val = serde_json::to_value(&ack).unwrap();
+        assert_eq!(val.get("session_id").and_then(|v| v.as_str()), Some("s2"));
+        assert_eq!(val.get("card_id").and_then(|v| v.as_u64()), Some(123));
+    }
+
+    #[test]
+    fn copilot_card_v2_serializes_with_session_id() {
+        let card = CopilotCard {
+            id: 1,
+            session_id: "s3".to_string(),
+            status: "heard".to_string(),
+            provider_frozen: "no_ai".to_string(),
+            reason: Some("retry".to_string()),
+            retry_of: Some(42),
+            question: "Q?".to_string(),
+            resolved_question: Some("What was asked?".to_string()),
+            answer_shape: "brief".to_string(),
+            question_source: "Them".to_string(),
+            context_turns: vec!["Me: Earlier context".to_string()],
+            asked_at_ms: 1000,
+            trigger: "auto".to_string(),
+            passages: vec![],
+            retrieval_ms: Some(10),
+        };
+        let val = serde_json::to_value(&card).unwrap();
+        assert_eq!(val.get("session_id").and_then(|v| v.as_str()), Some("s3"));
+        assert_eq!(val.get("status").and_then(|v| v.as_str()), Some("heard"));
+        assert_eq!(
+            val.get("provider_frozen").and_then(|v| v.as_str()),
+            Some("no_ai")
+        );
+        assert_eq!(val.get("reason").and_then(|v| v.as_str()), Some("retry"));
+        assert_eq!(val.get("retry_of").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(val["resolved_question"], "What was asked?");
+        let mut legacy = val;
+        legacy.as_object_mut().unwrap().remove("resolved_question");
+        let legacy: CopilotCard = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.resolved_question.is_none());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("resolved_question")
+            .is_none());
+    }
+
+    #[test]
+    fn folder_copilot_brief_serializes_with_snake_case_keys() {
+        let brief = FolderCopilotBrief {
+            folder_id: 7,
+            folder_name: "Daily stand-up".to_string(),
+            copilot_mode: "no_ai".to_string(),
+            copilot_web: true,
+            meeting_count: 1,
+            last_meeting: Some(BriefMeetingRef {
+                id: 11,
+                title: "Stand-up".to_string(),
+                recorded_at: "2026-07-03T09:00:00Z".to_string(),
+                attendees: vec!["Sam".to_string()],
+            }),
+            open_items: vec![BriefOpenItem {
+                id: 13,
+                meeting_id: 11,
+                meeting_title: "Stand-up".to_string(),
+                recorded_at: "2026-07-03T09:00:00Z".to_string(),
+                ord: 0,
+                text: "Send recap".to_string(),
+                assignee: "Sam".to_string(),
+                due: String::new(),
+                meetings_ago: 0,
+            }],
+            decisions: Vec::new(),
+            follow_ups: Vec::new(),
+        };
+
+        let value = serde_json::to_value(brief).unwrap();
+        assert!(value.get("folder_id").is_some());
+        assert_eq!(
+            value.get("copilot_web").and_then(|item| item.as_bool()),
+            Some(true)
+        );
+        assert!(value.get("last_meeting").is_some());
+        assert!(value.get("open_items").is_some());
+        assert!(value["open_items"][0].get("meetings_ago").is_some());
+    }
 }

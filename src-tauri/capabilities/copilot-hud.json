@@ -1,0 +1,9 @@
+{
+  "identifier": "copilot-hud-window",
+  "description": "Copilot HUD: listen for the copilot-card and copilot-answer broadcasts so the floating window can show the latest answer.",
+  "windows": ["copilot-hud"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

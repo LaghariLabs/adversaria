@@ -1,0 +1,343 @@
+.ch-frame {
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  max-width: none;
+  overflow: hidden;
+  font-family: var(--font-copilot);
+}
+
+.ch-head {
+  padding: 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.ch-head-title {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  font-family: var(--font-copilot);
+}
+
+.ch-head-sub {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  margin: 2px 0 0;
+  font-family: var(--font-copilot);
+}
+
+.ch-filters {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.ch-filter {
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+  cursor: pointer;
+}
+
+.ch-filter[aria-pressed="true"] {
+  background: var(--text-primary);
+  color: var(--bg-tertiary);
+  border-color: var(--text-primary);
+}
+
+.ch-session {
+  padding: 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.ch-session:last-child {
+  border-bottom: 0;
+}
+
+.ch-session-label {
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+  margin: 0 0 10px;
+}
+
+.ch-entry {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.ch-entry:last-child {
+  border-bottom: 0;
+}
+
+.ch-entry-q {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+  margin: 0 0 4px;
+}
+
+.ch-headline {
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 400;
+  color: var(--text-primary);
+  margin: 0 0 6px;
+  max-width: 92ch;
+  font-family: var(--font-copilot);
+}
+
+.ch-bullets {
+  margin: 0;
+  padding: 0 0 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 92ch;
+}
+
+.ch-bullets li {
+  font-size: 14px;
+  line-height: 21px;
+  color: var(--text-secondary);
+  font-family: var(--font-copilot);
+}
+
+.ch-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: ch-step;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 92ch;
+}
+
+.ch-steps li {
+  counter-increment: ch-step;
+  position: relative;
+  padding-left: 28px;
+  font-size: 15px;
+  line-height: 22px;
+  color: var(--text-secondary);
+  font-family: var(--font-copilot);
+}
+
+.ch-steps li::before {
+  content: counter(ch-step) ".";
+  position: absolute;
+  left: 0;
+  top: 0;
+  font-weight: 600;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ch-bullets li strong, .ch-steps li strong { font-weight: 600; color: var(--text-primary); }
+
+.ch-live-withdrawn {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+  font-style: italic;
+  margin: 6px 0 0;
+}
+
+.ch-trust {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+}
+
+.ch-trust-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex: none;
+  display: inline-block;
+}
+
+.ch-trust--supported .ch-trust-dot {
+  background: var(--accent-green);
+}
+
+.ch-trust--unverified .ch-trust-dot {
+  background: var(--accent-amber);
+}
+
+.ch-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+}
+
+.ch-meta-left,
+.ch-meta-right {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.ch-link-btn {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 17px;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--font-copilot);
+}
+
+.ch-link-btn:hover {
+  color: var(--text-primary);
+}
+
+.ch-link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ch-state {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  margin: 0 0 6px;
+  font-family: var(--font-copilot);
+}
+
+.ch-empty {
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  max-width: none;
+  padding: 24px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+}
+
+.ch-frame .ch-empty {
+  border: 0;
+  border-radius: 0;
+  max-width: none;
+  background: transparent;
+}
+
+.ch-loading {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  margin: 0;
+  font-family: var(--font-copilot);
+}
+
+.ch-error {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--accent-red);
+  margin: 0;
+  font-family: var(--font-copilot);
+}
+
+.ch-disclosure summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.ch-disclosure summary::-webkit-details-marker {
+  display: none;
+}
+
+.ch-activity {
+  display: inline;
+}
+
+.ch-activity summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.ch-activity summary::-webkit-details-marker {
+  display: none;
+}
+
+.ch-activity-list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+}
+
+.ch-entry--live .ch-kind {
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+  margin: 0 0 4px;
+}
+
+.ch-tag {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--amber-bg, var(--tag-orange-bg, rgba(255, 149, 0, 0.12)));
+  color: var(--tag-orange-text, var(--accent-amber));
+  border: 1px solid rgba(255, 149, 0, 0.22);
+  font-family: var(--font-copilot);
+}
+
+.ch-live-edited {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 6px 0;
+}
+
+.ch-live-owner-due {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  font-family: var(--font-copilot);
+  margin: 6px 0 0;
+}

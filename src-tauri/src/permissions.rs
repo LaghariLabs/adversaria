@@ -5,6 +5,10 @@
 //! Core Audio process tap, for which macOS exposes no public check or request
 //! API; the app proves access by playing real audio and recording whether the
 //! tap hears it. Screen Recording is not used by the capture path.
+//!
+//! On Windows, WASAPI loopback has no privacy gate. The microphone is governed
+//! by the Settings › Privacy › Microphone switches, which are read from the
+//! registry; Windows offers desktop apps no in-process prompt.
 
 use serde::{Deserialize, Serialize};
 
@@ -162,11 +166,78 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Fold the Windows microphone privacy switches into one state.
+///
+/// Windows keeps three independent switches under
+/// `CapabilityAccessManager\ConsentStore\microphone`, each a `Value` string of
+/// `"Allow"` or `"Deny"`: the device-wide one (HKLM), the per-user "Microphone
+/// access" one (HKCU), and "Let desktop apps access your microphone" (HKCU
+/// `NonPackaged`), which is the one that governs an unpackaged Win32 app like
+/// this. Any `"Deny"` silences the "Me" track. A missing value means the
+/// switch was never touched, and Windows defaults it to allowed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_mic_consent(values: &[Option<String>]) -> PermissionState {
+    if values
+        .iter()
+        .flatten()
+        .any(|value| value.trim().eq_ignore_ascii_case("deny"))
+    {
+        PermissionState::Denied
+    } else {
+        PermissionState::Granted
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    use super::{windows_mic_consent, CapturePermissions, PermissionState};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    const CONSENT: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
+
+    fn read_value(root: &RegKey, path: &str) -> Option<String> {
+        root.open_subkey(path)
+            .ok()?
+            .get_value::<String, _>("Value")
+            .ok()
+    }
+
+    fn microphone() -> PermissionState {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        windows_mic_consent(&[
+            read_value(&hklm, CONSENT),
+            read_value(&hkcu, CONSENT),
+            read_value(&hkcu, &format!(r"{CONSENT}\NonPackaged")),
+        ])
+    }
+
+    // WASAPI loopback has no privacy gate, so system audio is always
+    // available. The microphone is behind the Windows privacy switches.
+    pub fn check() -> CapturePermissions {
+        CapturePermissions {
+            microphone: microphone(),
+            system_audio: PermissionState::Granted,
+        }
+    }
+
+    // Windows has no per-app consent prompt for desktop apps: the switches
+    // live in Settings, so the best "request" is to report the current state
+    // and let the UI offer the Settings deep link when it reads Denied.
+    pub fn request_microphone() -> PermissionState {
+        microphone()
+    }
+
+    pub fn persist_system_audio_probe(_granted: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
     use super::{CapturePermissions, PermissionState};
 
-    // WASAPI loopback has no TCC gate, so both capture paths are available.
     pub fn check() -> CapturePermissions {
         CapturePermissions {
             microphone: PermissionState::Granted,
@@ -185,13 +256,64 @@ mod imp {
 
 pub use imp::{check, persist_system_audio_probe, request_microphone};
 
-/// Deep link into the exact System Settings pane for a permission, so a denied
-/// user isn't told to "go to Settings" and left to find it.
+/// Deep link into the exact settings pane for a permission, so a denied user
+/// isn't told to "go to Settings" and left to find it.
+#[cfg(target_os = "macos")]
 pub fn settings_url(which: &str) -> &'static str {
     match which {
         "microphone" => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         }
         _ => "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture",
+    }
+}
+
+/// Windows Settings deep link. System audio (WASAPI loopback) has no privacy
+/// switch, so its closest useful page is Sound, where a muted or wrong output
+/// device is the usual reason nothing is heard.
+#[cfg(not(target_os = "macos"))]
+pub fn settings_url(which: &str) -> &'static str {
+    match which {
+        "microphone" => "ms-settings:privacy-microphone",
+        _ => "ms-settings:sound",
+    }
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::{windows_mic_consent, PermissionState};
+
+    fn v(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn untouched_switches_mean_granted() {
+        assert_eq!(
+            windows_mic_consent(&[None, None, None]),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            windows_mic_consent(&[v("Allow"), v("Allow"), v("Allow")]),
+            PermissionState::Granted
+        );
+    }
+
+    #[test]
+    fn any_deny_means_denied() {
+        // "Let desktop apps access your microphone" off is the common case.
+        assert_eq!(
+            windows_mic_consent(&[v("Allow"), v("Allow"), v("Deny")]),
+            PermissionState::Denied
+        );
+        // Device-wide switch off (set by an admin) wins over per-user Allow.
+        assert_eq!(
+            windows_mic_consent(&[v("Deny"), v("Allow"), None]),
+            PermissionState::Denied
+        );
+        assert_eq!(
+            windows_mic_consent(&[None, v(" deny ")]),
+            PermissionState::Denied
+        );
     }
 }

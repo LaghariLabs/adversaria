@@ -1,0 +1,18 @@
+{
+  "name": "multi_question_rag",
+  "note": "MQ-A: two distinct questions in one turn must both be answered; SAY needs a retrieval answer and an efficiency answer, SPECIFIC needs an efficiency mechanism.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "Let's say you have a hundred million documents. How will you use RAG? How will you make rag efficient?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": []
+  },
+  "expect": {
+    "say_count": [2, 3],
+    "say_must_match": ["\\b(?:retriev\\w*|embed\\w*|chunk\\w*|index\\w*)\\b", "\\b(?:efficien\\w*|fast\\w*|latency|scal\\w*|cost|shard\\w*|cach\\w*|partition\\w*)\\b"],
+    "must_match": ["\\b(?:shard\\w*|partition\\w*|cach\\w*|hybrid|ANN|HNSW|approximate nearest|quantiz\\w*|re-?rank\\w*)\\b"]
+  }
+}

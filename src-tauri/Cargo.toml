@@ -1,6 +1,6 @@
 [package]
 name = "meeting-note-taker"
-version = "0.3.83"
+version = "0.4.1"
 authors = ["Mohammad Hamza Laghari <hamza@lagharilabs.com>"]
 edition = "2021"
 
@@ -53,6 +53,8 @@ chacha20poly1305 = "0.10"
 robius-authentication = "0.1"
 base64 = "0.22"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
+tokio-util = "0.7"
 regex = "1"
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system"] }
 tauri-plugin-wdio = { version = "1", optional = true }

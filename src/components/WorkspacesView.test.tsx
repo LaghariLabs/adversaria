@@ -12,6 +12,7 @@ import type {
   WorkspaceTask,
 } from "../types";
 import { WorkspacesView } from "./WorkspacesView";
+import { COPY } from "../lib/platform";
 
 const summary: WorkspaceSummary = {
   workspace: {
@@ -495,7 +496,7 @@ describe("WorkspacesView", () => {
     await user.click(await screen.findByRole("button", { name: "Preview" }));
     expect(await screen.findByRole("heading", { name: "Notes", level: 1 })).toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: "Reveal in Finder" }));
+    await user.click(screen.getByRole("button", { name: `Show in ${COPY.fileManager}` }));
     await waitFor(() => expect(revealPayload).toEqual({ path: artifactPath }));
   });
 

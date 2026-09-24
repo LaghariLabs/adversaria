@@ -12,9 +12,10 @@ Fill these fields:
 
 Grounding rules:
 - Use only the transcript. Do not infer missing purpose, outcomes, owners, deadlines, decisions, or tasks.
+- Exception: items inside <accepted_live_items> were confirmed by the user during the meeting; keep each one under its section with the wording, owner and due date unchanged. They count as traced.
 - A team or department is not a job title; for example, “from QA” must not become “QA Lead”.
 - Discussion, advice, possibilities, and descriptions of existing work are not decisions or action items.
 - Decisions and Action Items are mutually exclusive. Work someone will do belongs only in Action Items, even when everyone agreed to it; never repeat it under Decisions.
 - Preserve negations and uncertainty. Do not turn “might” into “will”.
 - If a section has no supported content, use "None mentioned".
-- Before finishing, remove every Decision, Action Item, or Follow-up that cannot be traced to a specific sentence in the transcript.
+- Before finishing, remove every Decision, Action Item, or Follow-up that cannot be traced to a specific sentence in the transcript or to <accepted_live_items>.

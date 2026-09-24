@@ -286,6 +286,7 @@ export interface AppConfig {
   default_prompt_template: PromptTemplate;
   auto_detect_meetings: boolean;
   ollama_model: string;
+  copilot_local_model: string;
   summary_language: string;
   theme: string;
   user_name: string;
@@ -338,7 +339,9 @@ export interface AppConfig {
   todo_digest_hour: number;
   /** One-time guided tour shown after setup; true once finished or skipped. */
   tour_completed: boolean;
+  copilot_deepseek_model: "deepseek-v4-flash" | "deepseek-v4-pro";
   calendar: CalendarConfig;
+  copilot_hud_enabled?: boolean;
 }
 
 export interface RegistrationState {
@@ -552,6 +555,22 @@ export interface Folder {
   instructions: string;
   created_at: string;
   updated_at: string;
+  copilot_mode?: "no_ai" | "local" | "claude" | "deepseek";
+  purpose?: string;
+  profile?: string;
+  profile_hash?: string;
+  profile_at?: string;
+  voice_1?: string;
+  voice_2?: string;
+}
+
+export interface FolderSource {
+  id: number;
+  folder_id: number;
+  path: string;
+  kind: "file" | "dir";
+  added_at: string;
+  doc_count: number;
 }
 
 /** A folder plus its number of explicitly filed meetings. */
@@ -747,4 +766,250 @@ export interface RelatedMeetingRef {
   title: string;
   recorded_at: string;
   reason: string;
+}
+
+export interface BriefMeetingRef {
+  id: number;
+  title: string;
+  recorded_at: string;
+  attendees: string[];
+}
+
+export interface BriefOpenItem {
+  id: number;
+  meeting_id: number;
+  meeting_title: string;
+  recorded_at: string;
+  ord: number;
+  text: string;
+  assignee: string;
+  due: string;
+  meetings_ago: number;
+}
+
+export interface BriefBullet {
+  meeting_id: number;
+  text: string;
+}
+
+export interface FolderCopilotBrief {
+  folder_id: number;
+  folder_name: string;
+  copilot_mode: "no_ai" | "local" | "claude" | "deepseek";
+  copilot_web: boolean;
+  meeting_count: number;
+  last_meeting: BriefMeetingRef | null;
+  open_items: BriefOpenItem[];
+  decisions: BriefBullet[];
+  follow_ups: BriefBullet[];
+}
+
+// ---- Live copilot (Slice B) ----
+
+export type CopilotMode = "no_ai" | "local" | "claude" | "deepseek";
+
+export interface CopilotCitation {
+  kind: "notes" | "web";
+  passage_index?: number | null;
+  cited_text?: string | null;
+  url?: string | null;
+  title?: string | null;
+}
+
+export interface CopilotBullet {
+  text: string;
+  label: "notes" | "web" | "model";
+  passage_index?: number | null;
+  url?: string | null;
+}
+
+export interface CopilotNote {
+  passage_index?: number | null;
+  quote: string;
+  clause: string;
+  text: string;
+}
+export interface CopilotSections {
+  say: string[];
+  specifics: string[];
+  notes: CopilotNote[];
+  next?: string | null;
+}
+export type CopilotSection = "say" | "specific" | "notes" | "next";
+
+export interface CopilotAnswerEvent {
+  card_id: number;
+  session_id: string;
+  provider: string;
+  kind: 'delta' | 'citation' | 'searching' | 'done' | 'error' | 'cancelled';
+  text?: string | null;
+  citation?: CopilotCitation | null;
+  provenance?: CopilotBullet[] | null;
+  egress_bytes?: number | null;
+  web_requested?: boolean | null;
+  web_performed?: number | null;
+  error?: string | null;
+  reason?: string | null;
+  section?: CopilotSection | null;
+  index?: number | null;
+  sections?: CopilotSections | null;
+  drop?: boolean | null;
+}
+
+export interface CopilotReceipt {
+  questions: number;
+  passages: number;
+  claude_questions: number;
+  deepseek_questions: number;
+  local_questions: number;
+  web_requested: number;
+  web_performed: number;
+}
+
+export interface CopilotHistoryCard {
+  row_id: number;
+  session_id: string;
+  card_id: number;
+  at: string;
+  finished_at: string | null;
+  question: string;
+  resolved_question: string | null;
+  provider: "no_ai" | "local" | "claude" | "deepseek";
+  trigger: "auto" | "manual";
+  status: "heard" | "done" | "error" | "cancelled";
+  reason: string | null;
+  error: string | null;
+  retry_of: number | null;
+  answer_md: string | null;
+  sections: CopilotSections | null;
+  passages: CopilotPassage[];
+  provenance: CopilotBullet[];
+  pinned_at: string | null;
+  dismissed_at: string | null;
+  answer_shape?: "brief" | "steps";
+}
+export interface AcceptedLiveItem {
+  id: string;
+  kind: "decision" | "action" | "question";
+  text: string;
+  owner: string | null;
+  due: string | null;
+  evidence_turn_ids: string[];
+  revision: number;
+}
+
+export interface MeetingCopilotHistory {
+  meeting_id: number;
+  cards: CopilotHistoryCard[];
+  live_items: LiveItem[];
+}
+export type CopilotReviewAction = "pin" | "unpin" | "dismiss" | "restore";
+export interface CopilotCardReviewState {
+  row_id: number;
+  pinned_at: string | null;
+  dismissed_at: string | null;
+}
+
+export type LiveItemKind = "decision" | "action" | "question";
+export type LiveItemStatus = "proposed" | "accepted" | "dismissed" | "retracted";
+export interface LiveReviewEvent { action: "accept" | "edit_accept" | "dismiss" | "restore"; at: string; before_text: string | null; after_text: string | null; }
+export interface LiveItem {
+  id: string;
+  kind: LiveItemKind;
+  text: string;
+  original_text: string;
+  owner: string | null;
+  due: string | null;
+  status: LiveItemStatus;
+  revision: number;
+  evidence_turn_ids: string[];
+  at_ms: number;
+  review_events: LiveReviewEvent[];
+  withdrawal_quote?: string | null;
+  withdrawn_at?: string | null;
+}
+export interface LiveSummary { bullets: string[]; evidence_turn_ids: string[]; }
+export type LiveStatus = "off" | "idle" | "updating" | "busy" | "error";
+export interface LiveState {
+  session_id: string;
+  revision: number;
+  enabled: boolean;
+  status: LiveStatus;
+  reason: string | null;
+  through_ms: number;
+  summary: LiveSummary;
+  items: LiveItem[];
+}
+
+export interface CopilotFolderReadiness {
+  session_id: string;
+  folder_id: number | null;
+  status: "indexing" | "ready" | "error";
+  count: number;
+  pack_projects: number;
+  pack_chars: number;
+  pack_hash: string;
+  error: string | null;
+}
+
+export interface CopilotAnswer {
+  provider: "claude" | "deepseek" | "local";
+  status: "streaming" | "searching" | "done" | "error" | "cancelled";
+  text: string;
+  citations: CopilotCitation[];
+  provenance?: CopilotBullet[];
+  egress_bytes?: number;
+  web_requested?: boolean;
+  web_performed?: number;
+  error?: string;
+  reason?: string;
+  sections?: CopilotSections;
+}
+
+export interface CopilotPassage {
+  source_kind: "meeting" | "vault" | "project" | "notes" | "attachment" | "folder";
+  source_id: string;
+  title: string;
+  text: string;
+  score: number;
+}
+
+export interface CopilotCard {
+  id: number;
+  session_id: string;
+  status: 'heard' | 'answering' | 'done' | 'skipped';
+  provider_frozen: 'no_ai' | 'local' | 'claude' | 'deepseek';
+  reason?: string;
+  retry_of?: number;
+  question: string;
+  resolved_question?: string | null;
+  question_source?: "Me" | "Them";
+  context_turns?: string[];
+  asked_at_ms: number;
+  trigger: "auto" | "manual";
+  passages: CopilotPassage[];
+  retrieval_ms?: number;
+  answer?: CopilotAnswer;
+  answer_shape?: "brief" | "steps";
+}
+
+export interface CopilotCommandAck {
+  session_id: string;
+  card_id: number;
+}
+
+export interface CopilotLiveContext {
+  folder_id: number | null;
+  notes: string;
+  attachments: AttachmentDraft[];
+}
+
+export interface ImportReport {
+  format: "adversaria-1" | "legacy-json-1" | string;
+  imported: number;
+  skipped_existing: number;
+  folders_created: number;
+  meeting_ids: number[];
+  folder_id: number | null;
+  path: string;
 }

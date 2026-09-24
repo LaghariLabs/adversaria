@@ -78,44 +78,25 @@ fn compute_in_window(
     let total_seconds: f64 = week_meetings.iter().map(|m| m.duration_seconds).sum();
 
     // Heading classifiers mirror WeeklyView.tsx (incl. Arabic); section parsing
-    // mirrors storage::extract_action_items (`**Heading**` + `- bullet`).
+    // is shared with the deterministic folder brief.
     let dec_re = regex::Regex::new(r"(?i)(decision|agreement|قرار|الاتفاق|الاتفاقيات)").unwrap();
     let top_re =
         regex::Regex::new(r"(?i)(key topic|discussion|topic|المواضيع|النقاط|المناقشة|مواضيع)")
             .unwrap();
-    let heading_re = regex::Regex::new(r"^\*\*(.+?)\*\*:?$").unwrap();
-    let bullet_re = regex::Regex::new(r"^[-*•]\s+(.*)$").unwrap();
 
     let mut decisions = Vec::new();
     let mut topics = Vec::new();
     for m in &week_meetings {
-        let mut bucket = 0u8; // 0 = neither, 1 = decision, 2 = topic
-        for line in m.summary.lines() {
-            let t = line.trim();
-            if let Some(c) = heading_re.captures(t) {
-                let h = c[1].trim_end_matches(':').trim();
-                bucket = if dec_re.is_match(h) {
-                    1
-                } else if top_re.is_match(h) {
-                    2
-                } else {
-                    0
-                };
-            } else if bucket != 0 {
-                if let Some(c) = bullet_re.captures(t) {
-                    let b = c[1].trim();
-                    if is_placeholder_bullet(b) {
-                        continue;
-                    }
-                    let entry = format!("{b} ({})", m.title);
-                    if bucket == 1 {
-                        decisions.push(entry);
-                    } else {
-                        topics.push(entry);
-                    }
-                }
-            }
-        }
+        decisions.extend(
+            crate::storage::summary_section_bullets(&m.summary, &dec_re)
+                .into_iter()
+                .map(|bullet| format!("{bullet} ({})", m.title)),
+        );
+        topics.extend(
+            crate::storage::summary_section_bullets(&m.summary, &top_re)
+                .into_iter()
+                .map(|bullet| format!("{bullet} ({})", m.title)),
+        );
     }
 
     RecapDigest {
@@ -134,20 +115,6 @@ fn compute_in_window(
             })
             .collect(),
     }
-}
-
-/// Skip "None mentioned"/"None"/Arabic-none placeholder bullets (mirrors
-/// `lib/summary.isPlaceholderBullet`).
-fn is_placeholder_bullet(b: &str) -> bool {
-    let l = b.trim().to_lowercase();
-    l.is_empty()
-        || l == "none"
-        || l == "n/a"
-        || l == "na"
-        || l == "-"
-        || l == "—"
-        || l.starts_with("none ")
-        || b.contains("لا يوجد")
 }
 
 /// Render the digest as the grounded markdown answer for the Ask thread.
@@ -191,6 +158,7 @@ mod tests {
     fn meeting(id: i64, recorded_at: &str, summary: &str, dur: f64) -> Meeting {
         Meeting {
             id,
+            uid: String::new(),
             title: format!("Meeting {id}"),
             recorded_at: recorded_at.to_string(),
             duration_seconds: dur,
@@ -253,6 +221,18 @@ mod tests {
         assert_eq!(d.actions_total, 2); // only meeting 1's items
         assert_eq!(d.actions_done, 1);
         assert!(d.decisions[0].contains("Ship v1"));
+    }
+
+    #[test]
+    fn summary_section_bullets_matches_recap_behaviour() {
+        let summary = "**Decisions Made**\n- Ship v1\n- None\n**Key Topics Discussed**\n- Pricing";
+        let decision_re =
+            regex::Regex::new(r"(?i)(decision|agreement|قرار|الاتفاق|الاتفاقيات)").unwrap();
+
+        assert_eq!(
+            crate::storage::summary_section_bullets(summary, &decision_re),
+            vec!["Ship v1"]
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! flows through this module.  The base URL is read from `AppConfig`.
 
 use crate::types::{
-    HealthResponse, ModelDownloadStatus, SummarizeResponse, TemplateInfo, TranscribeResponse,
-    WhisperModelInfo,
+    AcceptedLiveItem, CopilotCitation, CopilotEgressPassage, HealthResponse, ModelDownloadStatus,
+    SummarizeResponse, TemplateInfo, TranscribeResponse, WhisperModelInfo,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +220,320 @@ async fn read_token_stream(
     Ok(answer)
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct CopilotWarmResponse {
+    pub ok: bool,
+    pub ms: u64,
+    pub detail: Option<String>,
+}
+
+/// Ceiling for the copilot gate round-trip. Temporary: it covers the
+/// observed ~4 s queued completions when the 35B model is streaming another
+/// card, not a measured optimum.
+pub const COPILOT_GATE_TIMEOUT_MS: u64 = 6_000;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GateRequest {
+    pub candidate: String,
+    pub speaker: String,
+    pub mode: String,
+    pub context_turns: Vec<String>,
+    pub recent_questions: Vec<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateResponse {
+    pub action: String,
+    pub resolved_question: Option<String>,
+    pub reason_code: String,
+}
+
+impl GateResponse {
+    pub fn validate(self) -> Result<Self, String> {
+        // `backend_error` is the Python gate backend reporting its own
+        // failure (model call raised, output unparseable, summarizer
+        // missing) — never a model verdict. Accept it only as an ignore
+        // with no question, so the caller can apply its reason-aware
+        // fallback instead of mistaking it for a genuine "ignore".
+        if self.reason_code == "backend_error" {
+            if self.action == "ignore" && self.resolved_question.is_none() {
+                return Ok(self);
+            }
+            return Err("Invalid Copilot gate response".into());
+        }
+        let reason_valid = matches!(
+            self.reason_code.as_str(),
+            "direct_question"
+                | "embedded_question"
+                | "narration"
+                | "answered_in_turn"
+                | "repeat"
+                | "no_request"
+                | "unclear"
+        );
+        let question_valid = match self.action.as_str() {
+            "ignore" => self.resolved_question.is_none(),
+            "answer" => self.resolved_question.as_deref().is_some_and(|question| {
+                let question = question.trim();
+                !question.is_empty()
+                    && question.chars().count() <= 2000
+                    && question.chars().any(char::is_alphanumeric)
+            }),
+            _ => false,
+        };
+        if reason_valid && question_valid {
+            Ok(self)
+        } else {
+            Err("Invalid Copilot gate response".into())
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CopilotAnswerRequest {
+    pub provider: String,
+    pub schema_version: u32,
+    pub standing_pack: Option<String>,
+    pub recent_cards: Vec<crate::types::RecentCard>,
+    pub resolved_question: Option<String>,
+    pub answer_shape: &'static str,
+    pub question_source_tier: String,
+    pub question: String,
+    pub question_source: String,
+    pub context_turns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stated_figures: Vec<String>,
+    pub passages: Vec<CopilotEgressPassage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub voice_samples: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meeting_header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_summary: Option<String>,
+    pub web_search: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopilotFrame {
+    Text(String),
+    Replay(serde_json::Value),
+    Section {
+        section: String,
+        index: u32,
+        text: String,
+        drop: bool,
+    },
+    Citation(CopilotCitation),
+    Searching,
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        web_performed: u64,
+    },
+    Error(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopilotStreamSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub web_searches: u64,
+}
+
+const COPILOT_ENDED_EARLY: &str = "The answer stream ended early";
+const COPILOT_TRANSPORT: &str = "Copilot answer transport failed";
+const COPILOT_TIMEOUT: &str = "Answer timed out after 20 s";
+
+fn malformed_copilot_frame() -> String {
+    COPILOT_ENDED_EARLY.to_string()
+}
+
+pub fn parse_copilot_frame(data: &str) -> Result<Option<CopilotFrame>, String> {
+    let v: serde_json::Value = serde_json::from_str(data).map_err(|_| malformed_copilot_frame())?;
+    // The per-card replay record (R1) must never be mistaken for another
+    // frame, so it is parsed before every other branch. Unknown future keys
+    // inside it are preserved verbatim.
+    if let Some(replay) = v.get("replay") {
+        return Ok(Some(CopilotFrame::Replay(replay.clone())));
+    }
+    if let Some(t) = v.get("t").and_then(|x| x.as_str()) {
+        let drop = match v.get("drop") {
+            Some(value) => value.as_bool().ok_or_else(malformed_copilot_frame)?,
+            None => false,
+        };
+        let Some(section) = v.get("sec") else {
+            return Ok(Some(CopilotFrame::Text(t.to_string())));
+        };
+        let section = section
+            .as_str()
+            .filter(|section| matches!(*section, "say" | "specific" | "notes" | "next"))
+            .ok_or_else(malformed_copilot_frame)?;
+        let index = match v.get("i") {
+            Some(value) => value.as_u64().ok_or_else(malformed_copilot_frame)?,
+            None => 0,
+        };
+        return Ok(Some(CopilotFrame::Section {
+            section: section.to_string(),
+            index: index as u32,
+            text: t.to_string(),
+            drop,
+        }));
+    }
+    if v.get("t").is_some() {
+        return Err(malformed_copilot_frame());
+    }
+    if let Some(c) = v.get("c") {
+        let citation = serde_json::from_value::<CopilotCitation>(c.clone())
+            .map_err(|_| malformed_copilot_frame())?;
+        return Ok(Some(CopilotFrame::Citation(citation)));
+    }
+    if let Some(searching) = v.get("w") {
+        if searching.as_str() != Some("searching") {
+            return Err(malformed_copilot_frame());
+        }
+        return Ok(Some(CopilotFrame::Searching));
+    }
+    if let Some(usage) = v.get("usage") {
+        let usage = usage.as_object().ok_or_else(malformed_copilot_frame)?;
+        let count = |key| match usage.get(key) {
+            Some(value) => value.as_u64().ok_or_else(malformed_copilot_frame),
+            None => Ok(0),
+        };
+        let input_tokens = count("input_tokens")?;
+        let output_tokens = count("output_tokens")?;
+        let web_performed = count("web_searches")?;
+        return Ok(Some(CopilotFrame::Usage {
+            input_tokens,
+            output_tokens,
+            web_performed,
+        }));
+    }
+    if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+        return Ok(Some(CopilotFrame::Error(e.to_string())));
+    }
+    if v.get("error").is_some() {
+        return Err(malformed_copilot_frame());
+    }
+    Ok(None)
+}
+
+#[derive(Default)]
+struct CopilotDecoder {
+    buffer: Vec<u8>,
+    last_usage: Option<CopilotStreamSummary>,
+}
+
+impl CopilotDecoder {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        on_frame: &mut impl FnMut(CopilotFrame),
+    ) -> Result<Option<CopilotStreamSummary>, String> {
+        self.buffer.extend_from_slice(chunk);
+        while let Some((position, delimiter_len)) = complete_sse_frame(&self.buffer) {
+            let frame: Vec<u8> = self.buffer.drain(..position + delimiter_len).collect();
+            let frame = std::str::from_utf8(&frame).map_err(|_| malformed_copilot_frame())?;
+            let data = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                return self
+                    .last_usage
+                    .clone()
+                    .map(Some)
+                    .ok_or_else(malformed_copilot_frame);
+            }
+            if let Some(parsed) = parse_copilot_frame(data)? {
+                if let CopilotFrame::Usage {
+                    input_tokens,
+                    output_tokens,
+                    web_performed,
+                } = &parsed
+                {
+                    self.last_usage = Some(CopilotStreamSummary {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        web_searches: *web_performed,
+                    });
+                }
+                let error = match &parsed {
+                    CopilotFrame::Error(error) => Some(error.clone()),
+                    _ => None,
+                };
+                on_frame(parsed);
+                if let Some(error) = error {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish(self) -> Result<CopilotStreamSummary, String> {
+        Err(malformed_copilot_frame())
+    }
+}
+
+fn complete_sse_frame(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(left), Some(right)) if left <= right => Some((left, 2)),
+        (Some(_), Some(right)) => Some((right, 4)),
+        (Some(position), None) => Some((position, 2)),
+        (None, Some(position)) => Some((position, 4)),
+        (None, None) => None,
+    }
+}
+
+async fn read_copilot_stream(
+    mut resp: reqwest::Response,
+    mut on_frame: impl FnMut(CopilotFrame),
+) -> Result<CopilotStreamSummary, String> {
+    let mut decoder = CopilotDecoder::default();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| COPILOT_TRANSPORT.to_string())?
+    {
+        if let Some(summary) = decoder.push(&chunk, &mut on_frame)? {
+            return Ok(summary);
+        }
+    }
+    decoder.finish()
+}
+
+async fn with_copilot_body_timeout<F>(
+    timeout: std::time::Duration,
+    read: F,
+) -> Result<CopilotStreamSummary, String>
+where
+    F: std::future::Future<Output = Result<CopilotStreamSummary, String>>,
+{
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| COPILOT_TIMEOUT.to_string())?
+}
+
 /// Owned parameters for the final-transcription HTTP boundary.
 #[derive(serde::Serialize)]
 pub struct TranscribeParams {
@@ -255,6 +569,10 @@ pub struct SummarizeParams {
     pub user_notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached_context: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prior_meetings: Vec<crate::types::PriorMeeting>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accepted_live_items: Vec<AcceptedLiveItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,6 +597,8 @@ pub struct SummarizeParams {
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct LiveFeedResult {
     pub captions: Vec<String>,
+    #[serde(default)]
+    pub caption_boundaries: Vec<String>,
     #[serde(default)]
     pub partial: String,
 }
@@ -614,6 +934,12 @@ impl HttpClient {
     /// Ask the Python service to summarise a transcript using the given
     /// prompt template and (optionally) a specific Ollama model.
     pub async fn summarize(&self, params: SummarizeParams) -> Result<SummarizeResponse, String> {
+        if !params.accepted_live_items.is_empty() {
+            eprintln!(
+                "[copilot] [info] attaching {} accepted live items to summary",
+                params.accepted_live_items.len()
+            );
+        }
         let base_url = self.base_url.read().unwrap().clone();
         let resp = self
             .client
@@ -638,6 +964,64 @@ impl HttpClient {
         resp.json::<SummarizeResponse>()
             .await
             .map_err(|_| UNEXPECTED_RESPONSE.to_string())
+    }
+
+    pub async fn copilot_gate(&self, req: &GateRequest) -> Result<GateResponse, String> {
+        let base_url = self.base_url.read().unwrap().clone();
+        let started = std::time::Instant::now();
+        let result = self
+            .client
+            .post(format!("{}/copilot/gate", base_url.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_millis(COPILOT_GATE_TIMEOUT_MS))
+            .json(req)
+            .send()
+            .await
+            .map_err(|error| format!("Copilot gate request failed: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("Copilot gate failed: {error}"))?
+            .json::<GateResponse>()
+            .await
+            .map_err(|error| format!("Copilot gate returned invalid JSON: {error}"))?
+            .validate();
+        let elapsed_ms = started.elapsed().as_millis();
+        match &result {
+            Ok(response) => eprintln!(
+                "[copilot] gate ms={elapsed_ms} action={} reason={}",
+                response.action, response.reason_code
+            ),
+            Err(error) => eprintln!("[copilot] gate ms={elapsed_ms} action=error reason={error}"),
+        }
+        result
+    }
+
+    pub async fn copilot_live_extract(
+        &self,
+        req: &crate::types::LiveExtractRequest,
+    ) -> Result<crate::types::LiveExtractResponse, String> {
+        let base_url = self.base_url.read().unwrap().clone();
+        let response = self
+            .client
+            .post(format!(
+                "{}/copilot/live_extract",
+                base_url.trim_end_matches('/')
+            ))
+            .timeout(std::time::Duration::from_secs(12))
+            .json(req)
+            .send()
+            .await
+            .map_err(|error| format!("Live capture request failed: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Live capture failed ({status}): {}",
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("Live capture returned an unreadable response: {error}"))
     }
 
     /// Draft a note template from a plain-language description.
@@ -834,6 +1218,80 @@ impl HttpClient {
         read_token_stream(resp, on_token).await
     }
 
+    fn copilot_warm_request(
+        &self,
+        model: &str,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let service_url = self.base_url.read().unwrap().clone();
+        self.client
+            .post(format!("{service_url}/copilot/warm"))
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&serde_json::json!({"model": model, "llm_base_url": base_url, "llm_api_key": api_key}))
+    }
+
+    pub async fn copilot_warm(
+        &self,
+        model: &str,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<CopilotWarmResponse, String> {
+        self.copilot_warm_request(model, base_url, api_key)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Stream live Copilot answers, requiring authoritative usage and `[DONE]`.
+    pub async fn copilot_answer_stream(
+        &self,
+        req: &CopilotAnswerRequest,
+        on_frame: impl FnMut(CopilotFrame),
+    ) -> Result<CopilotStreamSummary, String> {
+        self.copilot_answer_stream_with_timeout(req, on_frame, std::time::Duration::from_secs(20))
+            .await
+    }
+
+    async fn copilot_answer_stream_with_timeout(
+        &self,
+        req: &CopilotAnswerRequest,
+        on_frame: impl FnMut(CopilotFrame),
+        timeout: std::time::Duration,
+    ) -> Result<CopilotStreamSummary, String> {
+        let base_url = self.base_url.read().unwrap().clone();
+        let resp = self
+            .client
+            .post(format!("{}/copilot_answer_stream", base_url))
+            .timeout(timeout)
+            .json(req)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    COPILOT_TIMEOUT.to_string()
+                } else {
+                    COPILOT_TRANSPORT.to_string()
+                }
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 400 | 422) {
+                return Err("Copilot request validation failed".to_string());
+            }
+            return Err(service_error(&body, "Copilot answer provider failed"));
+        }
+
+        with_copilot_body_timeout(timeout, read_copilot_stream(resp, on_frame)).await
+    }
+
     /// Fetch the list of available prompt templates from the service.
     pub async fn list_templates(&self) -> Result<Vec<TemplateInfo>, String> {
         let base_url = self.base_url.read().unwrap().clone();
@@ -967,6 +1425,150 @@ impl HttpClient {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gate_wire_request_matches_the_local_service_contract() {
+        let request = GateRequest {
+            candidate: "So for example, who is the founder of OpenAI? Bye.".into(),
+            speaker: "Me".into(),
+            mode: "self_ask".into(),
+            context_turns: vec!["Them: We discussed OpenAI.".into()],
+            recent_questions: vec!["What is an LLM?".into()],
+            model: Some("qwen3.6:35b".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "candidate": "So for example, who is the founder of OpenAI? Bye.",
+                "speaker": "Me", "mode": "self_ask",
+                "context_turns": ["Them: We discussed OpenAI."],
+                "recent_questions": ["What is an LLM?"], "model": "qwen3.6:35b"
+            })
+        );
+    }
+
+    #[test]
+    fn gate_response_rejects_invalid_actions_reasons_and_resolutions() {
+        let valid = serde_json::json!({
+            "action": "answer", "resolved_question": "Who founded OpenAI?",
+            "reason_code": "direct_question"
+        });
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<GateResponse>(value)
+                .map_err(|error| error.to_string())
+                .and_then(GateResponse::validate)
+        };
+        assert!(parse(valid.clone()).is_ok());
+        for (key, value) in [
+            ("action", serde_json::json!("maybe")),
+            ("reason_code", serde_json::json!("unknown")),
+            ("resolved_question", serde_json::Value::Null),
+            ("resolved_question", serde_json::json!("   ")),
+            ("resolved_question", serde_json::json!("?! ... ?!")),
+            ("resolved_question", serde_json::json!("x".repeat(2001))),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(parse(invalid).is_err(), "{key}");
+        }
+        assert!(parse(serde_json::json!({"action": "ignore", "resolved_question": null, "reason_code": "narration"})).is_ok());
+        assert!(parse(serde_json::json!({"action": "ignore", "resolved_question": "Who founded OpenAI?", "reason_code": "narration"})).is_err());
+        assert!(serde_json::from_str::<GateResponse>("not JSON").is_err());
+    }
+
+    #[test]
+    fn gate_response_accepts_multi_question_and_unbounded_resolved_questions() {
+        let parse = |resolved: &str| {
+            serde_json::from_value::<GateResponse>(serde_json::json!({
+                "action": "answer",
+                "resolved_question": resolved,
+                "reason_code": "direct_question",
+            }))
+            .map_err(|error| error.to_string())
+            .and_then(GateResponse::validate)
+        };
+        // One card holds every request: declaratives, several questions and
+        // long rewrites are all valid within 2000 characters.
+        assert!(parse("What is X? What is Y?").is_ok());
+        assert!(parse("OpenAI was founded.").is_ok());
+        assert!(parse(&format!("Who {}?", "founded ".repeat(60))).is_ok());
+        assert!(parse(&"x".repeat(2000)).is_ok());
+    }
+
+    #[test]
+    fn gate_response_accepts_backend_error_only_as_questionless_ignore() {
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<GateResponse>(value)
+                .map_err(|error| error.to_string())
+                .and_then(GateResponse::validate)
+        };
+        assert!(parse(serde_json::json!({"action": "ignore", "resolved_question": null, "reason_code": "backend_error"})).is_ok());
+        assert!(
+            parse(serde_json::json!({"action": "ignore", "reason_code": "backend_error"})).is_ok()
+        );
+        assert!(parse(serde_json::json!({"action": "answer", "resolved_question": "Who founded OpenAI?", "reason_code": "backend_error"})).is_err());
+        assert!(parse(serde_json::json!({"action": "ignore", "resolved_question": "Who founded OpenAI?", "reason_code": "backend_error"})).is_err());
+    }
+
+    #[test]
+    fn summarize_params_omit_empty_accepted_items_and_preserve_wire_fields() {
+        let mut params = SummarizeParams {
+            transcript: "The team discussed the launch checklist.".into(),
+            template_name: "general".into(),
+            model: None,
+            output_language: None,
+            user_notes: None,
+            attached_context: None,
+            prior_meetings: Vec::new(),
+            accepted_live_items: Vec::new(),
+            llm_base_url: None,
+            llm_api_key: None,
+            known_attendees: None,
+            category_hint: None,
+            auto_template: false,
+            viewer_label: None,
+            meeting_date: None,
+        };
+        let empty = serde_json::to_value(&params).unwrap();
+        assert!(empty.get("accepted_live_items").is_none());
+
+        params.accepted_live_items.push(AcceptedLiveItem {
+            id: "li_action".into(),
+            kind: "action".into(),
+            text: "Send the revised launch checklist".into(),
+            owner: Some("Amina".into()),
+            due: Some("2026-09-18".into()),
+            evidence_turn_ids: vec!["t8".into(), "t9".into()],
+            revision: 3,
+        });
+        let populated = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            populated["accepted_live_items"],
+            serde_json::json!([{
+                "id": "li_action",
+                "kind": "action",
+                "text": "Send the revised launch checklist",
+                "owner": "Amina",
+                "due": "2026-09-18",
+                "evidence_turn_ids": ["t8", "t9"],
+                "revision": 3
+            }])
+        );
+        params.accepted_live_items[0].owner = None;
+        params.accepted_live_items[0].due = None;
+        let no_metadata = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            no_metadata["accepted_live_items"][0].get("owner"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            no_metadata["accepted_live_items"][0].get("due"),
+            Some(&serde_json::Value::Null)
+        );
+        let round_trip: Vec<AcceptedLiveItem> =
+            serde_json::from_value(no_metadata["accepted_live_items"].clone()).unwrap();
+        assert_eq!(round_trip, params.accepted_live_items);
+    }
+
     /// The exact body a fresh Windows 0.3.68 install produced. It reached the
     /// user verbatim as `Transcription failed: {"detail":"Transcriber not
     /// initialized"}` — the failure that triggered the V3 addendum.
@@ -1044,5 +1646,278 @@ mod tests {
             ),
             "That template name is already taken."
         );
+    }
+
+    #[test]
+    fn parse_copilot_frame_handles_all_frame_kinds() {
+        assert_eq!(
+            parse_copilot_frame(r#"{"t": "Hello world"}"#),
+            Ok(Some(CopilotFrame::Text("Hello world".to_string())))
+        );
+        assert_eq!(
+            parse_copilot_frame(
+                r#"{"c": {"kind": "notes", "passage_index": 2, "cited_text": "sample text"}}"#
+            ),
+            Ok(Some(CopilotFrame::Citation(CopilotCitation {
+                kind: "notes".to_string(),
+                passage_index: Some(2),
+                cited_text: Some("sample text".to_string()),
+                url: None,
+                title: None,
+            })))
+        );
+        assert_eq!(
+            parse_copilot_frame(
+                r#"{"c": {"kind": "web", "url": "https://example.com", "title": "Example", "cited_text": "web quote"}}"#
+            ),
+            Ok(Some(CopilotFrame::Citation(CopilotCitation {
+                kind: "web".to_string(),
+                passage_index: None,
+                cited_text: Some("web quote".to_string()),
+                url: Some("https://example.com".to_string()),
+                title: Some("Example".to_string()),
+            })))
+        );
+        assert_eq!(
+            parse_copilot_frame(r#"{"w": "searching"}"#),
+            Ok(Some(CopilotFrame::Searching))
+        );
+        assert_eq!(
+            parse_copilot_frame(
+                r#"{"usage": {"input_tokens": 120, "output_tokens": 45, "web_searches": 2}}"#
+            ),
+            Ok(Some(CopilotFrame::Usage {
+                input_tokens: 120,
+                output_tokens: 45,
+                web_performed: 2,
+            }))
+        );
+        assert_eq!(
+            parse_copilot_frame(r#"{"error": "Anthropic rate limit reached"}"#),
+            Ok(Some(CopilotFrame::Error(
+                "Anthropic rate limit reached".to_string()
+            )))
+        );
+        assert_eq!(parse_copilot_frame(r#"{"future": true}"#), Ok(None));
+        assert!(parse_copilot_frame("not json").is_err());
+        assert!(parse_copilot_frame(r#"{"t": 42}"#).is_err());
+    }
+
+    #[test]
+    fn replay_frame_decodes_verbatim_and_text_usage_still_decode() {
+        let replay = serde_json::json!({"v": 1, "prompt_sha": "abc123", "future_key": [1, 2]});
+        let data = serde_json::json!({"replay": replay}).to_string();
+        assert_eq!(
+            parse_copilot_frame(&data),
+            Ok(Some(CopilotFrame::Replay(replay)))
+        );
+        let mut decoder = CopilotDecoder::default();
+        let mut frames = Vec::new();
+        assert_eq!(
+            decoder.push(b"data: {\"replay\":{\"v\":1}}\n\n", &mut |frame| frames
+                .push(frame)),
+            Ok(None)
+        );
+        assert_eq!(
+            frames,
+            vec![CopilotFrame::Replay(serde_json::json!({"v": 1}))]
+        );
+        assert_eq!(
+            parse_copilot_frame(r#"{"t": "Hello world"}"#),
+            Ok(Some(CopilotFrame::Text("Hello world".to_string())))
+        );
+        assert_eq!(
+            parse_copilot_frame(
+                r#"{"usage": {"input_tokens": 120, "output_tokens": 45, "web_searches": 2}}"#
+            ),
+            Ok(Some(CopilotFrame::Usage {
+                input_tokens: 120,
+                output_tokens: 45,
+                web_performed: 2,
+            }))
+        );
+    }
+
+    #[test]
+    fn copilot_parser_reads_sections_and_legacy_text() {
+        assert_eq!(
+            parse_copilot_frame(r#"{"t":"x","sec":"say","i":0,"future":true}"#),
+            Ok(Some(CopilotFrame::Section {
+                section: "say".into(),
+                index: 0,
+                text: "x".into(),
+                drop: false,
+            }))
+        );
+        assert_eq!(
+            parse_copilot_frame(r#"{"t":"x"}"#),
+            Ok(Some(CopilotFrame::Text("x".into())))
+        );
+        for section in ["specific", "notes", "next"] {
+            let value = serde_json::json!({"t": "x", "sec": section});
+            assert_eq!(
+                parse_copilot_frame(&value.to_string()),
+                Ok(Some(CopilotFrame::Section {
+                    section: section.into(),
+                    index: 0,
+                    text: "x".into(),
+                    drop: false,
+                }))
+            );
+        }
+        for value in [
+            r#"{"t":"x","sec":"bogus"}"#,
+            r#"{"t":"x","sec":null}"#,
+            r#"{"t":"x","sec":1}"#,
+            r#"{"t":"x","sec":"say","i":-1}"#,
+            r#"{"t":"x","sec":"say","i":0.5}"#,
+            r#"{"t":"x","sec":"say","i":"0"}"#,
+            r#"{"t":"x","sec":"say","i":null}"#,
+        ] {
+            assert_eq!(
+                parse_copilot_frame(value),
+                Err(malformed_copilot_frame()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_parser_reads_drop_flags_and_rejects_non_boolean_values() {
+        for drop in [true, false] {
+            let value = serde_json::json!({"t": "", "sec": "notes", "i": 1, "drop": drop});
+            assert_eq!(
+                parse_copilot_frame(&value.to_string()),
+                Ok(Some(CopilotFrame::Section {
+                    section: "notes".into(),
+                    index: 1,
+                    text: String::new(),
+                    drop,
+                }))
+            );
+        }
+        for invalid in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let value = serde_json::json!({"t": "", "sec": "notes", "i": 0, "drop": invalid});
+            assert_eq!(
+                parse_copilot_frame(&value.to_string()),
+                Err(malformed_copilot_frame())
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_decoder_handles_split_utf8_unknown_keys_usage_and_done() {
+        let mut decoder = CopilotDecoder::default();
+        let mut frames = Vec::new();
+        let frame_text = "data: {\"t\": \"مرحبا\"}\n\n";
+        let bytes = frame_text.as_bytes();
+        let split_pos = bytes.iter().position(|&b| b == 0xD9).unwrap() + 1;
+        assert_eq!(
+            decoder.push(&bytes[..split_pos], &mut |frame| frames.push(frame)),
+            Ok(None)
+        );
+        assert!(frames.is_empty());
+        assert_eq!(
+            decoder.push(&bytes[split_pos..], &mut |frame| frames.push(frame)),
+            Ok(None)
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], CopilotFrame::Text("مرحبا".to_string()));
+        assert_eq!(
+            decoder.push(b"data: {\"future\":true}\n\n", &mut |frame| frames
+                .push(frame)),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder.push(
+                b"data: {\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"web_searches\":1}}\n\n",
+                &mut |frame| frames.push(frame),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder.push(b"data: [DONE]\n\n", &mut |frame| frames.push(frame)),
+            Ok(Some(CopilotStreamSummary {
+                input_tokens: 3,
+                output_tokens: 2,
+                web_searches: 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn copilot_decoder_rejects_every_non_authoritative_terminal() {
+        let cases: &[&[u8]] = &[
+            b"data: {\"t\":\"partial\"}\n\n",
+            b"data: {malformed}\n\n",
+            b"data: {\"t\":\"partial\"}",
+            b"data: {\"usage\":{}}\n\ndata: [DONE]",
+            b"data: [DONE]\n\n",
+        ];
+        for bytes in cases {
+            let mut decoder = CopilotDecoder::default();
+            let pushed = decoder.push(bytes, &mut |_| {});
+            if pushed.is_ok() {
+                assert_eq!(decoder.finish(), Err(COPILOT_ENDED_EARLY.to_string()));
+            } else {
+                assert_eq!(pushed, Err(COPILOT_ENDED_EARLY.to_string()));
+            }
+        }
+
+        let mut decoder = CopilotDecoder::default();
+        let error = decoder.push(
+            b"data: {\"error\":\"Answer cut off at token limit\"}\n\ndata: {\"usage\":{}}\n\ndata: [DONE]\n\n",
+            &mut |_| {},
+        );
+        assert_eq!(error, Err("Answer cut off at token limit".to_string()));
+    }
+
+    #[test]
+    fn copilot_decoder_rejects_invalid_utf8_data() {
+        let mut decoder = CopilotDecoder::default();
+        assert_eq!(
+            decoder.push(b"data: {\"t\":\"\xff\"}\n\n", &mut |_| {}),
+            Err(COPILOT_ENDED_EARLY.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_reader_has_an_independent_body_timeout() {
+        let read = std::future::pending::<Result<CopilotStreamSummary, String>>();
+        let result = with_copilot_body_timeout(std::time::Duration::from_millis(10), read).await;
+        assert_eq!(result, Err(COPILOT_TIMEOUT.to_string()));
+    }
+    #[test]
+    fn copilot_warm_request_and_response_contract() {
+        let client = HttpClient::new("http://127.0.0.1:9876");
+        let request = client
+            .copilot_warm_request("local-model", Some("http://127.0.0.1:11434"), None)
+            .build()
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.url().as_str(), "http://127.0.0.1:9876/copilot/warm");
+        assert_eq!(
+            request.timeout(),
+            Some(&std::time::Duration::from_secs(120))
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"model": "local-model", "llm_base_url": "http://127.0.0.1:11434", "llm_api_key": null})
+        );
+        let response: CopilotWarmResponse =
+            serde_json::from_str(r#"{"ok":true,"ms":12,"detail":null}"#).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.ms, 12);
+        assert!(response.detail.is_none());
+        let response: CopilotWarmResponse =
+            serde_json::from_str(r#"{"ok":false,"ms":2,"detail":"Model unavailable"}"#).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.detail.as_deref(), Some("Model unavailable"));
     }
 }

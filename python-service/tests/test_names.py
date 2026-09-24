@@ -96,7 +96,8 @@ class TestDedupeAttendees:
     def test_initial_abbreviation_not_merged(self) -> None:
         """Hamza L and Hamza Laghari have different tokens — no subset merge."""
         assert dedupe_attendees(["Hamza L", "Hamza Laghari"]) == [
-            "Hamza L", "Hamza Laghari"
+            "Hamza L",
+            "Hamza Laghari",
         ]
         # But Hamza (subset of Hamza L) still merges into the longer form:
         assert dedupe_attendees(["Hamza", "Hamza L"]) == ["Hamza L"]

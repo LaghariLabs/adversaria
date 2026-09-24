@@ -157,8 +157,21 @@ fn is_private_host(host: &str) -> bool {
         || !host.contains('.')
 }
 
+pub fn default_copilot_deepseek_model() -> String {
+    "deepseek-v4-flash".to_string()
+}
+
+fn validate_copilot_deepseek_model(model: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(model, "deepseek-v4-flash" | "deepseek-v4-pro"),
+        "DeepSeek model must be deepseek-v4-flash or deepseek-v4-pro"
+    );
+    Ok(())
+}
+
 /// Persist `AppConfig` to disk as pretty-printed JSON.
 pub fn save_config(config: &AppConfig) -> anyhow::Result<()> {
+    validate_copilot_deepseek_model(&config.copilot_deepseek_model)?;
     ensure_config_dir()?;
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(config_path(), json)?;
@@ -191,6 +204,8 @@ impl Default for AppConfig {
             // own, so the safe default is the helpful one.
             auto_detect_meetings: true,
             ollama_model: default_llm_model(),
+            copilot_local_model: String::new(),
+            copilot_deepseek_model: default_copilot_deepseek_model(),
             summary_language: "en".to_string(),
             theme: "dark".to_string(),
             user_name: String::new(),
@@ -237,6 +252,11 @@ impl Default for AppConfig {
             todo_digest_hour: 9,
             tour_completed: false,
             agents_paused: false,
+            copilot_hud_x: None,
+            copilot_hud_y: None,
+            copilot_hud_w: None,
+            copilot_hud_h: None,
+            copilot_hud_enabled: false,
         }
     }
 }
@@ -472,5 +492,31 @@ mod tests {
     #[test]
     fn a_fresh_config_is_local() {
         assert_eq!(AppConfig::default().transcription_provider, "local");
+    }
+}
+
+#[cfg(test)]
+mod slice2_tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_config_defaults_round_trips_and_validates() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("copilot_deepseek_model");
+        let mut config: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.copilot_deepseek_model, "deepseek-v4-flash");
+        for model in ["deepseek-v4-flash", "deepseek-v4-pro"] {
+            config.copilot_deepseek_model = model.into();
+            validate_copilot_deepseek_model(model).unwrap();
+            let roundtrip: AppConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.copilot_deepseek_model, model);
+        }
+        config.copilot_deepseek_model = "deepseek-chat".into();
+        let error = save_config(&config).unwrap_err().to_string();
+        assert!(error.contains("deepseek-v4-flash") && error.contains("deepseek-v4-pro"));
     }
 }

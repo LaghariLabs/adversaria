@@ -1,0 +1,17 @@
+{
+  "name": "single_question_control",
+  "note": "MQ-A control: a single definition question still gets a compact one-to-two-sentence answer with the definition form.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is a vector database?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": []
+  },
+  "expect": {
+    "say_count": [1, 2],
+    "must_match": ["vector database is", "\\b(?:embedding\\w*|similarity)\\b"]
+  }
+}

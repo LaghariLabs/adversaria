@@ -1,0 +1,21 @@
+{
+  "name": "churn_leakage",
+  "note": "Invented practice case: target-leakage diagnosis at a fictional mobile operator.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "Looking at Exhibit 3, which data issue creates a risk of target leakage?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "stated_figures": [
+      "Me: First, the churn flag is set on the date the account is closed, which is usually 30 days after the customer called to cancel.",
+      "Me: Second, 8% of customers migrated from a legacy billing system 14 months ago and have no history before that."
+    ],
+    "passages": []
+  },
+  "expect": {
+    "must_match": ["churn flag|account is closed|30 days|cancel"],
+    "must_not_match": ["^[^.]*legacy[^.]*creates a risk"]
+  }
+}

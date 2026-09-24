@@ -56,6 +56,7 @@ for pkg in (
     "tiktoken",
     "huggingface_hub",
     "certifi",
+    "anthropic",
     "sherpa_onnx",
 ):
     d, b, h = collect_all(pkg)

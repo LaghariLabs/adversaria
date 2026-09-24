@@ -5,6 +5,139 @@ All notable changes to **Adversaria** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed (Windows)
+- **Google Calendar sign-in works on Windows.** The sign-in page opened with
+  everything after the first `&` cut off, so Google rejected it and the app
+  waited forever. Links now open without going through the command prompt,
+  which also stops a console window flashing.
+- **A recording that can't hear system audio now says so at the start.**
+  Windows used to report "recording" even when the audio device failed to
+  open, and only warned vaguely at stop. It now fails up front with the
+  reason, like the Mac.
+- **Recording survives a headset being plugged in or the default device
+  changing.** The capture follows the new default speaker or microphone
+  instead of recording silence, and keeps both sides in time across the
+  switch.
+- **Microphone recordings are much smaller.** The mic track is stored as one
+  channel instead of the device's full channel count; a many-channel virtual
+  input could produce multi-gigabyte files.
+- **Setup status tells you when the Windows microphone switch is off.** It
+  used to show the microphone as allowed regardless. "Open Windows Settings"
+  now goes straight to Privacy › Microphone.
+- **"Open" on a workspace file works on Windows**, and "Show in File
+  Explorer" selects the file even when its path has spaces.
+- **The recording pill can be hidden on Windows.** Settings said Windows had
+  no pill while one was shown on screen (and in screen shares). Settings ›
+  Recording now offers the pill styles, including Hidden, drawn as the
+  floating pill Windows actually shows.
+- **The recording pill and the meeting-detected card stay clear of the
+  taskbar** wherever it is docked, on any display scaling.
+- **Meeting detection recognizes more Windows apps**: the Webex desktop app,
+  GoTo, Vivaldi, and Arc. Apps that merely embed Edge (the new Outlook,
+  Widgets) no longer trigger "a browser meeting".
+- **Live captions are faster on Windows.** Confirmed captions decode greedily
+  on the loaded model instead of with the meeting transcript's full beam.
+- **GPU transcription finds NVIDIA's standalone cuDNN install**, and registers
+  CUDA folders with the DLL loader, so a machine with the CUDA toolkit no
+  longer falls back to CPU.
+- **Speaker labels no longer stay off after an interrupted model download.**
+  A leftover file made every later download fail on Windows.
+- **The local AI service shuts down cleanly on Windows** instead of being
+  terminated mid-teardown.
+- **Claude Code and Codex are detected on Windows** when installed through
+  npm, and the workspace runs no longer damage the system PATH.
+- **Windows copy throughout**: Ctrl+Shift+M instead of ⌘⇧M, Windows Settings,
+  File Explorer, Credential Manager, and Windows Hello instead of their Mac
+  names. The Apple Calendar card is hidden on Windows, where it could only
+  fail. Dropdowns are readable in every theme.
+
+## [0.4.1] - 2026-09-24
+
+### Added
+- **Answers cover every question you ask in one breath.** "How would you
+  design the retrieval, and how would you stop wrong answers?" gets one card
+  that answers both parts, with up to three spoken sentences and five detail
+  bullets.
+- **Rename a meeting.** Click the pencil next to the title, or double-click
+  it; Enter saves, Escape cancels.
+- **Compact meeting header.** The note view opens with only the title; a
+  chevron shows tags, attendees, the source link and the dictionary row.
+- **Answer this in the Copilot pop-out**, next to the close button (the
+  pop-out itself still ships switched off).
+
+### Changed
+- Copilot text uses Inter in every theme, including Laghari.
+- Spoken definitions sound more natural ("A vector database is a database
+  that stores embeddings and returns the most similar ones").
+- Numbers in answers are written as digits.
+
+### Fixed
+- Questions without a question mark ("If you were to build…, what would you
+  use…"), "Define X." and "X versus Y." now get answers.
+- Greetings ("Hello", "Hey, what's happening?", "Hello, can you hear me?")
+  no longer trigger answers, and Answer last skips past them to your last
+  real question.
+- Answers no longer invent statistics or meeting agendas.
+- Misheard or split names ("Lang graph", "Frescati") are answered under their
+  correct name; names the model does not know get "I'm not familiar with …;
+  which … do you mean?" instead of an invented description.
+- "What else?" adds new points instead of repeating; "What do you mean?"
+  restates the last answer more simply.
+- Model names such as E5 or GPT-4o are no longer shown as "[number]".
+- A slow or failing question check no longer silently drops clear questions.
+
+### Known limits
+- Quantitative case questions are still not dependable on the local model; a
+  built-in calculator is planned.
+- Names newer than the local model (for example Google's OKF) can still get a
+  confident but wrong explanation.
+- The floating pop-out ships switched off (`copilot_hud_enabled`).
+
+## [0.4.0] - 2026-09-22
+
+### Added
+- **Live Copilot answers while you talk.** During a recording the Copilot tab
+  answers the questions it hears: a definitive one-line answer with two or
+  three fact bullets, or a short numbered approach for "walk me through"
+  questions. Answers come from the local model in about a second and never
+  leave the machine in Local mode. Follow-ups such as "go deeper" continue from
+  the earlier answer.
+- **Live review during recording.** Decisions, action items and open questions
+  are extracted as the meeting goes, shown beside the transcript with edit and
+  delete controls, and flow into the final summary and to-dos. Everything found
+  is kept unless you remove it; a withdrawn item stays visible with Undo.
+- **AI Copilot tab in the note view.** Every answer and live item from a
+  meeting, with what you did with it; pin or dismiss.
+- **Figures are remembered.** Numbers said aloud earlier in the meeting are
+  carried into every later local answer, so a question about them does not
+  need repeating. Calculation questions show their working as steps.
+- **Rich-text notes.** Personal Notes, the summary editor and the companion
+  Notes use a formatting editor; Markdown stays the stored format.
+- **Recordings file into the folder you are viewing.** A new recording goes
+  into the folder open in the sidebar, otherwise into none.
+- **Bigger notch island.** On notched Macs the expanded island is a full
+  panel with larger caption text and controls.
+
+### Changed
+- The note view's AI Copilot panel fills the width of the window.
+- The Graph view follows the active theme.
+- Copilot answers are plain and short: one lead sentence plus keyword bullets.
+
+### Fixed
+- Deleting a meeting now deletes its Copilot answers, sessions and live review
+  items with it.
+- Live review columns are added to existing databases on first launch.
+- Copilot answers no longer wait 11 to 13 seconds for a model reload.
+
+### Known limits
+- Quantitative case questions (multi-step arithmetic over stated figures) are
+  not yet dependable on the local model.
+- A question read as "which of the following" may be answered before its
+  options are spoken; press Answer last to answer the full question.
+- A floating pop-out for answers ships switched off (`copilot_hud_enabled`).
+
 ## [0.3.83] - 2026-09-02
 
 ### Added

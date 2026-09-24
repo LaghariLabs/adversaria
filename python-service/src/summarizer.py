@@ -8,8 +8,11 @@ import os
 import platform
 import re
 import sys
+import time
+from collections.abc import Iterator
 from datetime import date
-from typing import Any, NamedTuple
+from difflib import SequenceMatcher
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlparse
 
 import httpx
@@ -17,15 +20,39 @@ from ollama import Client
 
 from .config import list_template_files, load_prompt
 from .models import (
+    AcceptedLiveItem,
     AttendeeDetail,
     ChatResponse,
     MeetingNotes,
+    PriorMeeting,
     SummarizeResponse,
     TemplateInfo,
+    validate_copilot_deepseek_endpoint,
 )
 from .names import dedupe_attendees, ground_to_roster
 
+if TYPE_CHECKING:
+    from .copilot_answer import StreamControl
+
 logger = logging.getLogger(__name__)
+
+
+def _norm_text(s: str) -> str:
+    """Normalize text: replace curly quotes, casefold, replace non-alphanumerics with space, collapse whitespace."""
+    if not s:
+        return ""
+    s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    s = s.casefold()
+    cleaned = "".join(c if c.isalnum() else " " for c in s)
+    return " ".join(cleaned.split())
+
+
+def _clean_prior_title(title: str) -> str:
+    """Strip *, _, backticks, collapse whitespace and truncate to 80 chars."""
+    cleaned = re.sub(r"[*_`]", "", title)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:80].strip()
+
 
 DRAFT_SYSTEM_PROMPT = (
     "You write complete deliverable documents in Markdown from a task brief. "
@@ -44,6 +71,7 @@ def _stated(value: object) -> str:
     """Return a trimmed field value, or "" when the model meant "not stated"."""
     text = str(value or "").strip()
     return "" if text.lower() in _NOT_STATED else text
+
 
 # ── context-window sizing ───────────────────────────────────────────────────
 # Ollama defaults to a 2048-token context regardless of the model's real
@@ -139,7 +167,9 @@ def _total_ram_bytes() -> int | None:
             return int(status.ullTotalPhys)
         return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except Exception:  # noqa: BLE001 — any failure means "unknown", never a crash
-        logger.debug("Could not read total RAM; using the conservative window.", exc_info=True)
+        logger.debug(
+            "Could not read total RAM; using the conservative window.", exc_info=True
+        )
         return None
 
 
@@ -227,7 +257,9 @@ def _adaptive_num_ctx(prompt_chars: int, model: str = "", client: Any = None) ->
     ``OLLAMA_NUM_CTX_RETRY_CAP`` overrides the truncation-retry ceiling.
     """
     if NUM_CTX_PIN:
-        logger.info("Context sizing: pinned to num_ctx=%d by OLLAMA_NUM_CTX", NUM_CTX_PIN)
+        logger.info(
+            "Context sizing: pinned to num_ctx=%d by OLLAMA_NUM_CTX", NUM_CTX_PIN
+        )
         return NUM_CTX_PIN
 
     prompt_tokens = -(-max(prompt_chars, 0) // CHARS_PER_TOKEN)  # ceil
@@ -304,6 +336,43 @@ _LOCAL_OLLAMA_HOSTS = {
     "http://localhost:11434",
 }
 _MANAGED_OLLAMA_HOST: str | None = None
+_MANAGED_LOCAL_OPENAI_BASE: str | None = None
+
+COPILOT_TIMEOUT_SECONDS = 18.0
+COPILOT_MAX_TOKENS = 1024
+# One context window for every Live Copilot call to the local model (gate, live
+# extraction, answer stream, warm-up). Ollama reloads the runner whenever num_ctx
+# changes; mixed 4096/8192/16384 calls reloaded qwen3.6:35b nine times in one
+# five-minute meeting (2026-09-18), 5 to 6 s each.
+COPILOT_NUM_CTX = NUM_CTX_FLOOR
+LOCAL_STREAM_EARLY = "Local engine ended the stream early"
+LOCAL_STREAM_LENGTH = "Answer cut off at token limit"
+LOCAL_STREAM_TIMEOUT = "Local engine timed out after 18 s"
+LOCAL_STREAM_PROVIDER = "The local engine could not complete the answer"
+DEEPSEEK_STREAM_EARLY = "DeepSeek ended the stream early"
+DEEPSEEK_STREAM_TIMEOUT = "DeepSeek timed out after 18 s"
+DEEPSEEK_STREAM_PROVIDER = "DeepSeek could not complete the answer"
+
+
+class CopilotStreamEvent(NamedTuple):
+    kind: str
+    text: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class CopilotStreamError(RuntimeError):
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _nonnegative_int(value: object) -> int:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else 0
+    )
 
 
 def _normalize_local_ollama_host(url: str | None) -> str | None:
@@ -317,26 +386,114 @@ def _normalize_local_ollama_host(url: str | None) -> str | None:
         return None
     if (
         parsed.scheme != "http"
-        or parsed.hostname not in ("127.0.0.1", "localhost")
+        or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.params
+        or parsed.path not in ("", "/", "/v1", "/v1/")
+    ):
+        return None
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    return f"http://{host}:{port}"
+
+
+def _normalize_registered_ollama_host(url: str | None) -> str | None:
+    """Canonicalize the host accepted by the app-owned registration route."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.params
+        or parsed.path not in ("", "/")
+    ):
+        return None
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    return f"http://{host}:{port}"
+
+
+def _normalize_local_openai_base(url: str | None) -> str | None:
+    """Canonicalize a registered loopback OpenAI-compatible base URL."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
         or port is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
         or parsed.path not in ("", "/", "/v1", "/v1/")
+        or parsed.params
     ):
         return None
-    return f"http://{parsed.hostname}:{port}"
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    suffix = "/v1" if parsed.path.rstrip("/") == "/v1" else ""
+    return f"http://{host}:{port}{suffix}"
 
 
 def configure_local_ollama_host(url: str) -> str:
     """Allow one additional app-owned loopback Ollama port for this process."""
     global _MANAGED_OLLAMA_HOST
-    normalized = _normalize_local_ollama_host(url)
+    normalized = _normalize_registered_ollama_host(url)
     if normalized is None:
         raise ValueError("ollama_host must be an http:// loopback URL without a path")
     _MANAGED_OLLAMA_HOST = normalized
     return normalized
+
+
+def configure_local_openai_base_url(url: str) -> str:
+    """Register the one app-managed Rapid-MLX endpoint for this process."""
+    global _MANAGED_LOCAL_OPENAI_BASE
+    normalized = _normalize_local_openai_base(url)
+    if normalized is None:
+        raise ValueError(
+            "local_openai_base_url must be an http:// loopback URL with only an optional /v1 path"
+        )
+    _MANAGED_LOCAL_OPENAI_BASE = normalized
+    return normalized
+
+
+def validate_copilot_local_endpoint(url: str | None, api_key: str | None) -> str:
+    """Return the registered local endpoint kind, or reject without doing I/O."""
+    normalized_ollama = _normalize_local_ollama_host(url)
+    default_ollama = normalized_ollama == "http://127.0.0.1:11434"
+    managed_ollama = (
+        normalized_ollama is not None and normalized_ollama == _MANAGED_OLLAMA_HOST
+    )
+    normalized_openai = _normalize_local_openai_base(url)
+    managed_openai = (
+        normalized_openai is not None
+        and normalized_openai == _MANAGED_LOCAL_OPENAI_BASE
+    )
+    if api_key is not None and not managed_openai:
+        raise ValueError(
+            "local credentials are only valid for the registered managed engine"
+        )
+    if managed_openai:
+        return "openai"
+    if default_ollama or managed_ollama:
+        return "ollama"
+    raise ValueError("local engine is not a registered loopback endpoint")
 
 
 def _is_local_ollama_url(url: str | None) -> bool:
@@ -401,11 +558,18 @@ def default_llm_backend() -> str:
         return env.strip().lower()
     return "openai" if _is_apple_silicon() else "ollama"
 
+
 # Reasoning models "think" before answering, which is slow and wasted for a
 # constrained extraction task — we disable it (think=False) for these. Name
 # fragments of model families that support a thinking mode.
 _THINKING_MODEL_HINTS = (
-    "qwen3", "deepseek-r1", "-r1", "gpt-oss", "magistral", "reasoning", "thinking",
+    "qwen3",
+    "deepseek-r1",
+    "-r1",
+    "gpt-oss",
+    "magistral",
+    "reasoning",
+    "thinking",
 )
 
 
@@ -419,7 +583,9 @@ def _is_thinking_model(model: str) -> bool:
 # <think> (Ollama/Groq qwen, deepseek-r1) or <thinking> (several HF/MLX chat
 # templates), and they do it on the json-constrained summarize path too when
 # think=False isn't honoured. It must go before the reply is read or parsed.
-_THINK_BLOCK_RE = re.compile(r"<(think|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(
+    r"<(think|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE
+)
 _THINK_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
 _THINK_OPEN_RE = re.compile(r"^<think(?:ing)?>", re.IGNORECASE)
 
@@ -661,7 +827,13 @@ _SPARSE_TRANSCRIPT_CHARS = 1500
 # heuristic's {meeting, youtube, brainstorm, other} — the extras get their own
 # tag colours in the Rust category_tag mapping.
 _LLM_CATEGORIES = {
-    "meeting", "one_on_one", "interview", "standup", "brainstorm", "youtube", "other",
+    "meeting",
+    "one_on_one",
+    "interview",
+    "standup",
+    "brainstorm",
+    "youtube",
+    "other",
 }
 
 
@@ -742,8 +914,13 @@ def classify_category(transcript: str) -> str:
         # Remote side: flat "Them" or a diarized "Speaker N" label. (Without the
         # Speaker-N case, diarized system audio was counted as the local user,
         # inflating me_ratio — a watched video then classified as "brainstorm".)
-        if sep and len(sp) <= 20 and (
-            sp.lower() == "them" or re.fullmatch(r"speaker \d+", sp, flags=re.IGNORECASE)
+        if (
+            sep
+            and len(sp) <= 20
+            and (
+                sp.lower() == "them"
+                or re.fullmatch(r"speaker \d+", sp, flags=re.IGNORECASE)
+            )
         ):
             them_parts.append(body.strip())
         elif sep and len(sp) <= 20 and " " not in sp:
@@ -908,7 +1085,10 @@ class OllamaSummarizer:
             self._ollama_clients[self.host] = self.client
         logger.info(
             "Summarizer initialized: backend=%s model=%s ollama_host=%s openai_base=%s",
-            self.backend, model, self.host, self.base_url,
+            self.backend,
+            model,
+            self.host,
+            self.base_url,
         )
 
     def set_ollama_host(self, host: str) -> None:
@@ -1010,9 +1190,11 @@ class OllamaSummarizer:
             # A reasoning model answers this one-word question with a paragraph of
             # thinking in front of it; unstripped, every such model silently loses
             # auto-routing (the reply matches no category and routing fails open).
-            normalized = _strip_think(raw).strip().lower().replace("-", "_").replace(" ", "_")
+            normalized = (
+                _strip_think(raw).strip().lower().replace("-", "_").replace(" ", "_")
+            )
             # Strip surrounding punctuation / quotes (e.g. '"interview"').
-            normalized = normalized.strip('"\'.,;:!?()[]{}<> \t')
+            normalized = normalized.strip("\"'.,;:!?()[]{}<> \t")
             if normalized in _LLM_CATEGORIES:
                 return normalized
             return None
@@ -1032,7 +1214,11 @@ class OllamaSummarizer:
         """
         text = template_content.replace("{{transcript}}", "")
         lines = text.rstrip().splitlines()
-        while lines and lines[-1].strip().rstrip(":").strip().lower() in ("", "---", "transcript"):
+        while lines and lines[-1].strip().rstrip(":").strip().lower() in (
+            "",
+            "---",
+            "transcript",
+        ):
             lines.pop()
         return "\n".join(lines).strip()
 
@@ -1179,6 +1365,209 @@ class OllamaSummarizer:
         return t or title
 
     @staticmethod
+    def _ensure_followup_section(
+        data: dict,
+        prior_meetings: list[PriorMeeting],
+        transcript: str,
+    ) -> None:
+        """Deterministic follow-up check on an attached previous meeting's open action items."""
+        items: list[tuple[str, str, str]] = []
+        p_idx = 1
+        for m in prior_meetings:
+            for item in m.open_items:
+                items.append((f"P{p_idx}", m.title, item))
+                p_idx += 1
+
+        sections = data.get("sections")
+        if not isinstance(sections, list):
+            sections = []
+            data["sections"] = sections
+
+        found_section_idx: int | None = None
+        bullets: list[str] = []
+
+        for idx, sec in enumerate(sections):
+            if not isinstance(sec, dict):
+                continue
+            heading = next(
+                (
+                    str(sec[key]).strip()
+                    for key in ("heading", "title", "section", "name", "header")
+                    if isinstance(sec.get(key), str) and sec[key].strip()
+                ),
+                "",
+            )
+            if _norm_text(heading).startswith("follow up from"):
+                found_section_idx = idx
+                raw_bullets = (
+                    sec.get("bullets") or sec.get("items") or sec.get("points") or []
+                )
+                if isinstance(raw_bullets, list):
+                    bullets = [
+                        str(b).strip()
+                        for b in raw_bullets
+                        if isinstance(b, str) and b.strip()
+                    ]
+                break
+
+        norm_transcript = _norm_text(transcript)
+        final_bullets: list[str] = []
+        done_count = 0
+        discussed_count = 0
+        still_open_count = 0
+        downgraded_count = 0
+
+        for i, (_tag, _meeting_title, text) in enumerate(items):
+            tag_num = i + 1
+            tag_pattern = re.compile(
+                rf"(?:\[\s*P{tag_num}\s*\]|P{tag_num}\s*[:\]\)]|\(\s*P{tag_num}\s*\))",
+                re.IGNORECASE,
+            )
+            candidate: str | None = None
+            for b in bullets:
+                if tag_pattern.search(b):
+                    candidate = b
+                    break
+
+            if candidate is None:
+                norm_text_prefix = _norm_text(text)[:30]
+                if norm_text_prefix:
+                    for b in bullets:
+                        if norm_text_prefix in _norm_text(b):
+                            candidate = b
+                            break
+
+            if (
+                candidate is None
+                and len(bullets) == len(items)
+                and 0 <= i < len(bullets)
+            ):
+                candidate = bullets[i]
+
+            status = "Still open"
+            initially_claimed_done_or_discussed = False
+            if candidate is not None:
+                c_clean = candidate.replace("“", '"').replace("”", '"').strip()
+                stripped = re.sub(r"^[-*•]\s*", "", c_clean)
+                stripped = re.sub(
+                    r"^(?:\[\s*P\d+\s*\]|P\d+\s*[:\]\)]|\(\s*P\d+\s*\))\s*[-—–:\.]?\s*",
+                    "",
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+                matches = list(
+                    re.finditer(
+                        r"(?:^|[—–:\-\(\[]\s*)(done|resolved|completed|closed|discussed|in progress|still open|open|not discussed|not mentioned)\b",
+                        stripped,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                if matches:
+                    kw = matches[-1].group(1).lower()
+                    if kw in ("done", "resolved", "completed", "closed"):
+                        status = "Done"
+                        initially_claimed_done_or_discussed = True
+                    elif kw in ("discussed", "in progress"):
+                        status = "Discussed"
+                        initially_claimed_done_or_discussed = True
+                    else:
+                        status = "Still open"
+                else:
+                    status = "Still open"
+
+            grounded_span: str | None = None
+            if status in ("Done", "Discussed") and candidate is not None:
+                c_norm_quotes = candidate.replace("“", '"').replace("”", '"')
+                spans = re.findall(r'"([^"]+)"', c_norm_quotes)
+                for span in spans:
+                    span_clean = span.strip()
+                    if 3 <= len(span_clean) <= 200:
+                        raw_fragments = re.split(
+                            r"(?:\[\s*(?:\.\.\.|…)\s*\]|\.\s*\.\s*\.|\.{3,}|…)",
+                            span_clean,
+                        )
+                        fragments = [f.strip() for f in raw_fragments if f.strip()]
+                        if fragments and all(
+                            len(_norm_text(f).split()) >= 3
+                            and _norm_text(f) in norm_transcript
+                            for f in fragments
+                        ):
+                            grounded_span = span_clean
+                            break
+
+                if grounded_span is None:
+                    status = "Still open"
+                    if initially_claimed_done_or_discussed:
+                        downgraded_count += 1
+
+            if status in ("Done", "Discussed") and grounded_span is not None:
+                final_bullets.append(f'{status} — {text}: "{grounded_span}"')
+                if status == "Done":
+                    done_count += 1
+                else:
+                    discussed_count += 1
+            else:
+                final_bullets.append(f"{status} — {text}")
+                still_open_count += 1
+
+        for m in prior_meetings:
+            if not m.open_items:
+                final_bullets.append(
+                    f"No open action items from {m.title} to follow up on."
+                )
+
+        if len(prior_meetings) == 1:
+            clean_title = _clean_prior_title(prior_meetings[0].title)
+            # Mirror the Rust to-do extractor's heading regex (storage.rs
+            # `re_actionable`) so this heading can never be read as a to-do list.
+            actionable = re.search(
+                r"(?i)(action item|action point|next step|to[ -]?(?:do|build)|deliverable|task)",
+                clean_title,
+            )
+            if clean_title and not actionable:
+                heading = f"Follow-up from {clean_title}"
+            else:
+                heading = "Follow-up from previous meetings"
+        else:
+            heading = "Follow-up from previous meetings"
+
+        if found_section_idx is not None:
+            sections[found_section_idx] = {
+                "heading": heading,
+                "bullets": final_bullets,
+            }
+        else:
+            notes_idx: int | None = None
+            for idx, sec in enumerate(sections):
+                if isinstance(sec, dict):
+                    h = next(
+                        (
+                            str(sec[k]).strip()
+                            for k in ("heading", "title", "section", "name", "header")
+                            if isinstance(sec.get(k), str) and sec[k].strip()
+                        ),
+                        "",
+                    )
+                    if h.casefold() == "from your notes":
+                        notes_idx = idx
+                        break
+            if notes_idx is not None:
+                sections.insert(
+                    notes_idx, {"heading": heading, "bullets": final_bullets}
+                )
+            else:
+                sections.append({"heading": heading, "bullets": final_bullets})
+
+        logger.info(
+            "Follow-up check: items=%d done=%d discussed=%d still_open=%d downgraded=%d",
+            len(items),
+            done_count,
+            discussed_count,
+            still_open_count,
+            downgraded_count,
+        )
+
+    @staticmethod
     def _ensure_user_notes_section(data: dict, notes: str) -> None:
         """Keep live user notes visible when a small model omits the requested
         ``From Your Notes`` section.
@@ -1216,6 +1605,179 @@ class OllamaSummarizer:
         if bullets:
             sections.append({"heading": "From Your Notes", "bullets": bullets})
 
+    @staticmethod
+    def _ensure_accepted_items_section(
+        data: dict, items: list[AcceptedLiveItem]
+    ) -> None:
+        """Reconcile user-confirmed live items into Decisions, Action Items, or Follow-ups.
+
+        Finds the target section by heading casefold ('decisions', 'action items',
+        'follow-ups'). If missing, creates it with the canonical heading ('Decisions',
+        'Action Items', 'Follow-ups'), inserting Decisions and Action Items before
+        Follow-ups (if present) else appending to the end, and appending Follow-ups.
+        Deduplicates against existing bullets using normalized alphanumerics:
+        equality, containment (one contains the other), or SequenceMatcher ratio >= 0.8.
+        Placeholder bullets ('None mentioned', 'None') are replaced instead of
+        appending after them. The operation is idempotent.
+        """
+        if not items:
+            return
+
+        sections = data.get("sections")
+        if not isinstance(sections, list):
+            sections = []
+            data["sections"] = sections
+
+        def _norm_alphanumeric(text: str) -> str:
+            return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+        def _is_placeholder(bullet: str) -> bool:
+            return _norm_alphanumeric(bullet) in ("none mentioned", "none")
+
+        def _matches(candidate: str, canonical: str, item_text: str) -> bool:
+            c_cand = _norm_alphanumeric(candidate)
+            if not c_cand or _is_placeholder(candidate):
+                return False
+            for target in (canonical, item_text):
+                t_norm = _norm_alphanumeric(target)
+                if not t_norm:
+                    continue
+                if (
+                    c_cand == t_norm
+                    or c_cand in t_norm
+                    or t_norm in c_cand
+                    or SequenceMatcher(None, c_cand, t_norm).ratio() >= 0.8
+                ):
+                    return True
+            return False
+
+        def _get_heading(sec: dict) -> str:
+            return next(
+                (
+                    str(sec[k]).strip()
+                    for k in ("heading", "title", "section", "name", "header")
+                    if isinstance(sec.get(k), str) and sec[k].strip()
+                ),
+                "",
+            )
+
+        def _find_or_create_section(
+            canonical_heading: str, target_cases: set[str]
+        ) -> dict:
+            for s in sections:
+                if not isinstance(s, dict):
+                    continue
+                h = _get_heading(s)
+                if h.casefold() in target_cases:
+                    return s
+
+            new_sec = {"heading": canonical_heading, "bullets": []}
+            if canonical_heading == "Decisions":
+                # Insert before Action Items if present, else before Follow-ups if present, else append
+                insert_idx = None
+                for idx, s in enumerate(sections):
+                    if not isinstance(s, dict):
+                        continue
+                    h = _get_heading(s).casefold()
+                    if h in (
+                        "action items",
+                        "action item",
+                        "follow-ups",
+                        "follow-up",
+                        "follow ups",
+                    ):
+                        insert_idx = idx
+                        break
+                if insert_idx is not None:
+                    sections.insert(insert_idx, new_sec)
+                else:
+                    sections.append(new_sec)
+            elif canonical_heading == "Action Items":
+                # Insert before Follow-ups if present, else append
+                insert_idx = None
+                for idx, s in enumerate(sections):
+                    if not isinstance(s, dict):
+                        continue
+                    h = _get_heading(s).casefold()
+                    if h in ("follow-ups", "follow-up", "follow ups"):
+                        insert_idx = idx
+                        break
+                if insert_idx is not None:
+                    sections.insert(insert_idx, new_sec)
+                else:
+                    sections.append(new_sec)
+            else:
+                sections.append(new_sec)
+            return new_sec
+
+        for item in items:
+            kind = (item.kind or "").strip().lower()
+            text = (item.text or "").strip()
+            if not text:
+                continue
+
+            if kind == "decision":
+                canonical_heading = "Decisions"
+                target_cases = {"decisions", "decision"}
+                canonical_bullet = text
+            elif kind == "action":
+                canonical_heading = "Action Items"
+                target_cases = {"action items", "action item"}
+                owner = (
+                    item.owner.strip()
+                    if item.owner and item.owner.strip()
+                    else "Unassigned"
+                )
+                due_part = ""
+                if item.due and item.due.strip():
+                    due_clean = item.due.strip()
+                    if re.match(r"^\d{4}-\d{2}-\d{2}$", due_clean):
+                        due_part = f" — due {due_clean}"
+                    else:
+                        due_part = f" (due {due_clean})"
+                canonical_bullet = f"{owner}: {text}{due_part}"
+            elif kind == "question":
+                canonical_heading = "Follow-ups"
+                target_cases = {"follow-ups", "follow-up", "follow ups"}
+                q_text = text
+                if q_text.casefold().startswith("open question:"):
+                    q_text = q_text[len("open question:"):].strip()
+                canonical_bullet = f"Open question: {q_text}"
+            else:
+                continue
+
+            target_sec = _find_or_create_section(canonical_heading, target_cases)
+            bullets = next(
+                (
+                    target_sec[k]
+                    for k in ("bullets", "points", "items", "content", "details")
+                    if isinstance(target_sec.get(k), list)
+                ),
+                None,
+            )
+            if bullets is None:
+                bullets = []
+                target_sec["bullets"] = bullets
+
+            # Check if any existing non-placeholder bullet matches
+            if any(_matches(str(b), canonical_bullet, text) for b in bullets):
+                continue
+
+            # Replace placeholder bullet if one exists, else append
+            placeholder_idx = next(
+                (i for i, b in enumerate(bullets) if _is_placeholder(str(b))),
+                None,
+            )
+            if placeholder_idx is not None:
+                bullets[placeholder_idx] = canonical_bullet
+                bullets[:] = [
+                    b
+                    for i, b in enumerate(bullets)
+                    if i == placeholder_idx or not _is_placeholder(str(b))
+                ]
+            else:
+                bullets.append(canonical_bullet)
+
     @classmethod
     def _render(cls, data: dict) -> tuple[str, str, list[str]]:
         """Render any reasonably-shaped notes JSON into (markdown, title, attendees).
@@ -1236,7 +1798,11 @@ class OllamaSummarizer:
             label = cls._attendee_str(item)
             # Drop the generic dual-capture speaker labels — they aren't real
             # named attendees (Me = the local mic, Them = remote/system audio).
-            if label and label.strip().lower() not in ("me", "them") and label not in attendees:
+            if (
+                label
+                and label.strip().lower() not in ("me", "them")
+                and label not in attendees
+            ):
                 attendees.append(label)
 
         parts: list[str] = []
@@ -1254,13 +1820,19 @@ class OllamaSummarizer:
             if not isinstance(sec, dict):
                 continue
             heading = next(
-                (str(sec[k]).strip() for k in ("heading", "title", "section", "name", "header")
-                 if isinstance(sec.get(k), str) and sec[k].strip()),
+                (
+                    str(sec[k]).strip()
+                    for k in ("heading", "title", "section", "name", "header")
+                    if isinstance(sec.get(k), str) and sec[k].strip()
+                ),
                 "",
             )
             bullets = next(
-                (sec[k] for k in ("bullets", "points", "items", "content", "details")
-                 if isinstance(sec.get(k), list)),
+                (
+                    sec[k]
+                    for k in ("bullets", "points", "items", "content", "details")
+                    if isinstance(sec.get(k), list)
+                ),
                 None,
             )
             if heading:
@@ -1270,7 +1842,9 @@ class OllamaSummarizer:
                 seen_headings.add(key)
                 parts.append(f"**{heading}**")
             if bullets:
-                rendered = "\n".join(f"- {str(b).strip()}" for b in bullets if str(b).strip())
+                rendered = "\n".join(
+                    f"- {str(b).strip()}" for b in bullets if str(b).strip()
+                )
                 parts.append(rendered or "None mentioned")
             elif heading:
                 parts.append("None mentioned")
@@ -1317,7 +1891,12 @@ class OllamaSummarizer:
             )
         if base_url:
             return self._chat_openai(
-                messages, model, json_schema, base_url=base_url, api_key=api_key, meta=meta
+                messages,
+                model,
+                json_schema,
+                base_url=base_url,
+                api_key=api_key,
+                meta=meta,
             )
         if self.backend == "openai":
             return self._chat_openai(messages, model, json_schema, meta=meta)
@@ -1404,7 +1983,9 @@ class OllamaSummarizer:
             response = client.chat(**chat_kwargs)
         except Exception as exc:
             if "think" in chat_kwargs:
-                logger.warning("chat with think=False failed (%s) — retrying without.", exc)
+                logger.warning(
+                    "chat with think=False failed (%s) — retrying without.", exc
+                )
                 chat_kwargs.pop("think")
                 try:
                     response = client.chat(**chat_kwargs)
@@ -1542,6 +2123,8 @@ class OllamaSummarizer:
         auto_template: bool = False,
         viewer_label: str | None = None,
         meeting_date: str | None = None,
+        prior_meetings: list[PriorMeeting] | None = None,
+        accepted_live_items: list[AcceptedLiveItem] | None = None,
     ) -> SummarizeResponse:
         """Summarize a meeting transcript into grounded, structured notes.
 
@@ -1567,6 +2150,8 @@ class OllamaSummarizer:
                 well-formed, a single date line is added to the system prompt so
                 spoken relative deadlines resolve to absolute dates. Absent or
                 malformed leaves the prompt untouched.
+            accepted_live_items: Items confirmed by the user during the live
+                meeting. Included under matching sections as traced facts.
 
         Returns:
             SummarizeResponse with markdown ``summary``, ``title``, and
@@ -1597,9 +2182,7 @@ class OllamaSummarizer:
         if auto_template and template_name == "general":
             pre_category = (
                 category_hint
-                or self._classify_category_llm(
-                    transcript, model, base_url, api_key
-                )
+                or self._classify_category_llm(transcript, model, base_url, api_key)
                 or heuristic_category
             )
             routed = route_template(pre_category)
@@ -1609,12 +2192,14 @@ class OllamaSummarizer:
                 except FileNotFoundError:
                     logger.warning(
                         "Auto-route: template %r missing — keeping %r",
-                        routed, template_name,
+                        routed,
+                        template_name,
                     )
                 else:
                     logger.info(
                         "Auto-routed template: category=%s template=%s",
-                        pre_category, routed,
+                        pre_category,
+                        routed,
                     )
                     template_name = routed
 
@@ -1640,7 +2225,9 @@ class OllamaSummarizer:
         # something undefined with it (2026-08-03 review) — and most of the nine
         # templates say nothing about deadlines. Mentioning DATE CONTEXT is how a
         # template (including a user's own) declares it knows what to do.
-        date_line = _date_directive(meeting_date) if "DATE CONTEXT" in system_prompt else None
+        date_line = (
+            _date_directive(meeting_date) if "DATE CONTEXT" in system_prompt else None
+        )
         if date_line:
             system_prompt = f"{system_prompt}\n\n{date_line}"
         directive = _language_directive(output_language)
@@ -1678,6 +2265,19 @@ class OllamaSummarizer:
                 "support; just keep the note as written)."
             )
 
+        accepted = list(accepted_live_items or [])
+        if accepted:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "Items inside <accepted_live_items> were confirmed by the user "
+                "during the meeting. Treat them as traced facts: include each "
+                "one under the matching section (decision → Decisions, action → "
+                "Action Items, question → Follow-ups) with its wording, owner and "
+                "due date unchanged, and never drop or contradict them."
+            )
+
+        prior = [m for m in (prior_meetings or [])]
+
         context = (attached_context or "").strip()
         if context:
             system_prompt = (
@@ -1687,6 +2287,27 @@ class OllamaSummarizer:
                 "Use it to resolve names, context, and details, but NEVER treat it "
                 "as something said in this meeting. Claims about what happened or "
                 "was said in this meeting must stay grounded in the transcript."
+            )
+
+        if prior:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "PRIOR MEETING FOLLOW-UP: The <prior_open_items> block of the "
+                "user message lists open action items from an earlier meeting the "
+                'user attached. Append one extra FINAL section titled exactly "Follow-up '
+                'from previous meeting" (when a "From Your Notes" section is also '
+                'requested, put "Follow-up from previous meeting" before it) with '
+                "exactly one bullet per listed item, in the listed order, each bullet "
+                "starting with the item's [P#] tag. After the tag write one of three "
+                'statuses: "Done — " when the transcript explicitly says the item was '
+                'completed, "Discussed — " when the transcript talks about the item '
+                'without completing it, or "Still open — " when the transcript never '
+                'mentions it. For "Done" and "Discussed", write the item text, then a '
+                "colon, then a 3–12 word quote copied verbatim from the transcript inside "
+                'double quotes. Never write "Done" or "Discussed" without such a verbatim '
+                'quote. If the transcript does not mention an item, write only "Still open — " '
+                "and the item text. Do not turn these items into new Action Items unless "
+                "the transcript assigns them again."
             )
 
         # Pin the exact JSON shape in the prompt. Local vLLM/Rapid-MLX enforces it
@@ -1720,6 +2341,26 @@ class OllamaSummarizer:
             user_message = (
                 f"{user_message}\n\n<attached_context>\n{context}\n</attached_context>"
             )
+        if accepted:
+            items_lines = "\n".join(
+                f"{item.kind} | {item.owner or '-'} | {item.due or '-'} | {item.text}"
+                for item in accepted
+            )
+            user_message = f"{user_message}\n\n<accepted_live_items>\n{items_lines}\n</accepted_live_items>"
+        if prior:
+            prior_blocks: list[str] = []
+            p_idx = 1
+            for m in prior:
+                date_part = f" ({m.date})" if m.date and m.date.strip() else ""
+                prior_blocks.append(f"Meeting: {m.title}{date_part}")
+                if m.open_items:
+                    for item in m.open_items:
+                        prior_blocks.append(f"- [P{p_idx}] {item}")
+                        p_idx += 1
+                else:
+                    prior_blocks.append("(no open action items)")
+            prior_content = "\n".join(prior_blocks)
+            user_message = f"{user_message}\n\n<prior_open_items>\n{prior_content}\n</prior_open_items>"
         if directive:
             # Same-script languages (es/fr/pt/…) lose to the English template by
             # recency: the directive sits FIRST (system prompt) while the English
@@ -1778,7 +2419,9 @@ class OllamaSummarizer:
                 )
             # Genuine prose — the model wrote a readable note instead of JSON.
             # Keep it: a readable note beats an error.
-            logger.warning("Model output was not JSON — using the prose reply as the note.")
+            logger.warning(
+                "Model output was not JSON — using the prose reply as the note."
+            )
             return SummarizeResponse(
                 summary=normalized.strip(),
                 template_used=template_name,
@@ -1786,8 +2429,12 @@ class OllamaSummarizer:
             )
 
         data = self._unwrap_envelope(data)
+        if prior:
+            self._ensure_followup_section(data, prior, transcript)
         if notes:
             self._ensure_user_notes_section(data, notes)
+        if accepted:
+            self._ensure_accepted_items_section(data, accepted)
 
         category = resolve_category(
             category_hint, data.get("category"), heuristic_category
@@ -1828,7 +2475,6 @@ class OllamaSummarizer:
             attendee_details=self._attendee_details(data, attendees),
         )
 
-
     def generate_template(
         self,
         description: str,
@@ -1867,7 +2513,10 @@ class OllamaSummarizer:
         try:
             example = load_prompt(example_template)
         except Exception:  # noqa: BLE001 - a missing example must not block the feature
-            logger.warning("Example template %r unavailable; generating without one.", example_template)
+            logger.warning(
+                "Example template %r unavailable; generating without one.",
+                example_template,
+            )
             example = ""
 
         use_model = model or self.model
@@ -2028,6 +2677,297 @@ class OllamaSummarizer:
             self._stream_messages(messages, use_model, base_url, api_key)
         )
 
+    def copilot_stream(
+        self,
+        system_prompt: str,
+        user_text: str,
+        model: str | None,
+        base_url: str | None,
+        api_key: str | None,
+        control: StreamControl,
+        provider: str = "local",
+    ) -> Iterator[CopilotStreamEvent]:
+        """Stream Copilot deltas plus one authoritative terminal usage event."""
+        if not system_prompt.strip():
+            raise ValueError("System prompt is empty.")
+        if not user_text.strip():
+            raise ValueError("User text is empty.")
+        use_model = model or self.model
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+        if provider == "local":
+            endpoint = validate_copilot_local_endpoint(base_url, api_key)
+            upstream = (
+                self._copilot_ollama_stream(messages, use_model, base_url, control)
+                if endpoint == "ollama"
+                else self._copilot_openai_stream(
+                    messages,
+                    use_model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    control=control,
+                    provider="local",
+                )
+            )
+        elif provider == "deepseek":
+            endpoint = validate_copilot_deepseek_endpoint(base_url)
+            if not (api_key or "").strip():
+                raise ValueError("DeepSeek API key missing")
+            upstream = self._copilot_openai_stream(
+                messages,
+                use_model,
+                base_url=endpoint,
+                api_key=api_key,
+                control=control,
+                provider="deepseek",
+            )
+        else:
+            raise ValueError("Unsupported Copilot streaming provider")
+        yield from self._strip_copilot_think_stream(upstream)
+
+    @staticmethod
+    def _strip_copilot_think_stream(
+        events: Iterator[CopilotStreamEvent],
+    ) -> Iterator[CopilotStreamEvent]:
+        """Remove a leading reasoning block without losing terminal metadata."""
+        buffer = ""
+        passthrough = False
+        for event in events:
+            if event.kind != "delta":
+                if (
+                    not passthrough
+                    and buffer
+                    and not _THINK_OPEN_RE.match(buffer.lstrip())
+                ):
+                    yield CopilotStreamEvent("delta", text=buffer)
+                yield event
+                return
+            if passthrough:
+                yield event
+                continue
+            buffer += event.text
+            stripped = buffer.lstrip()
+            if not stripped:
+                continue
+            if _THINK_OPEN_RE.match(stripped):
+                closer = _THINK_CLOSE_RE.search(buffer)
+                if closer:
+                    tail = buffer[closer.end() :].lstrip()
+                    buffer = ""
+                    passthrough = True
+                    if tail:
+                        yield CopilotStreamEvent("delta", text=tail)
+            elif not "<thinking>".startswith(
+                stripped.lower()
+            ) and not "<think>".startswith(stripped.lower()):
+                passthrough = True
+                yield CopilotStreamEvent("delta", text=buffer)
+                buffer = ""
+
+    def _copilot_openai_stream(
+        self,
+        messages: list[dict],
+        model: str,
+        base_url: str | None,
+        api_key: str | None,
+        control: StreamControl,
+        provider: str = "local",
+    ) -> Iterator[CopilotStreamEvent]:
+        """Strict OpenAI-compatible Copilot stream; EOF is never success."""
+        url = (base_url or self.base_url).rstrip("/")
+        key = api_key or self.api_key or "EMPTY"
+        deadline = time.monotonic() + COPILOT_TIMEOUT_SECONDS
+        deepseek = provider == "deepseek"
+        early_error = DEEPSEEK_STREAM_EARLY if deepseek else LOCAL_STREAM_EARLY
+        timeout_error = DEEPSEEK_STREAM_TIMEOUT if deepseek else LOCAL_STREAM_TIMEOUT
+        provider_error = DEEPSEEK_STREAM_PROVIDER if deepseek else LOCAL_STREAM_PROVIDER
+
+        def body() -> dict:
+            request: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "stream": True,
+                "max_tokens": COPILOT_MAX_TOKENS,
+                "stream_options": {"include_usage": True},
+            }
+            if deepseek:
+                request["thinking"] = {"type": "disabled"}
+            elif url not in _NO_CHAT_TEMPLATE_KWARGS:
+                request["chat_template_kwargs"] = {"enable_thinking": False}
+            return request
+
+        input_tokens = 0
+        output_tokens = 0
+        stop_seen = False
+        # Copilot traffic must never inherit an HTTP(S)_PROXY or follow a
+        # redirect to a different endpoint.
+        client = httpx.Client(trust_env=False, follow_redirects=False)
+        registration = control.register(client.close)
+        try:
+            for _ in range(2):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CopilotStreamError(timeout_error, "timeout")
+                with client.stream(
+                    "POST",
+                    f"{url}/chat/completions",
+                    json=body(),
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=remaining,
+                ) as response:
+                    if response.status_code == 400:
+                        response.read()
+                        if (
+                            not deepseek
+                            and "chat_template_kwargs" in response.text.lower()
+                            and url not in _NO_CHAT_TEMPLATE_KWARGS
+                        ):
+                            _NO_CHAT_TEMPLATE_KWARGS.add(url)
+                            continue
+                    if deepseek and response.status_code in (401, 403):
+                        response.read()
+                        raise CopilotStreamError(
+                            "DeepSeek rejected the API key.", "provider"
+                        )
+                    if deepseek and response.status_code == 429:
+                        response.read()
+                        raise CopilotStreamError(
+                            "DeepSeek rate limit, try again shortly.", "provider"
+                        )
+                    if response.status_code >= 400:
+                        response.read()
+                        raise CopilotStreamError(provider_error, "provider")
+                    for line in response.iter_lines():
+                        if time.monotonic() >= deadline:
+                            raise CopilotStreamError(timeout_error, "timeout")
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[len("data:") :].strip()
+                        if data == "[DONE]":
+                            if not stop_seen:
+                                raise CopilotStreamError(early_error, "ended_early")
+                            yield CopilotStreamEvent(
+                                "done",
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                            )
+                            return
+                        try:
+                            payload = json.loads(data)
+                        except json.JSONDecodeError as exc:
+                            raise CopilotStreamError(
+                                early_error, "ended_early"
+                            ) from exc
+                        if not isinstance(payload, dict):
+                            raise CopilotStreamError(early_error, "ended_early")
+                        usage = payload.get("usage")
+                        if usage is not None:
+                            if not isinstance(usage, dict):
+                                raise CopilotStreamError(early_error, "ended_early")
+                            input_tokens = _nonnegative_int(
+                                usage.get("prompt_tokens") or usage.get("input_tokens")
+                            )
+                            output_tokens = _nonnegative_int(
+                                usage.get("completion_tokens")
+                                or usage.get("output_tokens")
+                            )
+                        choices = payload.get("choices", [])
+                        if not isinstance(choices, list):
+                            raise CopilotStreamError(early_error, "ended_early")
+                        for choice in choices:
+                            if not isinstance(choice, dict):
+                                raise CopilotStreamError(early_error, "ended_early")
+                            finish_reason = choice.get("finish_reason")
+                            if finish_reason == "length":
+                                raise CopilotStreamError(LOCAL_STREAM_LENGTH, "length")
+                            if finish_reason == "stop":
+                                stop_seen = True
+                            delta_payload = choice.get("delta", {})
+                            if delta_payload is None:
+                                delta_payload = {}
+                            if not isinstance(delta_payload, dict):
+                                raise CopilotStreamError(early_error, "ended_early")
+                            delta = delta_payload.get("content")
+                            if delta is not None and not isinstance(delta, str):
+                                raise CopilotStreamError(early_error, "ended_early")
+                            if delta:
+                                yield CopilotStreamEvent("delta", text=delta)
+                    raise CopilotStreamError(early_error, "ended_early")
+            raise CopilotStreamError(provider_error, "provider")
+        except httpx.TimeoutException as exc:
+            raise CopilotStreamError(timeout_error, "timeout") from exc
+        except httpx.HTTPError as exc:
+            raise CopilotStreamError(provider_error, "transport") from exc
+        finally:
+            if control.unregister(registration):
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def _copilot_ollama_stream(
+        self,
+        messages: list[dict],
+        model: str,
+        base_url: str | None,
+        control: StreamControl,
+    ) -> Iterator[CopilotStreamEvent]:
+        """Strict Ollama Copilot stream with bounded generation and timeout."""
+        host = _normalize_local_ollama_host(base_url)
+        client = Client(
+            host=host or self.host,
+            timeout=COPILOT_TIMEOUT_SECONDS,
+            trust_env=False,
+            follow_redirects=False,
+        )
+        registration = control.register(client.close)
+        try:
+            options = _ollama_options(COPILOT_NUM_CTX)
+            options["num_predict"] = COPILOT_MAX_TOKENS
+            options["keep_alive"] = "30m"
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "options": options,
+                "keep_alive": "30m",
+            }
+            if _is_thinking_model(model):
+                kwargs["think"] = False
+            deadline = time.monotonic() + COPILOT_TIMEOUT_SECONDS
+            for chunk in client.chat(**kwargs):
+                if time.monotonic() >= deadline:
+                    raise CopilotStreamError(LOCAL_STREAM_TIMEOUT, "timeout")
+                piece = chunk.get("message", {}).get("content")
+                if piece:
+                    yield CopilotStreamEvent("delta", text=piece)
+                if chunk.get("done") is True:
+                    reason = _stop_reason(chunk)
+                    if reason == "length":
+                        raise CopilotStreamError(LOCAL_STREAM_LENGTH, "length")
+                    if reason != "stop":
+                        raise CopilotStreamError(LOCAL_STREAM_EARLY, "ended_early")
+                    yield CopilotStreamEvent(
+                        "done",
+                        input_tokens=_nonnegative_int(chunk.get("prompt_eval_count")),
+                        output_tokens=_nonnegative_int(chunk.get("eval_count")),
+                    )
+                    return
+            raise CopilotStreamError(LOCAL_STREAM_EARLY, "ended_early")
+        except httpx.TimeoutException as exc:
+            raise CopilotStreamError(LOCAL_STREAM_TIMEOUT, "timeout") from exc
+        finally:
+            if control.unregister(registration):
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
     def _stream_messages(
         self,
         messages,
@@ -2070,9 +3010,7 @@ class OllamaSummarizer:
             },
         ]
         yield from _strip_think_stream(
-            self._stream_messages(
-                messages, model or self.model, base_url, api_key
-            )
+            self._stream_messages(messages, model or self.model, base_url, api_key)
         )
 
     def _chat_openai_stream(self, messages, model, base_url=None, api_key=None):
@@ -2124,7 +3062,9 @@ class OllamaSummarizer:
                         break
                     try:
                         delta = (
-                            json.loads(data)["choices"][0].get("delta", {}).get("content")
+                            json.loads(data)["choices"][0]
+                            .get("delta", {})
+                            .get("content")
                         )
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
@@ -2151,3 +3091,68 @@ class OllamaSummarizer:
             piece = chunk.get("message", {}).get("content")
             if piece:
                 yield piece
+
+    def copilot_warm(
+        self,
+        model: str,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> tuple[bool, int, str | None]:
+        """Perform one minimal chat completion against the local backend to keep it warm."""
+        start = time.monotonic()
+        try:
+            endpoint = validate_copilot_local_endpoint(base_url, api_key)
+            use_model = model or self.model
+            if endpoint == "ollama":
+                client = Client(
+                    host=_normalize_local_ollama_host(base_url) or self.host,
+                    timeout=COPILOT_TIMEOUT_SECONDS,
+                    trust_env=False,
+                    follow_redirects=False,
+                )
+                try:
+                    # Every copilot call uses COPILOT_NUM_CTX: Ollama reloads the
+                    # runner when num_ctx changes, which would waste the warm-up.
+                    options = _ollama_options(COPILOT_NUM_CTX)
+                    options["num_predict"] = 1
+                    options["keep_alive"] = "30m"
+                    kwargs: dict[str, Any] = {
+                        "model": use_model,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "stream": False,
+                        "options": options,
+                        "keep_alive": "30m",
+                    }
+                    if _is_thinking_model(use_model):
+                        kwargs["think"] = False
+                    client.chat(**kwargs)
+                finally:
+                    client.close()
+            else:
+                url = (base_url or self.base_url).rstrip("/")
+                key = api_key or self.api_key or "EMPTY"
+                headers: dict[str, str] = {"Authorization": f"Bearer {key}"}
+                body: dict[str, Any] = {
+                    "model": use_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "stream": False,
+                }
+                if url not in _NO_CHAT_TEMPLATE_KWARGS:
+                    body["chat_template_kwargs"] = {"enable_thinking": False}
+                with httpx.Client(
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=COPILOT_TIMEOUT_SECONDS,
+                ) as http_client:
+                    resp = http_client.post(
+                        f"{url}/chat/completions",
+                        json=body,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return True, elapsed_ms, None
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return False, elapsed_ms, str(exc)

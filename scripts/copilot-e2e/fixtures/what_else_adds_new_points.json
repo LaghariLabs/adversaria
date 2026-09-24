@@ -1,0 +1,30 @@
+{
+  "name": "what_else_adds_new_points",
+  "note": "Guards card 372: 'What else' must add substantively new suggestions beyond the referenced card, not repeat its points.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What else would you do?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": ["Them: How would you improve accuracy for a document-search assistant?"],
+    "passages": [],
+    "recent_cards": [{
+      "card_ref": "fixture:1",
+      "question": "How would you improve retrieval accuracy?",
+      "say": "I would combine hybrid search, semantic chunking, metadata filtering and periodic re-embedding.",
+      "points": [
+        "Combine keyword and vector search.",
+        "Split documents at semantic boundaries.",
+        "Filter by document metadata.",
+        "Re-embed changed documents."
+      ]
+    }]
+  },
+  "expect": {
+    "say_count": [1, 2],
+    "specific_count": [2, 5],
+    "must_match": ["\\b(?:rerank\\w*|re-rank\\w*|evaluat\\w*|test\\w*|abstain\\w*|citation\\w*|deduplicat\\w*)\\b"],
+    "must_not_match": ["hybrid|BM25|chunk\\w*|metadata|re-?embed\\w*|keyword.{0,30}vector"]
+  }
+}

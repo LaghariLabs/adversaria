@@ -18,9 +18,10 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 ## Features
 
 - **Record → transcribe → summarize**, fully on-device; the audio is deleted right after.
-- **A recording companion view** — while recording, the app collapses into a slim panel made for docking beside a call: record bar (timer · live audio level · Stop & summarize), an auto-scrolling live transcript, and your notes split 50/50 (or pick **Transcript-first** in Settings → Recording view to give the transcript the whole window, notes in a one-tap footer). Toggle recording from anywhere with **⌘⇧M** (macOS) / **Ctrl+Shift+M** (Windows); **⌘⇧N** jots a quick note.
+- **A recording companion view** — while recording, the app collapses into a slim panel made for docking beside a call: record bar (timer · live audio level · Stop & summarize), an auto-scrolling live transcript, and your notes split 50/50 (or pick **Transcript-first** in Settings → Recording view to give the transcript the whole window, notes in a one-tap footer). Toggle recording from anywhere with **⌘⇧M** (macOS) / **Ctrl+Shift+M** (Windows).
 - **Live captions preview** — while you speak, grey English words appear within about half a second and revise as you go; at each pause the confirmed Whisper caption replaces them. Fully on-device: a 44 MB Moonshine model (sherpa-onnx) downloads once on first launch, with a status row in Settings → Transcription. English-only for now; other languages keep the confirmed captions.
-- **Meeting Room** — at wide window sizes the live transcript docks beside your notes instead of stacking above them, and **+ add context** lets you attach reference documents or prior meeting summaries mid-recording. Attachments fold into the summary as reference material.
+- **Meeting Room** — at wide window sizes the live transcript docks beside your notes instead of stacking above them, and **+ add context** lets you attach reference documents or prior meetings mid-recording. An attached prior meeting gets a **follow-up check** in the notes ("Follow-up from <meeting>": each of its open action items marked Done / Discussed with a verbatim quote from this transcript, or Still open); attached files are used as reference material; the finished note shows a **Context used** strip naming your typed notes and every attachment.
+- **Last time and Copilot tabs** *(merged to master 2026-09-03, ships in the next release)* — while recording, the right column gains **Last time** (what happened in this folder's previous meeting: open action items you can tick off, decisions, follow-ups — straight from your notes, no AI) and **Copilot** (when the other side asks something, verbatim passages from your own notes, past meetings, and attached files appear within about two seconds — local retrieval only, nothing leaves the machine). The recording is filed into the folder you were viewing when you pressed record.
 - **A floating recording pill** — switch away from the app mid-recording and a compact pill tucks in just below the notch (dot · timer · live waveform). Choose **Notch pill → Expressive** in Settings → Notch & alerts for a richer island — timer, the running live caption, both channels, and a one-tap Stop — or **Hidden** to turn it off.
 - **Speaker-labeled** transcript (`Me:` / `Them:`, with on-device **Speaker 1/2/… diarization** of the remote side); notes in **10 languages** (English, العربية, 中文, हिन्दी, Español, Français, বাংলা, Português, Русский, اردو — or *Match spoken*), RTL rendered properly.
 - **Fix this word** — select a misheard term in the transcript, type the correction, and every mention in the transcript *and* notes updates; the term joins your dictionary so future meetings hear it right. **Rename an attendee** on their chip and every reference follows.
@@ -33,7 +34,7 @@ are explicit and disclosed before use; see [the network-boundary guide](docs/PRI
 - **Weekly Briefing** — your week written by the local LLM ("your week in sixty seconds"), plus stats, decisions made, and open loops carried forward.
 - **Ask across meetings** — cross-meeting Q&A (SQLite FTS5 retrieval) answered by the local LLM.
 - **Knowledge Graph** — an interactive, physics-animated map of your meetings, people, tags, and action owners (built from local data, zero LLM). Click any node for a **side dossier**: meeting-notes previews, and **editable person profiles** (role, company, notes, aliases) that sync to your Obsidian vault alongside meeting notes.
-- **Import & export** — import a voice memo/audio file into notes; export a meeting as a dark **slide** (HTML → one-page PDF), **Markdown**, or a portable **`.adversaria.json` bundle**; back up / restore everything from Settings → Data.
+- **Import & export** — import a voice memo/audio file into notes; export a meeting as a **slide** that follows your active theme (Laghari Labs theme → Laghari Labs deck, with a one-click Print / Save as PDF that keeps the theme), **Markdown**, or an **`.adversaria` document** — a portable file with the meeting's notes, transcript, action items and their state, and folder; export a whole folder the same way; double-click a `.adversaria` file (or Import) to load it, re-imports never duplicate. Back up / restore everything from Settings → Data.
 - **A sidebar that stays short** — compact one-line rows (category dot · title · time) grouped into date bins (Pinned / Today / Yesterday / This week / month), with details in a hover peek (or switch back to the classic full cards in Settings); **archive any meeting** from its ⋯ menu (older ones auto-archive after a configurable window) into a collapsed, always-searchable **Archive**; the open meeting is highlighted; type **`@` in search to filter by person** (attendee chips that combine with text, day, and tag filters).
 - Colorful per-meeting **tags** + a **date heatmap** filter, **pin / delete / privacy-lock** (per-meeting PIN), **editable summaries**, **chat with a meeting**, **custom vocabulary**, and **auto-detect meetings**.
 
@@ -180,8 +181,11 @@ meetings" → click _Save Settings_** (ticking alone doesn't apply it — you mu
 Save). No restart needed. When a recognized call app (Zoom, Teams, Webex, Slack,
 or a browser meeting like Google Meet) uses your mic for ~4–6 s, a floating
 "Meeting detected — Record / Dismiss" card appears. It's **mic-based, not
-calendar-based**, and never records on its own — you click _Record_. macOS 14.4+
-only; WhatsApp/FaceTime aren't recognized yet.
+calendar-based**, and never records on its own — you click _Record_. Works on
+Windows 10/11 (GoTo, Vivaldi, and Arc are recognized there too) and macOS
+14.4+; WhatsApp/FaceTime aren't recognized yet. On Windows it needs **Settings ›
+Privacy › Microphone › Let desktop apps access your microphone** turned on, the
+same switch that lets Adversaria record your side of the call.
 
 ### ML service environment variables
 
@@ -229,7 +233,7 @@ src-tauri/src/        Rust backend
   commands.rs         Tauri IPC commands (record, transcribe, history, config)
   http_client.rs      Typed client for the Python service
   storage.rs          SQLite meeting store
-  tray.rs             System tray + global hotkeys (⌘⇧M / Ctrl+Shift+M record, ⌘⇧N quick note)
+  tray.rs             System tray + global hotkey (⌘⇧M / Ctrl+Shift+M record)
 python-service/
   src/server.py       FastAPI app: /health /transcribe /summarize /templates
   src/transcriber.py  faster-whisper wrapper (CUDA with CPU fallback)
@@ -288,3 +292,5 @@ remain available under those terms.
 
 - 2026-08-30 — Accuracy pass for v0.3.82: added Meeting Room (docked live transcript at wide widths and + add context mid-recording attachments), clarified meeting projects with the per-project Web research switch and standing instructions, and confirmed native capture uses a Core Audio process tap on macOS with no screen-recording session.
 - 2026-09-02 — v0.3.83 cut and notarized: added the live captions preview (grey words as you speak, replaced per utterance by the confirmed caption), related meetings under the note, the To-dos Done view; meeting projects are now Folders (migrated automatically) and the folder screen no longer shows the web-research switch; a hung transcription can no longer wedge the queue.
+- 2026-09-14 — Live Copilot v3 on `feat/live-copilot-c` (unreleased): brief answer cards with a trust line, a Live review area while recording in AI · Local (decisions, action items, open questions, running summary with Accept · Edit · Dismiss), the redesigned recording-window Copilot tab, an **AI Copilot** tab in the note view, and a rich-text notes editor (markdown stays the stored format). See SPEC.md changelog.
+- 2026-09-24 — v0.4.1 shipped (beta, macOS): Copilot answers every question in one card, catches questions without a question mark, ignores greetings, stops inventing statistics, and handles misheard names; meeting titles are editable and the note header collapses to the title; copilot text is Inter in every theme. See CHANGELOG.md.

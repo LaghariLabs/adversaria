@@ -37,7 +37,9 @@ def test_new_language_directive_names_language(
     ("code", "alias", "_language_name"),
     [(code, alias, name) for code, (alias, name) in NEW_LANGUAGES.items()],
 )
-def test_new_language_full_name_alias(code: str, alias: str, _language_name: str) -> None:
+def test_new_language_full_name_alias(
+    code: str, alias: str, _language_name: str
+) -> None:
     assert _language_directive(alias) == _language_directive(code)
 
 

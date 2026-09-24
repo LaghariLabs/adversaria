@@ -1,0 +1,18 @@
+{
+  "name": "unknown_plus_known",
+  "note": "MQ-A: the unrecognised-name rule applies per question, so the unknown name gets its clarification sentence while the known term is still defined normally.",
+  "request": {
+    "schema_version": 7,
+    "provider": "local",
+    "question": "What is Qwen 5 Nova? What is an LLM?",
+    "question_source": "Me",
+    "answer_shape": "brief",
+    "context_turns": [],
+    "passages": []
+  },
+  "expect": {
+    "say_count": [2, 3],
+    "must_match": ["not familiar with Qwen 5 Nova", "\\b(?:LLM|large language model)\\b[^.]*\\bis\\b"],
+    "must_not_match": ["\\bQwen 5 Nova\\s+(?:is|was|has|uses|supports)\\b", "\\b(?:does not exist|confusion|blend of)\\b"]
+  }
+}
